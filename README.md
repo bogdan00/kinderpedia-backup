@@ -70,13 +70,3 @@ No problem. Just click the bookmark again and select the same folder. It will in
 
 **Which web browsers are supported?**  
 Google Chrome, Microsoft Edge, Brave, Opera, and other modern Chromium-based browsers on Windows, Mac, or Linux.
-
----
-
-## 🎬 Classroom Videos
-
-Photos, school documents, and classroom videos are all supported!
-
-Because Kinderpedia hosts classroom videos on Vimeo (which normally restricts direct in-browser downloads), the bookmarklet includes a pre-configured Cloudflare Video Helper so videos download directly to your computer as `.mp4` files alongside your photos and documents—with zero local software or terminal required.
-
-*(Optional for developers)*: If you want to host your own private video helper, the complete code is included in [`worker.js`](worker.js) and can be deployed for free to your own Cloudflare account.
