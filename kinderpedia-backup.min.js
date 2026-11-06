@@ -26,6 +26,7 @@
   const BASE_API = "https://app.kinderpedia.co/web-api";
   const USERGATEWAY_API = "https://usergateway-services.kinderpedia.co";
   const MUX_JS_CDN = "https://cdnjs.cloudflare.com/ajax/libs/mux.js/6.3.0/mux.min.js";
+  const MUX_JS_FALLBACK_CDN = "https://cdn.jsdelivr.net/npm/mux.js@6.3.0/dist/mux.min.js";
   const DEFAULT_WORKER_URL = "https://kinderpedia-backup.bogdan00.workers.dev";
   const DEFAULT_WORKER_SECRET = "kp_sec_98721";
 
@@ -690,53 +691,97 @@
     }
 
     async ensureMuxLoaded() {
-      if (window.mux) {
+      const getMux = () => (typeof window !== "undefined" ? (window.muxjs || window.mux) : null);
+      if (getMux()) {
+        if (typeof window !== "undefined") {
+          window.mux = getMux();
+          window.muxjs = getMux();
+        }
         this.muxLoaded = true;
         return;
       }
-      await new Promise((resolve, reject) => {
-        const s = document.createElement("script");
-        s.src = MUX_JS_CDN;
-        s.onload = () => {
-          this.muxLoaded = true;
-          resolve();
-        };
-        s.onerror = () => reject(new Error("Failed to load mux.js"));
-        document.head.appendChild(s);
-      });
+
+      // Candidate script URLs: local vendored copy first, then CDNs
+      const candidates = [];
+      try {
+        if (typeof document !== "undefined") {
+          const scripts = Array.from(document.querySelectorAll("script"));
+          for (const s of scripts) {
+            if (s.src && s.src.includes("kinderpedia-backup")) {
+              candidates.push(new URL("mux.min.js", s.src).href);
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+      candidates.push(MUX_JS_CDN);
+      candidates.push(MUX_JS_FALLBACK_CDN);
+
+      let lastError = null;
+      for (const url of candidates) {
+        try {
+          await new Promise((resolve, reject) => {
+            const s = document.createElement("script");
+            s.src = url;
+            s.crossOrigin = "anonymous";
+            s.onload = () => {
+              const m = window.muxjs || window.mux;
+              if (m) {
+                window.mux = m;
+                window.muxjs = m;
+                this.muxLoaded = true;
+                resolve();
+              } else {
+                reject(new Error("mux.js loaded but neither window.muxjs nor window.mux is defined"));
+              }
+            };
+            s.onerror = () => reject(new Error(`Failed to load ${url}`));
+            document.head.appendChild(s);
+          });
+          if (getMux()) break;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+
+      if (!getMux()) {
+        throw new Error(`Could not load video transmuxer engine: ${lastError?.message || "All sources failed"}`);
+      }
     }
 
-    async downloadVideo(vimeoUrl, destFileHandle, workerConfig = null, onProgress = null) {
+    async downloadVideo(vimeoUrl, destFileHandle, workerConfig = null, onProgress = null, useLocalHelper = false) {
       const mId = vimeoUrl.match(/video\/(\d+)/) || vimeoUrl.match(/vimeo\.com\/(\d+)/);
       if (!mId) throw new Error(`Cannot parse Vimeo ID from ${vimeoUrl}`);
       const vid = mId[1];
       const mHash = vimeoUrl.match(/[?&]h=([a-zA-Z0-9]+)/) || vimeoUrl.match(/vimeo\.com\/\d+\/([a-zA-Z0-9]+)/);
       const hash = mHash ? mHash[1] : "";
 
-      // 1. Primary path: Stream via local helper server (remuxes video+audio with zero loss, bypassing Vimeo browser CORS)
-      try {
-        const streamUrl = `${this.serverBase}/vimeo-stream?id=${vid}&h=${hash}`;
-        const res = await fetch(streamUrl);
-        if (res.ok) {
-          let writable = null;
-          try {
-            writable = await destFileHandle.createWritable({ keepExistingData: false });
-            await res.body.pipeTo(writable);
-            writable = null;
-          } catch (pErr) {
-            if (writable) {
-              try { await writable.abort(); } catch (_) {}
+      // 1. Primary path: Stream via local helper server (ONLY if helper was detected and available)
+      if (useLocalHelper && this.serverBase) {
+        try {
+          const streamUrl = `${this.serverBase}/vimeo-stream?id=${vid}&h=${hash}`;
+          const res = await fetch(streamUrl);
+          if (res.ok) {
+            let writable = null;
+            try {
+              writable = await destFileHandle.createWritable({ keepExistingData: false });
+              await res.body.pipeTo(writable);
+              writable = null;
+            } catch (pErr) {
+              if (writable) {
+                try { await writable.abort(); } catch (_) {}
+              }
+              throw pErr;
             }
-            throw pErr;
+            const file = await destFileHandle.getFile();
+            if (!file || file.size < 10000) {
+              throw new Error(`Video stream incomplete (${file?.size || 0} bytes)`);
+            }
+            return file.size;
           }
-          const file = await destFileHandle.getFile();
-          if (!file || file.size < 10000) {
-            throw new Error(`Video stream incomplete (${file?.size || 0} bytes)`);
-          }
-          return file.size;
+        } catch (err) {
+          // Local helper server unreachable; fall through to Cloudflare Worker or direct
         }
-      } catch (err) {
-        // Local helper server unreachable; fall through to Cloudflare Worker or direct
       }
 
       // 2. Cloudflare Worker path: Fetch config via worker
@@ -839,9 +884,14 @@
 
       if (!segmentUrls.length) throw new Error("No video segments found in HLS stream");
 
+      const Mux = typeof window !== "undefined" ? (window.muxjs || window.mux) : null;
+      if (!Mux || !Mux.mp4 || !Mux.mp4.Transmuxer) {
+        throw new Error("Transmuxer engine (mux.js) not available");
+      }
+
       const outChunks = [];
       let initWritten = false;
-      const transmuxer = new window.mux.mp4.Transmuxer({ keepOriginalTimestamps: true });
+      const transmuxer = new Mux.mp4.Transmuxer({ keepOriginalTimestamps: true });
       transmuxer.on("data", (segment) => {
         if (segment.initSegment && !initWritten) {
           outChunks.push(segment.initSegment);
@@ -1212,7 +1262,10 @@
           const scripts = Array.from(document.querySelectorAll("script"));
           for (const s of scripts) {
             if (s.src && s.src.includes("kinderpedia-backup")) {
-              serverBase = new URL(s.src).origin;
+              const u = new URL(s.src);
+              if (u.hostname === "localhost" || u.hostname === "127.0.0.1") {
+                serverBase = u.origin;
+              }
               break;
             }
           }
@@ -1900,7 +1953,7 @@
           const vHandle = await videosDir.getFileHandle(vname, { create: true });
           await this.vimeo.downloadVideo(videoUrl, vHandle, workerCfg, (curr, total) => {
             this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 25)}" (${curr}/${total} segments)...`);
-          });
+          }, !!this.vimeoHelperAvailable);
           
           // Post-download integrity verification
           const vFile = await vHandle.getFile();

@@ -85,6 +85,12 @@ const server = http.createServer(async (req, res) => {
 
   // --- API Endpoint: /vimeo-config ---
   if (reqPath === "/vimeo-config") {
+    if (parsedUrl.searchParams.get("test") === "1") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", service: "local-vimeo-helper" }));
+      return;
+    }
+
     let vid = parsedUrl.searchParams.get("id");
     let hash = parsedUrl.searchParams.get("h") || "";
     const rawUrl = parsedUrl.searchParams.get("url");
