@@ -1,110 +1,72 @@
-# ☁️ Kinderpedia Cloud Backup — 1-Click Browser Bookmarklet
+# ☁️ Kinderpedia Backup for Parents
 
-A fast, private, zero-install browser bookmarklet that allows parents to backup their children's complete photo albums, videos, and documents directly from [Kinderpedia](https://app.kinderpedia.co) to a local computer or external drive.
+A simple, 1-click tool for parents to download and keep all their children's kindergarten photos, videos, and school documents safely on their own computer.
 
-🔗 **Live Bookmarklet Page**: **[https://bogdan00.github.io/kinderpedia-backup/](https://bogdan00.github.io/kinderpedia-backup/)**
-
----
-
-## ✨ Features
-
-- **Zero-Install (1-Click)**: No Python, terminal commands, or native software required. Runs directly inside your web browser.
-- **Direct-to-Disk Streaming**: Uses the modern [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_Access_API) (`showDirectoryPicker`) to stream high-resolution media straight to disk without overloading your computer's RAM.
-- **Concurrent Producer-Consumer Architecture**: Discovers upcoming albums in real time while 6 parallel streaming workers download photos concurrently. Total counts and progress adjust dynamically.
-- **Multi-Child Detection**: Automatically recognizes all child profiles associated with your parent account.
-- **Instant Resume & Incremental Sync**: If paused, stopped, or re-run in the future, it skips already downloaded files in milliseconds and only downloads newly uploaded media.
-- **Windows, FAT32 & USB Safe**: All file and directory names are cleaned automatically—stripping emojis, normalizing curly quotes, dashes, and ellipsis, and removing trailing dots/spaces that cause errors on Windows or external USB drives.
-- **Pure Media Organization**: Photo, video, and document folders contain pure media files only. All JSON indexes and manifests are neatly segregated into a dedicated `Metadata/` folder.
-- **Strict Data Integrity**: Every photo, video, and document is checked against its expected size. Incomplete or 0-byte files are automatically deleted and re-downloaded.
-- **100% Private & Secure**: Operates entirely within your active browser session. No credentials, tokens, or photos ever touch any third-party server.
+👉 **Install it here:** **[https://bogdan00.github.io/kinderpedia-backup/](https://bogdan00.github.io/kinderpedia-backup/)**
 
 ---
 
-## 🚀 How to Use (For Parents)
+## 🌟 Why Use This?
 
-### 1. Install the Bookmarklet
-1. Open **[https://bogdan00.github.io/kinderpedia-backup/](https://bogdan00.github.io/kinderpedia-backup/)** in Chrome, Edge, Brave, or any Chromium-based browser.
-2. Ensure your browser's **Bookmarks Bar** is visible (`Ctrl + Shift + B` on Windows, `Cmd + Shift + B` on Mac).
-3. Drag the blue **`☁️ Kinderpedia Backup`** button directly into your Bookmarks Bar.
-
-### 2. Run the Backup
-1. Go to **[https://app.kinderpedia.co](https://app.kinderpedia.co)** (or `https://mykp.kinderpedia.co`) and log in.
-2. Click your **`☁️ Kinderpedia Backup`** bookmark.
-3. An overlay dashboard will appear showing your logged-in account and your children's profiles.
-4. Click **Select Destination Folder** and choose where you want to save the backup (e.g., your Desktop, Documents, or an external USB hard drive).
-5. Click **Start Backup**!
+- 🖱️ **Zero Installation**: You don't need to install any apps or software. It runs right in your web browser.
+- 📸 **Saves Everything**: Downloads full-resolution photo albums, classroom videos, and documents.
+- 👶 **All Your Kids in One Place**: Automatically finds all your children enrolled on your Kinderpedia account.
+- ⚡ **Fast & Lightweight**: Downloads files directly to your computer without slowing down your browser.
+- 🔄 **Smart Resuming**: You can pause or stop anytime. When you run it again, it skips what you already saved and only downloads new memories.
+- 💻 **Works Everywhere**: All filenames are neatly cleaned so they open smoothly on Windows PCs, Macs, USB sticks, and digital photo frames.
+- 🔒 **100% Private**: Runs entirely on your computer. None of your photos, passwords, or personal details are ever shared or sent anywhere.
 
 ---
 
-## 📁 Backup Folder Structure
+## 🚀 How to Use (3 Simple Steps)
 
-The backup engine structures your library cleanly and predictably:
+### Step 1: Add the Bookmark
+1. Open **[https://bogdan00.github.io/kinderpedia-backup/](https://bogdan00.github.io/kinderpedia-backup/)** in Google Chrome, Microsoft Edge, or Brave.
+2. Make sure your browser's **Bookmarks Bar** is showing (press `Ctrl + Shift + B` on Windows, or `Cmd + Shift + B` on Mac).
+3. Drag the big blue **`☁️ Kinderpedia Backup`** button up into your Bookmarks Bar.
+
+### Step 2: Open Kinderpedia
+1. Go to **[https://app.kinderpedia.co](https://app.kinderpedia.co)** and log in as you normally do.
+
+### Step 3: Start Your Backup
+1. Click your new **`☁️ Kinderpedia Backup`** bookmark.
+2. A small window will appear showing your children's names.
+3. Click **Select Destination Folder** and pick where you want your photos saved (like your Desktop or a USB stick).
+4. Click **Start Backup** and watch your memories download!
+
+---
+
+## 📁 How Your Files Are Organized
+
+Everything is saved in clean, easy-to-browse folders:
 
 ```text
-[Your Chosen Backup Folder]/
-├── 📁 Emilia Draghicescu/
-│   ├── avatar.png
-│   ├── 📁 Albums/
-│   │   ├── 📁 2026-09-07_47819249_Traseu sportiv/
-│   │   │   ├── 001_47819317.jpg
-│   │   │   ├── 002_47819318.jpg
-│   │   │   └── ...
-│   │   └── 📁 2026-10-21_49893161_Masti vesele - Culori si creativitate/
-│   │       ├── 001_49893201.jpg
-│   │       └── ...
-│   ├── 📁 Videos/
-│   │   ├── 2026-09-18_48353657_Salutul de dimineata.mp4
-│   │   ├── 2026-10-12_49447004_Ghici ghicitoarea mea.mp4
-│   │   └── ...
-│   └── 📁 Documents/
-│       ├── Formular optionale.docx
-│       ├── Program serbare.pdf
-│       └── ...
-└── 📁 Metadata/
-    └── 📁 Emilia Draghicescu/
-        ├── albums_index.json
-        ├── videos_index.json
-        ├── documents_index.json
-        ├── backup_progress.json
-        └── 📁 Albums/
-            ├── 2026-09-07_47819249_Traseu sportiv.json
-            └── ...
+📁 Your Backup Folder/
+├── 📁 Emilia/
+│   ├── 📁 Albums/       <-- All photo albums, sorted by date and name
+│   ├── 📁 Videos/       <-- All classroom and activity videos
+│   └── 📁 Documents/    <-- School reports, newsletters, and documents
+└── 📁 Radu/
+    ├── 📁 Albums/
+    ├── 📁 Videos/
+    └── 📁 Documents/
 ```
 
 ---
 
-## 🔒 Privacy & Security
+## ❓ Frequently Asked Questions
 
-- **Where do my files go?**
-  Directly from Kinderpedia's CDN servers to your local hard drive. There is no middleman server.
-- **Are my credentials safe?**
-  Yes. The bookmarklet runs entirely within your existing logged-in browser session. It does not ask for or store your password, nor does it transmit your session tokens anywhere.
-- **Can I inspect the code?**
-  Yes! The script is completely open source and un-obfuscated in this repository (`kinderpedia-backup.js`).
+**Do I need to install any program on my computer?**  
+No. It works completely inside your web browser using a simple bookmark.
 
----
+**Is it safe and private?**  
+Yes, 100%. The download happens directly between Kinderpedia and your computer. No external server ever sees your photos, account, or password.
 
-## 🌐 Browser Compatibility
+**Can I save directly to an external hard drive or USB stick?**  
+Yes! When you click *Select Destination Folder*, simply choose your external drive or USB stick.
 
-| Browser | Supported | Notes |
-| :--- | :---: | :--- |
-| **Google Chrome** | ✅ Yes | Recommended |
-| **Microsoft Edge** | ✅ Yes | Fully supported |
-| **Brave** | ✅ Yes | Fully supported |
-| **Opera / Vivaldi** | ✅ Yes | Fully supported |
-| **Mozilla Firefox** | ⚠️ Limited | Lacks native File System Access API (`showDirectoryPicker`) |
-| **Apple Safari** | ⚠️ Limited | Lacks native File System Access API (`showDirectoryPicker`) |
+**What happens if my internet disconnects?**  
+No problem. Just click the bookmark again and select the same folder. It will instantly pick up right where it left off without downloading duplicates.
 
----
-
-## 🎬 Note on Vimeo Videos
-
-Kinderpedia hosts parent-uploaded videos on Vimeo with domain privacy restrictions.
-- Direct MP4 files and documents download 100% in-browser without any setup.
-- If Vimeo restricts in-browser cross-origin streaming for certain video formats, you can optionally run the lightweight local helper `node serve.js` on port `8080`, which uses `ffmpeg` to transmux Vimeo HLS streams directly into lossless MP4 files.
-
----
-
-## 📄 License
-
-MIT License. Feel free to use, share, and adapt for your family's memories.
+**Which web browsers are supported?**  
+Google Chrome, Microsoft Edge, Brave, Opera, and other modern Chromium-based browsers on Windows, Mac, or Linux.
