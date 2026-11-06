@@ -704,7 +704,7 @@
       });
     }
 
-    async downloadVideo(vimeoUrl, destFileHandle) {
+    async downloadVideo(vimeoUrl, destFileHandle, workerConfig = null) {
       const mId = vimeoUrl.match(/video\/(\d+)/) || vimeoUrl.match(/vimeo\.com\/(\d+)/);
       if (!mId) throw new Error(`Cannot parse Vimeo ID from ${vimeoUrl}`);
       const vid = mId[1];
@@ -725,16 +725,32 @@
           return file.size;
         }
       } catch (err) {
-        // Local helper server unreachable; fall through to browser direct
+        // Local helper server unreachable; fall through to Cloudflare Worker or direct
       }
 
-      // 2. Fallback path: In-browser fetching & muxing (if direct access is available)
-      await this.ensureMuxLoaded();
+      // 2. Cloudflare Worker path: Fetch config via worker
+      let cfg = null;
+      if (workerConfig && workerConfig.url) {
+        try {
+          const wUrl = `${workerConfig.url}?id=${vid}&h=${hash}&secret=${encodeURIComponent(workerConfig.secret || "kp_sec_98721")}`;
+          const wRes = await fetch(wUrl);
+          if (wRes.ok) {
+            const wData = await wRes.json();
+            cfg = wData.raw_files ? { request: { files: wData.raw_files } } : wData;
+          }
+        } catch (_) {}
+      }
 
-      const cfgUrl = `https://player.vimeo.com/video/${vid}/config${hash ? `?h=${hash}` : ""}`;
-      const cfgRes = await fetch(cfgUrl);
-      if (!cfgRes.ok) throw new Error(`Vimeo config returned HTTP ${cfgRes.status}. (Ensure 'node serve.js' is running on http://localhost:8080)`);
-      const cfg = await cfgRes.json();
+      // 3. Fallback path: In-browser direct fetching (if direct access is available)
+      if (!cfg) {
+        const cfgUrl = `https://player.vimeo.com/video/${vid}/config${hash ? `?h=${hash}` : ""}`;
+        try {
+          const cfgRes = await fetch(cfgUrl);
+          if (cfgRes.ok) cfg = await cfgRes.json();
+        } catch (_) {}
+      }
+
+      if (!cfg) throw new Error("Could not retrieve Vimeo video configuration");
 
       // Check for progressive MP4 files first (cleanest, fastest)
       const progressive = cfg?.request?.files?.progressive;
@@ -748,15 +764,25 @@
       }
 
       // Fallback: HLS master playlist remuxing via mux.js
+      await this.ensureMuxLoaded();
+
       const hls = cfg?.request?.files?.hls;
       const defaultCdn = hls?.default_cdn;
       const masterUrl = hls?.cdns?.[defaultCdn]?.url || Object.values(hls?.cdns || {})[0]?.url;
       if (!masterUrl) throw new Error("No HLS or progressive stream found in Vimeo embed config");
 
-      const masterRes = await fetch(masterUrl);
+      // Request standard MPEG-TS segments by ensuring sf=ts
+      let tsMasterUrl = masterUrl;
+      try {
+        const u = new URL(masterUrl);
+        u.searchParams.set("sf", "ts");
+        tsMasterUrl = u.href;
+      } catch (_) {}
+
+      const masterRes = await fetch(tsMasterUrl);
       const masterText = await masterRes.text();
 
-      let streamUrl = masterUrl;
+      let streamUrl = tsMasterUrl;
       const lines = masterText.split("\n");
       let bestBandwidth = -1;
       let variantUri = null;
@@ -775,7 +801,7 @@
       }
 
       if (variantUri) {
-        streamUrl = new URL(variantUri, masterUrl).href;
+        streamUrl = new URL(variantUri, tsMasterUrl).href;
       }
 
       const variantRes = await fetch(streamUrl);
@@ -930,6 +956,20 @@
               <input id="pass-in" type="password" placeholder="Password" style="width:100%; padding:8px; border-radius:6px; background:#1e293b; border:1px solid #475569; color:#fff;" />
             </div>
 
+            <div style="margin-bottom: 14px; font-size: 11px;">
+              <div id="worker-toggle-row" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; color:#38bdf8; user-select:none; padding:4px 0;">
+                <span id="worker-toggle-text">⚡ Cloudflare Video Helper (Optional)</span>
+                <span id="worker-toggle-arrow">▾</span>
+              </div>
+              <div id="worker-panel" style="display:none; margin-top:8px; background:rgba(30, 41, 59, 0.7); border:1px solid rgba(56, 189, 248, 0.2); border-radius:8px; padding:10px;">
+                <label style="display:block; color:#94a3b8; font-size:11px; margin-bottom:4px;">Worker URL:</label>
+                <input id="worker-url-input" type="url" placeholder="https://kp-vimeo-proxy.<subdomain>.workers.dev" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px; margin-bottom:8px;" />
+                <label style="display:block; color:#94a3b8; font-size:11px; margin-bottom:4px;">Shared Secret:</label>
+                <input id="worker-secret-input" type="password" placeholder="kp_sec_98721" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px;" />
+                <div style="font-size:10px; color:#64748b; margin-top:6px; line-height:1.4;">Allows in-browser video downloads without running a local server.</div>
+              </div>
+            </div>
+
             <button id="start-btn" class="btn btn-primary" style="width:100%;">📁 Select Folder & Start Backup</button>
           </div>
 
@@ -983,6 +1023,40 @@
       this.authPrompt = this.shadow.getElementById("auth-prompt");
       this.emailIn = this.shadow.getElementById("email-in");
       this.passIn = this.shadow.getElementById("pass-in");
+      this.workerToggleRow = this.shadow.getElementById("worker-toggle-row");
+      this.workerPanel = this.shadow.getElementById("worker-panel");
+      this.workerToggleArrow = this.shadow.getElementById("worker-toggle-arrow");
+      this.workerUrlInput = this.shadow.getElementById("worker-url-input");
+      this.workerSecretInput = this.shadow.getElementById("worker-secret-input");
+
+      if (this.workerToggleRow && this.workerPanel) {
+        try {
+          const savedUrl = localStorage.getItem("kp_worker_url") || "";
+          const savedSec = localStorage.getItem("kp_worker_secret") || "";
+          if (savedUrl) {
+            this.workerUrlInput.value = savedUrl;
+            this.workerPanel.style.display = "block";
+            this.workerToggleArrow.textContent = "▴";
+          }
+          if (savedSec) this.workerSecretInput.value = savedSec;
+        } catch (_) {}
+
+        this.workerToggleRow.addEventListener("click", () => {
+          const isHidden = this.workerPanel.style.display === "none";
+          this.workerPanel.style.display = isHidden ? "block" : "none";
+          this.workerToggleArrow.textContent = isHidden ? "▴" : "▾";
+        });
+
+        const saveWorkerCfg = () => {
+          try {
+            if (this.workerUrlInput) localStorage.setItem("kp_worker_url", this.workerUrlInput.value.trim());
+            if (this.workerSecretInput) localStorage.setItem("kp_worker_secret", this.workerSecretInput.value.trim());
+          } catch (_) {}
+        };
+        this.workerUrlInput?.addEventListener("change", saveWorkerCfg);
+        this.workerSecretInput?.addEventListener("change", saveWorkerCfg);
+      }
+
       this.startBtn = this.shadow.getElementById("start-btn");
       this.activityTicker = this.shadow.getElementById("activity-ticker");
       this.childLabel = this.shadow.getElementById("child-label");
@@ -1153,6 +1227,15 @@
 
       this.init();
       this.bindEvents();
+    }
+
+    getWorkerConfig() {
+      try {
+        const url = (this.ui?.workerUrlInput?.value || localStorage.getItem("kp_worker_url") || "").trim();
+        const secret = (this.ui?.workerSecretInput?.value || localStorage.getItem("kp_worker_secret") || "kp_sec_98721").trim();
+        if (url) return { url: url.replace(/\/+$/, ""), secret: secret || "kp_sec_98721" };
+      } catch (_) {}
+      return null;
     }
 
     toggleUI() {
@@ -1795,9 +1878,24 @@
         }
       }
 
+      // Check if Cloudflare Worker is configured and reachable
+      const workerCfg = this.getWorkerConfig();
+      if (this.vimeoWorkerAvailable === undefined) {
+        if (workerCfg && workerCfg.url) {
+          try {
+            const check = await fetch(`${workerCfg.url}?ping=1&secret=${encodeURIComponent(workerCfg.secret)}`, { signal: AbortSignal.timeout(1500) });
+            this.vimeoWorkerAvailable = check.ok;
+          } catch (_) {
+            this.vimeoWorkerAvailable = false;
+          }
+        } else {
+          this.vimeoWorkerAvailable = false;
+        }
+      }
+
       if (videoUrl && videoUrl.includes("vimeo.com")) {
-        // ON KINDERPEDIA: If local helper is NOT active, DO NOT attempt to fetch Vimeo or generate errors!
-        if (!this.vimeoHelperAvailable) {
+        // ON KINDERPEDIA: If neither local helper nor Cloudflare Worker is active, quiet cataloging
+        if (!this.vimeoHelperAvailable && !this.vimeoWorkerAvailable) {
           this.stats.videosSkipped++;
           this.refreshLiveUI(ctx.child_name);
           return;
@@ -1806,7 +1904,7 @@
         try {
           this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 30)}"...`);
           const vHandle = await videosDir.getFileHandle(vname, { create: true });
-          await this.vimeo.downloadVideo(videoUrl, vHandle);
+          await this.vimeo.downloadVideo(videoUrl, vHandle, workerCfg);
           
           // Post-download integrity verification
           const vFile = await vHandle.getFile();

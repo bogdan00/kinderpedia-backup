@@ -70,3 +70,19 @@ No problem. Just click the bookmark again and select the same folder. It will in
 
 **Which web browsers are supported?**  
 Google Chrome, Microsoft Edge, Brave, Opera, and other modern Chromium-based browsers on Windows, Mac, or Linux.
+
+---
+
+## 🎬 Classroom Videos (Optional Helper)
+
+Photos and school documents download directly with zero extra setup.
+
+Kinderpedia hosts classroom videos on Vimeo, which places restrictions on web browsers downloading videos directly. By default, the tool will safely catalog all your video details into a neat index file.
+
+If you would like your videos to download directly onto your computer as `.mp4` files without running any software, you can use a free Cloudflare Worker:
+1. Log in to [Cloudflare](https://dash.cloudflare.com/) (it's 100% free).
+2. Go to **Workers & Pages** ➔ **Create application** ➔ **Create Worker**.
+3. Name it `kinderpedia-video-helper` and click **Deploy**.
+4. Click **Edit code**, paste the contents of [`worker.js`](worker.js), and click **Deploy**.
+5. Copy your worker address (e.g. `https://kinderpedia-video-helper.<your-subdomain>.workers.dev`).
+6. In your Kinderpedia Backup bookmarklet, click **⚡ Cloudflare Video Helper (Optional)**, paste your worker address, and your videos will download automatically!
