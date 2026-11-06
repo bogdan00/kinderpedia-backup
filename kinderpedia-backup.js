@@ -706,7 +706,7 @@
       });
     }
 
-    async downloadVideo(vimeoUrl, destFileHandle, workerConfig = null) {
+    async downloadVideo(vimeoUrl, destFileHandle, workerConfig = null, onProgress = null) {
       const mId = vimeoUrl.match(/video\/(\d+)/) || vimeoUrl.match(/vimeo\.com\/(\d+)/);
       if (!mId) throw new Error(`Cannot parse Vimeo ID from ${vimeoUrl}`);
       const vid = mId[1];
@@ -718,8 +718,17 @@
         const streamUrl = `${this.serverBase}/vimeo-stream?id=${vid}&h=${hash}`;
         const res = await fetch(streamUrl);
         if (res.ok) {
-          const writable = await destFileHandle.createWritable({ keepExistingData: false });
-          await res.body.pipeTo(writable);
+          let writable = null;
+          try {
+            writable = await destFileHandle.createWritable({ keepExistingData: false });
+            await res.body.pipeTo(writable);
+            writable = null;
+          } catch (pErr) {
+            if (writable) {
+              try { await writable.abort(); } catch (_) {}
+            }
+            throw pErr;
+          }
           const file = await destFileHandle.getFile();
           if (!file || file.size < 10000) {
             throw new Error(`Video stream incomplete (${file?.size || 0} bytes)`);
@@ -760,8 +769,18 @@
         progressive.sort((a, b) => (b.width || 0) - (a.width || 0));
         const bestMp4 = progressive[0].url;
         const res = await fetch(bestMp4);
-        const writable = await destFileHandle.createWritable({ keepExistingData: false });
-        await res.body.pipeTo(writable);
+        if (!res.ok) throw new Error(`Failed to fetch progressive MP4: HTTP ${res.status}`);
+        let writable = null;
+        try {
+          writable = await destFileHandle.createWritable({ keepExistingData: false });
+          await res.body.pipeTo(writable);
+          writable = null;
+        } catch (pipeErr) {
+          if (writable) {
+            try { await writable.abort(); } catch (_) {}
+          }
+          throw pipeErr;
+        }
         return;
       }
 
@@ -782,6 +801,7 @@
       } catch (_) {}
 
       const masterRes = await fetch(tsMasterUrl);
+      if (!masterRes.ok) throw new Error(`Failed to fetch HLS master playlist: HTTP ${masterRes.status}`);
       const masterText = await masterRes.text();
 
       let streamUrl = tsMasterUrl;
@@ -807,6 +827,7 @@
       }
 
       const variantRes = await fetch(streamUrl);
+      if (!variantRes.ok) throw new Error(`Failed to fetch HLS variant playlist: HTTP ${variantRes.status}`);
       const variantText = await variantRes.text();
       const segmentUrls = [];
       for (const vline of variantText.split("\n")) {
@@ -818,26 +839,46 @@
 
       if (!segmentUrls.length) throw new Error("No video segments found in HLS stream");
 
-      const writable = await destFileHandle.createWritable({ keepExistingData: false });
-      const transmuxer = new window.mux.mp4.Transmuxer({ keepOriginalTimestamps: true });
-
+      const outChunks = [];
       let initWritten = false;
-      transmuxer.on("data", async (segment) => {
+      const transmuxer = new window.mux.mp4.Transmuxer({ keepOriginalTimestamps: true });
+      transmuxer.on("data", (segment) => {
         if (segment.initSegment && !initWritten) {
-          await writable.write(segment.initSegment);
+          outChunks.push(segment.initSegment);
           initWritten = true;
         }
-        if (segment.data) await writable.write(segment.data);
+        if (segment.data) {
+          outChunks.push(segment.data);
+        }
       });
 
       for (let i = 0; i < segmentUrls.length; i++) {
+        if (typeof onProgress === "function") {
+          onProgress(i + 1, segmentUrls.length);
+        }
         const segRes = await fetch(segmentUrls[i]);
+        if (!segRes.ok) throw new Error(`Failed to fetch segment ${i + 1}/${segmentUrls.length}: HTTP ${segRes.status}`);
         const segBuffer = await segRes.arrayBuffer();
         transmuxer.push(new Uint8Array(segBuffer));
         transmuxer.flush();
       }
 
-      await writable.close();
+      if (!outChunks.length) throw new Error("Transmuxing produced no video data");
+
+      let writable = null;
+      try {
+        writable = await destFileHandle.createWritable({ keepExistingData: false });
+        for (const chunk of outChunks) {
+          await writable.write(chunk);
+        }
+        await writable.close();
+        writable = null;
+      } catch (err) {
+        if (writable) {
+          try { await writable.abort(); } catch (_) {}
+        }
+        throw err;
+      }
     }
   }
 
@@ -1857,7 +1898,9 @@
         try {
           this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 30)}"...`);
           const vHandle = await videosDir.getFileHandle(vname, { create: true });
-          await this.vimeo.downloadVideo(videoUrl, vHandle, workerCfg);
+          await this.vimeo.downloadVideo(videoUrl, vHandle, workerCfg, (curr, total) => {
+            this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 25)}" (${curr}/${total} segments)...`);
+          });
           
           // Post-download integrity verification
           const vFile = await vHandle.getFile();
@@ -1867,7 +1910,7 @@
           }
           this.stats.videosSaved++;
           this.stats.bytesSaved += vFile.size;
-          this.ui.log(`🎬 Video downloaded: "${sanitizeName(vid.name || vid.id, 40)}"`);
+          this.ui.log(`🎬 Video downloaded: "${sanitizeName(vid.name || vid.id, 40)}" (${(vFile.size / (1024 * 1024)).toFixed(1)} MB)`);
         } catch (err) {
           try { await videosDir.removeEntry(vname); } catch (_) {}
           console.warn("[Video] Download failed:", err);
