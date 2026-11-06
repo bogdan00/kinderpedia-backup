@@ -22,6 +22,238 @@
     return;
   }
 
+  // --- Graceful Environment & Compatibility Dialog ---
+  function showNoticeModal({ icon, title, messageHtml, primaryBtn, secondaryBtn }) {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById("kp-notice-overlay");
+    if (existing) existing.remove();
+
+    const host = document.createElement("div");
+    host.id = "kp-notice-overlay";
+    document.body.appendChild(host);
+    const shadow = host.attachShadow({ mode: "open" });
+
+    shadow.innerHTML = `
+      <style>
+        * { box-sizing: border-box; }
+        .backdrop {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba(10, 15, 29, 0.78);
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
+          padding: 16px;
+          animation: kpFadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        @keyframes kpFadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        .modal {
+          background: #0f172a;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 16px;
+          max-width: 470px;
+          width: 100%;
+          padding: 26px;
+          box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          color: #f1f5f9;
+          animation: kpScaleIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        @keyframes kpScaleIn {
+          from { opacity: 0; transform: scale(0.95); }
+          to { opacity: 1; transform: scale(1); }
+        }
+        .icon-badge {
+          width: 52px;
+          height: 52px;
+          border-radius: 14px;
+          background: rgba(56, 189, 248, 0.12);
+          border: 1px solid rgba(56, 189, 248, 0.25);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 26px;
+          margin-bottom: 16px;
+        }
+        .title {
+          font-size: 18px;
+          font-weight: 700;
+          color: #ffffff;
+          margin: 0 0 10px 0;
+        }
+        .body {
+          font-size: 14px;
+          line-height: 1.55;
+          color: #94a3b8;
+          margin: 0 0 22px 0;
+        }
+        .body b { color: #f1f5f9; }
+        .body code {
+          background: rgba(255, 255, 255, 0.1);
+          padding: 2px 6px;
+          border-radius: 4px;
+          color: #38bdf8;
+          font-size: 13px;
+        }
+        .body a { color: #38bdf8; text-decoration: underline; }
+        .body ul, .body ol {
+          margin: 10px 0 0 18px;
+          padding: 0;
+        }
+        .body li {
+          margin-bottom: 6px;
+        }
+        .actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+        }
+        .btn {
+          border: none;
+          padding: 10px 18px;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          font-family: inherit;
+          transition: all 0.15s ease;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          text-decoration: none;
+        }
+        .btn-primary {
+          background: #0284c7;
+          color: #ffffff;
+        }
+        .btn-primary:hover {
+          background: #0369a1;
+        }
+        .btn-secondary {
+          background: rgba(255, 255, 255, 0.08);
+          color: #cbd5e1;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+        .btn-secondary:hover {
+          background: rgba(255, 255, 255, 0.14);
+          color: #ffffff;
+        }
+      </style>
+      <div class="backdrop" id="backdrop">
+        <div class="modal">
+          <div class="icon-badge">${icon}</div>
+          <div class="title">${title}</div>
+          <div class="body">${messageHtml}</div>
+          <div class="actions">
+            ${secondaryBtn ? `<button class="btn btn-secondary" id="sec-btn">${secondaryBtn.text}</button>` : ""}
+            <button class="btn btn-primary" id="pri-btn">${primaryBtn.text}</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const close = () => {
+      host.remove();
+      window.removeEventListener("keydown", onKeyDown);
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    shadow.getElementById("backdrop").addEventListener("click", (e) => {
+      if (e.target.id === "backdrop") close();
+    });
+
+    const priEl = shadow.getElementById("pri-btn");
+    priEl.addEventListener("click", () => {
+      if (primaryBtn.action) {
+        try { primaryBtn.action(); } catch (_) {}
+      }
+      close();
+    });
+
+    if (secondaryBtn) {
+      const secEl = shadow.getElementById("sec-btn");
+      secEl.addEventListener("click", () => {
+        if (secondaryBtn.action) {
+          try { secondaryBtn.action(); } catch (_) {}
+        }
+        close();
+      });
+    }
+  }
+
+  // --- 1. Validate Target Website / Domain ---
+  const hostName = (typeof window !== "undefined" && window.location && window.location.hostname) || "";
+  const safeHost = String(hostName).replace(/[^\w.-]/g, "") || "an external website";
+  const isAllowedHost =
+    /(^|\.)kinderpedia\.(co|ro|com)$/i.test(hostName) ||
+    hostName === "localhost" ||
+    hostName === "127.0.0.1" ||
+    (typeof document !== "undefined" && !!document.getElementById("launch-test-btn")) ||
+    (typeof window !== "undefined" && window.location && window.location.search && window.location.search.includes("kp_test=1"));
+
+  if (!isAllowedHost) {
+    showNoticeModal({
+      icon: "🌐",
+      title: "Open Kinderpedia to Use Backup",
+      messageHtml: `This bookmarklet backs up media directly from your logged-in Kinderpedia account.<br><br>You are currently on <code>${safeHost}</code>. Please navigate to your Kinderpedia portal, log in, and click this bookmarklet again.`,
+      primaryBtn: {
+        text: "Go to app.kinderpedia.co ↗",
+        action: () => {
+          window.open("https://app.kinderpedia.co", "_blank");
+        },
+      },
+      secondaryBtn: {
+        text: "Close",
+      },
+    });
+    return;
+  }
+
+  // --- 2. Validate Device & File System Capabilities ---
+  const isMobileDevice = (() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|mobile/i.test(ua);
+    const isIPadOS = navigator.maxTouchPoints > 1 && /Macintosh/.test(ua);
+    return isMobileUA || isIPadOS;
+  })();
+
+  const isFileSystemSupported = typeof window !== "undefined" && typeof window.showDirectoryPicker === "function";
+
+  if (isMobileDevice) {
+    showNoticeModal({
+      icon: "📱",
+      title: "Desktop Computer Required",
+      messageHtml: `Mobile browsers (iPhone, iPad, and Android) do not support the <b>File System Access API</b>, which is required to stream and organize gigabytes of high-resolution photos and videos directly into folders.<br><br><b>To download your family archive:</b><ol><li>Open a computer (Mac, Windows, Linux, or Chromebook).</li><li>Use <b>Google Chrome</b>, <b>Microsoft Edge</b>, or <b>Brave</b>.</li><li>Log into <b><a href="https://app.kinderpedia.co" target="_blank">app.kinderpedia.co</a></b> and click the bookmarklet.</li></ol>`,
+      primaryBtn: {
+        text: "Got It",
+      },
+    });
+    return;
+  }
+
+  if (!isFileSystemSupported) {
+    showNoticeModal({
+      icon: "💻",
+      title: "Chromium Browser Required",
+      messageHtml: `Your current browser (such as Safari or Firefox) does not support direct folder saving (File System Access API).<br><br>Please open your Kinderpedia account in a Chromium-based browser to back up your photos, videos, and documents:<ul><li><b>Google Chrome</b> (Recommended)</li><li><b>Microsoft Edge</b></li><li><b>Brave</b> or <b>Opera</b></li></ul>`,
+      primaryBtn: {
+        text: "Got It",
+      },
+    });
+    return;
+  }
+
   const API_KEY = "Web01Pari3l4em|v1.02";
   const BASE_API = "https://app.kinderpedia.co/web-api";
   const USERGATEWAY_API = "https://usergateway-services.kinderpedia.co";
