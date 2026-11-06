@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kinderpedia Cloud Backup — 1-Click Bookmarklet</title>
+  <style>
+    :root {
+      --primary: #38bdf8;
+      --primary-hover: #0284c7;
+      --bg: #0f172a;
+      --card-bg: rgba(30, 41, 59, 0.7);
+      --border: rgba(255, 255, 255, 0.1);
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(135deg, #090d16 0%, #0f172a 50%, #1e1b4b 100%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    .container {
+      max-width: 800px;
+      width: 100%;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--primary);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    h1 {
+      font-size: 36px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      margin-bottom: 12px;
+      background: linear-gradient(90deg, #fff 0%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p.subtitle {
+      font-size: 16px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    .card {
+      background: var(--card-bg);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      margin-bottom: 24px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    }
+    .bookmark-cta {
+      text-align: center;
+      padding: 24px;
+      background: rgba(56, 189, 248, 0.05);
+      border: 2px dashed rgba(56, 189, 248, 0.4);
+      border-radius: 12px;
+      margin: 20px 0;
+    }
+    .bookmarklet-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: linear-gradient(135deg, #38bdf8 0%, #6366f1 100%);
+      color: #fff;
+      font-size: 18px;
+      font-weight: 700;
+      padding: 14px 28px;
+      border-radius: 12px;
+      text-decoration: none;
+      box-shadow: 0 8px 24px rgba(56, 189, 248, 0.35);
+      cursor: grab;
+      user-select: none;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .bookmarklet-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 32px rgba(56, 189, 248, 0.5);
+    }
+    .bookmarklet-btn:active {
+      cursor: grabbing;
+    }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      margin-top: 24px;
+    }
+    .step-item {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .step-num {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: rgba(56, 189, 248, 0.2);
+      color: var(--primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .step-text h4 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .step-text p {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .code-box {
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 12px;
+      color: #cbd5e1;
+      overflow-x: auto;
+      margin-top: 10px;
+    }
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-top: 20px;
+    }
+    .feature-card {
+      background: rgba(15, 23, 42, 0.5);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      padding: 16px;
+      border-radius: 10px;
+    }
+    .feature-card h5 {
+      font-size: 14px;
+      color: #fff;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .feature-card p {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+    .test-actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .btn {
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .btn-secondary {
+      background: #334155;
+      color: #fff;
+    }
+    .btn-secondary:hover {
+      background: #475569;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <span class="badge">Zero Native Installs • Pure Browser</span>
+      <h1>Kinderpedia Cloud Backup</h1>
+      <p class="subtitle">Directly download all full-resolution photo albums, private Vimeo videos, and documents to your computer hard drive in 1 click.</p>
+    </header>
+
+    <div class="card">
+      <h3 style="margin-bottom: 12px;">Step 1: Install Bookmarklet</h3>
+      <p style="font-size: 13px; color: var(--text-muted);">
+        Drag the purple button below directly onto your web browser's <b>Bookmarks Bar</b> (press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> on Mac or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> on Windows if your bookmarks bar is hidden).
+      </p>
+
+      <div class="bookmark-cta">
+        <a id="bookmarklet-link" class="bookmarklet-btn" href="#">
+          💾 Kinderpedia Backup
+        </a>
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 10px;">
+          (Drag this button to your Bookmarks Bar)
+        </div>
+      </div>
+
+      <div class="steps">
+        <div class="step-item">
+          <div class="step-num">1</div>
+          <div class="step-text">
+            <h4>Open Kinderpedia in your Browser</h4>
+            <p>Go to <a href="https://app.kinderpedia.co" target="_blank" style="color:var(--primary);">app.kinderpedia.co</a> and sign in with your parent account as usual.</p>
+          </div>
+        </div>
+
+        <div class="step-item">
+          <div class="step-num">2</div>
+          <div class="step-text">
+            <h4>Click the "Kinderpedia Backup" Bookmark</h4>
+            <p>A floating glassmorphic dashboard will appear directly on top of the Kinderpedia page.</p>
+          </div>
+        </div>
+
+        <div class="step-item">
+          <div class="step-num">3</div>
+          <div class="step-text">
+            <h4>Pick a Destination Folder on Your Computer</h4>
+            <p>Click "Select Folder". Chrome will prompt you to choose where to save the files (e.g., your Desktop or External Drive). It streams files straight to disk with zero RAM buildup!</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom: 12px;">How It Works & Capabilities</h3>
+      <div class="features-grid">
+        <div class="feature-card">
+          <h5>⚡ File System Access API</h5>
+          <p>Streams multi-gigabyte photos and video files directly from network sockets straight to disk handles, keeping browser memory under 30 MB.</p>
+        </div>
+        <div class="feature-card">
+          <h5>🛡️ Adaptive Rate Limiter</h5>
+          <p>Uses AIMD + soft-floor request pacing to stream metadata at maximum velocity without triggering HTTP 429 quota bans.</p>
+        </div>
+        <div class="feature-card">
+          <h5>🔄 Instant Resume</h5>
+          <p>Checks local files and JSON manifests on startup. Skips existing photos in &lt;1 second if you pause or resume later.</p>
+        </div>
+        <div class="feature-card">
+          <h5>🎬 Pure-JS Video Remuxing</h5>
+          <p>Uses in-browser Web Workers with <code>mux.js</code> to assemble Vimeo HLS streams into playable standard MP4 files without native FFmpeg.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom: 12px;">Alternative: Manual Paste in Console</h3>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;">
+        If you prefer not to use bookmarks, open DevTools (<kbd>F12</kbd> or <kbd>Cmd</kbd>+<kbd>Option</kbd>+<kbd>I</kbd>) on <a href="https://app.kinderpedia.co" target="_blank" style="color:var(--primary);">app.kinderpedia.co</a>, paste this in the <b>Console</b> tab, and hit Enter:
+      </p>
+      <div class="code-box" id="raw-code">
+        // Generating bookmarklet code...
+      </div>
+      <div class="test-actions">
+        <button id="copy-btn" class="btn btn-secondary">📋 Copy Code</button>
+        <button id="launch-test-btn" class="btn btn-secondary">🧪 Test Overlay in This Tab</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Construct dynamic loader bookmarklet
+    const currentOrigin = window.location.origin;
+    const scriptUrl = new URL("kinderpedia-backup.js", window.location.href).href;
+
+    const bookmarkletCode = `javascript:(function(){if(window.__kinderpedia_backup_instance){window.__kinderpedia_backup_instance.toggleUI();return;}const s=document.createElement('script');s.src='${scriptUrl}?t='+Date.now();document.body.appendChild(s);})();`;
+
+    document.getElementById("bookmarklet-link").setAttribute("href", bookmarkletCode);
+    document.getElementById("raw-code").textContent = bookmarkletCode;
+
+    document.getElementById("copy-btn").addEventListener("click", () => {
+      navigator.clipboard.writeText(bookmarkletCode).then(() => {
+        alert("Bookmarklet code copied to clipboard! Paste it into Chrome Console on app.kinderpedia.co");
+      });
+    });
+
+    document.getElementById("launch-test-btn").addEventListener("click", () => {
+      const s = document.createElement("script");
+      s.src = "kinderpedia-backup.js?t=" + Date.now();
+      document.body.appendChild(s);
+    });
+  </script>
+</body>
+</html>
