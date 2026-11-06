@@ -1107,9 +1107,9 @@
         : `${totalPhotosDone.toLocaleString()}`;
 
       const totalVideosDone = videosSaved + videosSkipped;
-      this.statVideos.textContent = totalVideos > 0
-        ? `${totalVideosDone} / ${totalVideos}`
-        : `${totalVideosDone}`;
+      this.statVideos.textContent = videosSaved > 0
+        ? `${videosSaved} / ${totalVideos}`
+        : `${totalVideos} cataloged`;
 
       this.statSpeed.textContent = speed;
       this.statEta.textContent = eta;
@@ -1785,7 +1785,24 @@
         } catch (_) {}
       }
 
+      // Check if local streaming helper server (serve.js) is available
+      if (this.vimeoHelperAvailable === undefined) {
+        try {
+          const check = await fetch("http://localhost:8080/vimeo-config?test=1", { signal: AbortSignal.timeout(600) });
+          this.vimeoHelperAvailable = check.ok;
+        } catch (_) {
+          this.vimeoHelperAvailable = false;
+        }
+      }
+
       if (videoUrl && videoUrl.includes("vimeo.com")) {
+        // ON KINDERPEDIA: If local helper is NOT active, DO NOT attempt to fetch Vimeo or generate errors!
+        if (!this.vimeoHelperAvailable) {
+          this.stats.videosSkipped++;
+          this.refreshLiveUI(ctx.child_name);
+          return;
+        }
+
         try {
           this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 30)}"...`);
           const vHandle = await videosDir.getFileHandle(vname, { create: true });
@@ -1802,7 +1819,7 @@
           this.ui.log(`🎬 Video downloaded: "${sanitizeName(vid.name || vid.id, 40)}"`);
         } catch (err) {
           try { await videosDir.removeEntry(vname); } catch (_) {}
-          this.ui.log(`⚠️ Could not download video: "${sanitizeName(vid.name || vid.id, 40)}"`);
+          console.warn("[Video] Download failed:", err);
         }
       } else if (videoUrl && (videoUrl.includes(".mp4") || videoUrl.includes("kinderpedia.co"))) {
         try {
@@ -1815,7 +1832,7 @@
           }
         } catch (err) {
           try { await videosDir.removeEntry(vname); } catch (_) {}
-          this.ui.log(`⚠️ Could not download video: "${sanitizeName(vid.name || vid.id, 40)}"`);
+          console.warn("[Video] Download failed:", err);
         }
       }
       this.refreshLiveUI(ctx.child_name);
