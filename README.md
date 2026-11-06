@@ -73,16 +73,10 @@ Google Chrome, Microsoft Edge, Brave, Opera, and other modern Chromium-based bro
 
 ---
 
-## 🎬 Classroom Videos (Optional Helper)
+## 🎬 Classroom Videos
 
-Photos and school documents download directly with zero extra setup.
+Photos, school documents, and classroom videos are all supported!
 
-Kinderpedia hosts classroom videos on Vimeo, which places restrictions on web browsers downloading videos directly. By default, the tool will safely catalog all your video details into a neat index file.
+Because Kinderpedia hosts classroom videos on Vimeo (which normally restricts direct in-browser downloads), the bookmarklet includes a pre-configured Cloudflare Video Helper so videos download directly to your computer as `.mp4` files alongside your photos and documents—with zero local software or terminal required.
 
-If you would like your videos to download directly onto your computer as `.mp4` files without running any software, you can use a free Cloudflare Worker:
-1. Log in to [Cloudflare](https://dash.cloudflare.com/) (it's 100% free).
-2. Go to **Workers & Pages** ➔ **Create application** ➔ **Create Worker**.
-3. Name it `kinderpedia-video-helper` and click **Deploy**.
-4. Click **Edit code**, paste the contents of [`worker.js`](worker.js), and click **Deploy**.
-5. Copy your worker address (e.g. `https://kinderpedia-video-helper.<your-subdomain>.workers.dev`).
-6. In your Kinderpedia Backup bookmarklet, click **⚡ Cloudflare Video Helper (Optional)**, paste your worker address, and your videos will download automatically!
+*(Optional for developers)*: If you want to host your own private video helper, the complete code is included in [`worker.js`](worker.js) and can be deployed for free to your own Cloudflare account.

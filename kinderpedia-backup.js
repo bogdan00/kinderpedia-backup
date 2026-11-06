@@ -26,6 +26,8 @@
   const BASE_API = "https://app.kinderpedia.co/web-api";
   const USERGATEWAY_API = "https://usergateway-services.kinderpedia.co";
   const MUX_JS_CDN = "https://cdnjs.cloudflare.com/ajax/libs/mux.js/6.3.0/mux.min.js";
+  const DEFAULT_WORKER_URL = "https://kinderpedia-backup.bogdan00.workers.dev";
+  const DEFAULT_WORKER_SECRET = "kp_sec_98721";
 
   // --- Utility Functions ---
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -819,8 +821,12 @@
       const writable = await destFileHandle.createWritable({ keepExistingData: false });
       const transmuxer = new window.mux.mp4.Transmuxer({ keepOriginalTimestamps: true });
 
+      let initWritten = false;
       transmuxer.on("data", async (segment) => {
-        if (segment.initSegment) await writable.write(segment.initSegment);
+        if (segment.initSegment && !initWritten) {
+          await writable.write(segment.initSegment);
+          initWritten = true;
+        }
         if (segment.data) await writable.write(segment.data);
       });
 
@@ -958,15 +964,15 @@
 
             <div style="margin-bottom: 14px; font-size: 11px;">
               <div id="worker-toggle-row" style="display:flex; justify-content:space-between; align-items:center; cursor:pointer; color:#38bdf8; user-select:none; padding:4px 0;">
-                <span id="worker-toggle-text">⚡ Cloudflare Video Helper (Optional)</span>
+                <span id="worker-toggle-text">⚡ Video Downloader: Cloudflare Edge (Active)</span>
                 <span id="worker-toggle-arrow">▾</span>
               </div>
               <div id="worker-panel" style="display:none; margin-top:8px; background:rgba(30, 41, 59, 0.7); border:1px solid rgba(56, 189, 248, 0.2); border-radius:8px; padding:10px;">
                 <label style="display:block; color:#94a3b8; font-size:11px; margin-bottom:4px;">Worker URL:</label>
-                <input id="worker-url-input" type="url" placeholder="https://kp-vimeo-proxy.<subdomain>.workers.dev" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px; margin-bottom:8px;" />
+                <input id="worker-url-input" type="url" value="https://kinderpedia-backup.bogdan00.workers.dev" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px; margin-bottom:8px;" />
                 <label style="display:block; color:#94a3b8; font-size:11px; margin-bottom:4px;">Shared Secret:</label>
-                <input id="worker-secret-input" type="password" placeholder="kp_sec_98721" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px;" />
-                <div style="font-size:10px; color:#64748b; margin-top:6px; line-height:1.4;">Allows in-browser video downloads without running a local server.</div>
+                <input id="worker-secret-input" type="password" value="kp_sec_98721" style="width:100%; box-sizing:border-box; padding:6px 8px; border-radius:6px; background:#0f172a; border:1px solid #334155; color:#fff; font-size:11px;" />
+                <div style="font-size:10px; color:#34d399; margin-top:6px; line-height:1.4;">✓ Pre-configured: videos will download automatically without running a local server.</div>
               </div>
             </div>
 
@@ -1031,14 +1037,10 @@
 
       if (this.workerToggleRow && this.workerPanel) {
         try {
-          const savedUrl = localStorage.getItem("kp_worker_url") || "";
-          const savedSec = localStorage.getItem("kp_worker_secret") || "";
-          if (savedUrl) {
-            this.workerUrlInput.value = savedUrl;
-            this.workerPanel.style.display = "block";
-            this.workerToggleArrow.textContent = "▴";
-          }
-          if (savedSec) this.workerSecretInput.value = savedSec;
+          const savedUrl = localStorage.getItem("kp_worker_url") || DEFAULT_WORKER_URL;
+          const savedSec = localStorage.getItem("kp_worker_secret") || DEFAULT_WORKER_SECRET;
+          if (this.workerUrlInput) this.workerUrlInput.value = savedUrl;
+          if (this.workerSecretInput) this.workerSecretInput.value = savedSec;
         } catch (_) {}
 
         this.workerToggleRow.addEventListener("click", () => {
@@ -1231,11 +1233,11 @@
 
     getWorkerConfig() {
       try {
-        const url = (this.ui?.workerUrlInput?.value || localStorage.getItem("kp_worker_url") || "").trim();
-        const secret = (this.ui?.workerSecretInput?.value || localStorage.getItem("kp_worker_secret") || "kp_sec_98721").trim();
-        if (url) return { url: url.replace(/\/+$/, ""), secret: secret || "kp_sec_98721" };
+        const url = (this.ui?.workerUrlInput?.value || localStorage.getItem("kp_worker_url") || DEFAULT_WORKER_URL).trim();
+        const secret = (this.ui?.workerSecretInput?.value || localStorage.getItem("kp_worker_secret") || DEFAULT_WORKER_SECRET).trim();
+        if (url) return { url: url.replace(/\/+$/, ""), secret: secret || DEFAULT_WORKER_SECRET };
       } catch (_) {}
-      return null;
+      return { url: DEFAULT_WORKER_URL, secret: DEFAULT_WORKER_SECRET };
     }
 
     toggleUI() {
