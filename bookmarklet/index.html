@@ -3,304 +3,893 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Kinderpedia Cloud Backup — 1-Click Bookmarklet</title>
+  <title>Kinderpedia Backup — Save All Your Child's Photos &amp; Videos in 3 Steps</title>
+  <meta name="description" content="Free 1-click browser bookmarklet for parents to download all full-resolution Kinderpedia photo albums, classroom videos, and documents directly to their computer.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="alternate icon" type="image/png" href="favicon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --primary: #38bdf8;
-      --primary-hover: #0284c7;
-      --bg: #0f172a;
-      --card-bg: rgba(30, 41, 59, 0.7);
-      --border: rgba(255, 255, 255, 0.1);
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
+      --bg-page: hsl(38, 35%, 96%);
+      --bg-surface: hsl(0, 0%, 100%);
+      --bg-subtle: hsl(38, 28%, 93%);
+      --bg-warm-tint: hsl(38, 45%, 95%);
+      --ink-strong: hsl(215, 32%, 13%);
+      --ink-body: hsl(215, 20%, 28%);
+      --ink-muted: hsl(215, 14%, 46%);
+      --accent: hsl(198, 86%, 34%);
+      --accent-hover: hsl(198, 90%, 28%);
+      --accent-soft: hsl(198, 75%, 94%);
+      --success: hsl(152, 68%, 29%);
+      --success-soft: hsl(152, 55%, 93%);
+      --warn-bg: hsl(36, 95%, 94%);
+      --warn-ink: hsl(28, 78%, 26%);
+      --line: hsla(215, 25%, 15%, 0.09);
+      --line-strong: hsla(215, 25%, 15%, 0.16);
+      --shadow-card:
+        0 1px 2px hsla(215, 30%, 12%, 0.04),
+        0 12px 32px -8px hsla(215, 30%, 12%, 0.07);
+      --shadow-btn:
+        0 2px 4px hsla(198, 86%, 20%, 0.18),
+        0 10px 24px -4px hsla(198, 86%, 28%, 0.32);
+      --radius-lg: 20px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #090d16 0%, #0f172a 50%, #1e1b4b 100%);
-      color: var(--text);
-      min-height: 100vh;
+      font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background-color: var(--bg-page);
+      background-image: radial-gradient(ellipse 90% 50% at 50% -10%, hsl(198, 60%, 91%), transparent 70%);
+      color: var(--ink-body);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      padding: 36px 18px 64px;
+    }
+
+    .page-shell {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+
+    /* Compatibility Notice Banner (shown only on Mobile or Safari/Firefox) */
+    .compat-banner {
+      display: none;
+      background: var(--warn-bg);
+      color: var(--warn-ink);
+      border: 1px solid hsla(28, 70%, 40%, 0.2);
+      border-radius: var(--radius-md);
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      font-size: 14px;
+      line-height: 1.5;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .compat-banner.is-visible {
+      display: flex;
+    }
+
+    .compat-banner strong {
+      display: block;
+      font-size: 15px;
+      margin-bottom: 2px;
+    }
+
+    .compat-copy-btn {
+      background: var(--bg-surface);
+      color: var(--warn-ink);
+      border: 1px solid hsla(28, 70%, 35%, 0.25);
+      padding: 8px 14px;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s ease, transform 0.15s ease;
+    }
+
+    .compat-copy-btn:hover {
+      background: hsl(36, 60%, 98%);
+      transform: translateY(-1px);
+    }
+
+    /* Hero Header */
+    header.hero {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+
+    header.hero h1 {
+      font-size: clamp(28px, 5vw, 40px);
+      font-weight: 800;
+      color: var(--ink-strong);
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 12px;
+    }
+
+    header.hero p.lead {
+      font-size: clamp(16px, 2.3vw, 18px);
+      color: var(--ink-body);
+      max-width: 600px;
+      margin: 0 auto 18px;
+    }
+
+    .trust-strip {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px 20px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-muted);
+    }
+
+    .trust-strip span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .trust-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--success);
+      display: inline-block;
+    }
+
+    /* Main Steps Card */
+    .steps-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-card);
+      padding: clamp(22px, 4vw, 38px);
+      margin-bottom: 24px;
+    }
+
+    .step-list {
+      list-style: none;
       display: flex;
       flex-direction: column;
-      align-items: center;
-      padding: 40px 20px;
+      gap: 32px;
     }
-    .container {
-      max-width: 800px;
-      width: 100%;
+
+    .step {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 16px;
+      align-items: start;
     }
-    header {
-      text-align: center;
-      margin-bottom: 40px;
-    }
-    .badge {
-      display: inline-block;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: rgba(56, 189, 248, 0.15);
-      color: var(--primary);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      font-size: 12px;
-      font-weight: 600;
-      margin-bottom: 12px;
-    }
-    h1 {
-      font-size: 36px;
+
+    .step-badge {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      color: var(--accent);
       font-weight: 800;
-      letter-spacing: -0.5px;
-      margin-bottom: 12px;
-      background: linear-gradient(90deg, #fff 0%, #cbd5e1 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-    p.subtitle {
       font-size: 16px;
-      color: var(--text-muted);
-      line-height: 1.6;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 1px;
     }
-    .card {
-      background: var(--card-bg);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--border);
+
+    .step-body h2 {
+      font-size: 19px;
+      font-weight: 700;
+      color: var(--ink-strong);
+      letter-spacing: -0.015em;
+      margin-bottom: 6px;
+    }
+
+    .step-body p {
+      font-size: 15px;
+      color: var(--ink-body);
+    }
+
+    .step-divider {
+      height: 1px;
+      background: var(--line);
+      border: none;
+    }
+
+    /* Interactive Browser Mockup + Drag Zone */
+    .drag-stage {
+      margin-top: 16px;
+      background: var(--bg-warm-tint);
+      border: 1px solid var(--line-strong);
       border-radius: 16px;
-      padding: 32px;
-      margin-bottom: 24px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      overflow: hidden;
     }
-    .bookmark-cta {
+
+    .browser-bar-mock {
+      background: hsl(215, 22%, 92%);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 14px 8px;
+      user-select: none;
+    }
+
+    .browser-top-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .window-dots {
+      display: flex;
+      gap: 5px;
+    }
+
+    .window-dots i {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: block;
+      background: hsla(215, 16%, 55%, 0.45);
+    }
+
+    .mock-url {
+      flex: 1;
+      background: var(--bg-surface);
+      border-radius: 999px;
+      padding: 3px 12px;
+      font-size: 11.5px;
+      color: var(--ink-muted);
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .mock-bookmarks-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 4px 4px 2px;
+      font-size: 12px;
+      color: var(--ink-muted);
+    }
+
+    .mock-drop-slot {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 6px;
+      border: 1.5px dashed var(--accent);
+      background: hsla(198, 86%, 96%, 0.85);
+      color: var(--accent);
+      font-weight: 700;
+      font-size: 12px;
+      transition: transform 0.2s ease, background 0.2s ease;
+    }
+
+    .drag-stage.is-dragging .mock-drop-slot {
+      background: var(--success-soft);
+      border-color: var(--success);
+      color: var(--success);
+      transform: scale(1.04);
+    }
+
+    .drag-cta-body {
+      padding: 24px 20px 20px;
       text-align: center;
-      padding: 24px;
-      background: rgba(56, 189, 248, 0.05);
-      border: 2px dashed rgba(56, 189, 248, 0.4);
-      border-radius: 12px;
-      margin: 20px 0;
     }
+
+    .drag-arrow-hint {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
     .bookmarklet-btn {
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      background: linear-gradient(135deg, #38bdf8 0%, #6366f1 100%);
-      color: #fff;
-      font-size: 18px;
+      background: var(--accent);
+      color: #ffffff;
+      font-size: 17px;
       font-weight: 700;
+      letter-spacing: -0.01em;
       padding: 14px 28px;
-      border-radius: 12px;
+      border-radius: var(--radius-md);
       text-decoration: none;
-      box-shadow: 0 8px 24px rgba(56, 189, 248, 0.35);
+      box-shadow: var(--shadow-btn);
       cursor: grab;
       user-select: none;
-      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      transition: transform 0.16s ease, background-color 0.16s ease, box-shadow 0.16s ease;
     }
+
     .bookmarklet-btn:hover {
+      background: var(--accent-hover);
       transform: translateY(-2px);
-      box-shadow: 0 12px 32px rgba(56, 189, 248, 0.5);
     }
+
     .bookmarklet-btn:active {
       cursor: grabbing;
+      transform: translateY(0);
     }
-    .steps {
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-      margin-top: 24px;
+
+    .drag-feedback {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--ink-muted);
+      min-height: 22px;
+      transition: color 0.2s ease;
     }
-    .step-item {
-      display: flex;
-      gap: 16px;
-      align-items: flex-start;
+
+    .drag-feedback.is-nudge {
+      color: var(--warn-ink);
+      background: var(--warn-bg);
+      display: inline-block;
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-weight: 600;
+      animation: gentlePop 0.28s ease;
     }
-    .step-num {
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      background: rgba(56, 189, 248, 0.2);
-      color: var(--primary);
+
+    .drag-feedback.is-active-drag {
+      color: var(--success);
+      font-weight: 700;
+    }
+
+    @keyframes gentlePop {
+      0% { transform: scale(0.96); opacity: 0.5; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
+    .shortcut-helper {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid hsla(215, 25%, 15%, 0.08);
+      font-size: 13px;
+      color: var(--ink-muted);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-weight: 700;
-      font-size: 14px;
-      flex-shrink: 0;
-    }
-    .step-text h4 {
-      font-size: 15px;
-      font-weight: 600;
-      margin-bottom: 4px;
-    }
-    .step-text p {
-      font-size: 13px;
-      color: var(--text-muted);
-      line-height: 1.5;
-    }
-    .code-box {
-      background: #090d16;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
-      font-family: ui-monospace, Menlo, monospace;
-      font-size: 12px;
-      color: #cbd5e1;
-      overflow-x: auto;
-      margin-top: 10px;
-    }
-    .features-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin-top: 20px;
-    }
-    .feature-card {
-      background: rgba(15, 23, 42, 0.5);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      padding: 16px;
-      border-radius: 10px;
-    }
-    .feature-card h5 {
-      font-size: 14px;
-      color: #fff;
-      margin-bottom: 6px;
-      display: flex;
-      align-items: center;
+      flex-wrap: wrap;
       gap: 6px;
     }
-    .feature-card p {
-      font-size: 12px;
-      color: var(--text-muted);
-      line-height: 1.4;
+
+    kbd {
+      font-family: "JetBrains Mono", ui-monospace, Menlo, monospace;
+      font-size: 11.5px;
+      font-weight: 500;
+      background: var(--bg-surface);
+      color: var(--ink-strong);
+      border: 1px solid var(--line-strong);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      padding: 2px 6px;
     }
-    .test-actions {
-      display: flex;
-      gap: 12px;
-      margin-top: 16px;
+
+    .os-switch-btn {
+      background: none;
+      border: none;
+      color: var(--accent);
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      text-decoration: underline;
+      cursor: pointer;
+      padding: 0 2px;
     }
-    .btn {
+
+    /* Step 2 Action Link */
+    .open-kp-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
       padding: 10px 18px;
-      border-radius: 8px;
+      background: var(--bg-subtle);
+      color: var(--ink-strong);
+      font-weight: 700;
+      font-size: 14px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--line-strong);
+      text-decoration: none;
+      transition: background 0.15s ease, transform 0.15s ease;
+    }
+
+    .open-kp-link:hover {
+      background: hsl(38, 25%, 89%);
+      transform: translateY(-1px);
+    }
+
+    /* Step 3 Mini Tips */
+    .step-notes {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+    }
+
+    .mini-note {
+      background: var(--bg-page);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      font-size: 13px;
+      color: var(--ink-body);
+    }
+
+    .mini-note strong {
+      color: var(--ink-strong);
+      display: block;
+      font-size: 13px;
+      margin-bottom: 2px;
+    }
+
+    /* Folder Preview Section */
+    .info-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-card);
+      padding: clamp(20px, 3.5vw, 30px);
+      margin-bottom: 24px;
+    }
+
+    .info-card h2 {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--ink-strong);
+      letter-spacing: -0.015em;
+      margin-bottom: 6px;
+    }
+
+    .info-card > p {
+      font-size: 14.5px;
+      color: var(--ink-muted);
+      margin-bottom: 16px;
+    }
+
+    .folder-tree {
+      background: hsl(215, 28%, 13%);
+      color: hsl(210, 25%, 92%);
+      border-radius: var(--radius-md);
+      padding: 18px 20px;
+      font-family: "JetBrains Mono", ui-monospace, Menlo, monospace;
+      font-size: 12.5px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+
+    .folder-tree .comment {
+      color: hsl(198, 65%, 72%);
+    }
+
+    /* FAQ Accordion */
+    .faq-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    details.faq-item {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--bg-page);
+      overflow: hidden;
+    }
+
+    details.faq-item summary {
+      padding: 14px 18px;
+      font-weight: 600;
+      font-size: 14.5px;
+      color: var(--ink-strong);
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    details.faq-item summary::-webkit-details-marker {
+      display: none;
+    }
+
+    details.faq-item summary::after {
+      content: "+";
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink-muted);
+      line-height: 1;
+      transition: transform 0.15s ease;
+    }
+
+    details.faq-item[open] summary::after {
+      content: "−";
+    }
+
+    .faq-answer {
+      padding: 0 18px 16px;
+      font-size: 14px;
+      color: var(--ink-body);
+      line-height: 1.6;
+    }
+
+    .faq-answer a {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .code-box {
+      background: hsl(215, 28%, 13%);
+      color: hsl(210, 25%, 90%);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      font-family: "JetBrains Mono", ui-monospace, Menlo, monospace;
+      font-size: 12px;
+      overflow-x: auto;
+      margin: 10px 0 12px;
+      white-space: nowrap;
+    }
+
+    .console-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .btn-secondary {
+      padding: 9px 15px;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
       font-weight: 600;
       font-size: 13px;
-      border: none;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-surface);
+      color: var(--ink-strong);
       cursor: pointer;
       transition: background 0.15s ease;
     }
-    .btn-secondary {
-      background: #334155;
-      color: #fff;
-    }
+
     .btn-secondary:hover {
-      background: #475569;
+      background: var(--bg-subtle);
+    }
+
+    footer.page-footer {
+      text-align: center;
+      font-size: 13px;
+      color: var(--ink-muted);
+      margin-top: 28px;
+    }
+
+    footer.page-footer a {
+      color: var(--ink-body);
+      font-weight: 600;
+      text-decoration: underline;
+    }
+
+    @media (max-width: 560px) {
+      body {
+        padding: 22px 14px 48px;
+      }
+      .step {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .bookmarklet-btn {
+        width: 100%;
+        justify-content: center;
+      }
+      .mock-bookmarks-bar span.mock-existing {
+        display: none;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <span class="badge">Zero Native Installs • Pure Browser</span>
-      <h1>Kinderpedia Cloud Backup</h1>
-      <p class="subtitle">Directly download all full-resolution photo albums, private Vimeo videos, and documents to your computer hard drive in 1 click.</p>
+  <div class="page-shell">
+    <aside id="compat-banner" class="compat-banner" aria-live="polite">
+      <div id="compat-message"></div>
+      <button type="button" id="compat-copy-url-btn" class="compat-copy-btn">Copy Link for Chrome</button>
+    </aside>
+
+    <header class="hero">
+      <h1>Save Every Kindergarten Photo &amp; Video</h1>
+      <p class="lead">Download all of your child's full-resolution Kinderpedia photo albums, classroom videos, and school documents straight into neat folders on your computer.</p>
+      <div class="trust-strip">
+        <span><i class="trust-dot"></i> Nothing to install</span>
+        <span><i class="trust-dot"></i> Works in Chrome, Edge &amp; Brave</span>
+        <span><i class="trust-dot"></i> 100% private — saves directly to your disk</span>
+      </div>
     </header>
 
-    <div class="card">
-      <h3 style="margin-bottom: 12px;">Step 1: Install Bookmarklet</h3>
-      <p style="font-size: 13px; color: var(--text-muted);">
-        Drag the purple button below directly onto your web browser's <b>Bookmarks Bar</b> (press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> on Mac or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> on Windows if your bookmarks bar is hidden).
+    <main>
+      <section class="steps-card" aria-label="Setup Steps">
+        <ol class="step-list">
+          <!-- STEP 1 -->
+          <li class="step">
+            <div class="step-badge" aria-hidden="true">1</div>
+            <div class="step-body">
+              <h2>Drag this button up to your Bookmarks Bar</h2>
+              <p>Click and <strong>hold</strong> the blue button below, then drag it up onto your browser's Bookmarks Bar right underneath the address bar.</p>
+
+              <div class="drag-stage" id="drag-stage">
+                <div class="browser-bar-mock" aria-hidden="true">
+                  <div class="browser-top-row">
+                    <div class="window-dots"><i></i><i></i><i></i></div>
+                    <div class="mock-url">app.kinderpedia.co</div>
+                  </div>
+                  <div class="mock-bookmarks-bar">
+                    <span class="mock-existing">★ Gmail</span>
+                    <span class="mock-existing">★ Calendar</span>
+                    <span class="mock-drop-slot" id="mock-drop-slot">↑ Drop "Kinderpedia Backup" here</span>
+                  </div>
+                </div>
+
+                <div class="drag-cta-body">
+                  <div class="drag-arrow-hint" aria-hidden="true">↑ Drag &amp; drop to your Bookmarks Bar ↑</div>
+                  <a id="bookmarklet-link" class="bookmarklet-btn" href="#" title="Drag me to your Bookmarks Bar">
+                    💾 Kinderpedia Backup
+                  </a>
+                  <div id="drag-feedback" class="drag-feedback">
+                    Tip: Hold down your mouse button and drag — don't just click.
+                  </div>
+
+                  <div class="shortcut-helper">
+                    <span>Don't see your Bookmarks Bar? Press</span>
+                    <span id="shortcut-keys"><kbd>⌘ Cmd</kbd> + <kbd>⇧ Shift</kbd> + <kbd>B</kbd></span>
+                    <span>to show it</span>
+                    <button type="button" id="os-switch-btn" class="os-switch-btn">(using Windows?)</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </li>
+
+          <hr class="step-divider">
+
+          <!-- STEP 2 -->
+          <li class="step">
+            <div class="step-badge" aria-hidden="true">2</div>
+            <div class="step-body">
+              <h2>Log in to your Kinderpedia parent account</h2>
+              <p>Open Kinderpedia and sign in as you normally do. Once you're logged in, click the <strong>💾 Kinderpedia Backup</strong> bookmark you just added in your Bookmarks Bar.</p>
+              <a id="open-kinderpedia-btn" class="open-kp-link" href="https://app.kinderpedia.co" target="_blank" rel="noopener">
+                Open app.kinderpedia.co ↗
+              </a>
+            </div>
+          </li>
+
+          <hr class="step-divider">
+
+          <!-- STEP 3 -->
+          <li class="step">
+            <div class="step-badge" aria-hidden="true">3</div>
+            <div class="step-body">
+              <h2>Pick a folder on your computer &amp; click Start</h2>
+              <p>A small backup window will appear right inside Kinderpedia. Choose where you want to save your family archive (for example, a folder on your Desktop or an external drive) and click <strong>Start Backup</strong>.</p>
+              <div class="step-notes">
+                <div class="mini-note">
+                  <strong>Pause or resume anytime</strong>
+                  Need to close your laptop? Run it again later on the same folder — it skips already-saved photos in under a second.
+                </div>
+                <div class="mini-note">
+                  <strong>Browser asks for permission?</strong>
+                  Click <em>"View files"</em> / <em>"Save changes"</em> when Chrome asks so it can save albums straight to your chosen folder.
+                </div>
+              </div>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <!-- FOLDER PREVIEW -->
+      <section class="info-card" aria-labelledby="preview-heading">
+        <h2 id="preview-heading">How Your Saved Archive Is Organized</h2>
+        <p>Every child gets a clean folder sorted by year, month, and activity date — with classroom videos placed right alongside that day's photos:</p>
+        <pre class="folder-tree" aria-label="Example folder structure">Your Chosen Folder/
+├── Alex/
+│   ├── Albums/
+│   │   └── 2026/
+│   │       └── 06/
+│   │           └── 2026-06-12 Summer Festival/
+│   │               ├── 001_507123.jpg
+│   │               ├── 002_507124.jpg
+│   │               └── Classroom Song.mp4   <span class="comment">← same-day videos included!</span>
+│   └── Documents/
+│       └── Weekly Menu.pdf
+└── Metadata/                                <span class="comment">← keeps track of progress for instant resume</span></pre>
+      </section>
+
+      <!-- FAQ & ALTERNATIVE -->
+      <section class="info-card" aria-labelledby="faq-heading">
+        <h2 id="faq-heading">Common Questions</h2>
+        <p>Quick answers if you get stuck or want to run incremental updates later.</p>
+
+        <div class="faq-list">
+          <details class="faq-item">
+            <summary>Are my child's photos private?</summary>
+            <div class="faq-answer">
+              Yes — 100%. The bookmarklet runs entirely inside your own logged-in Kinderpedia browser tab and saves photos, videos, and documents straight from Kinderpedia to your computer's hard drive. Neither your password nor your family photos are ever uploaded to any third-party storage server.
+            </div>
+          </details>
+
+          <details class="faq-item">
+            <summary>Why do I need Google Chrome, Microsoft Edge, or Brave?</summary>
+            <div class="faq-answer">
+              Saving tens of gigabytes of full-resolution photos and videos directly into organized folders without running out of memory uses a modern browser feature (<em>File System Access</em>) currently supported on desktop <strong>Chrome</strong>, <strong>Edge</strong>, <strong>Brave</strong>, and <strong>Opera</strong>. Safari, Firefox, and phone browsers cannot write folders directly to disk.
+            </div>
+          </details>
+
+          <details class="faq-item">
+            <summary>Can I run it again next month to grab only new albums?</summary>
+            <div class="faq-answer">
+              Yes! Simply open Kinderpedia, click the bookmark, and pick your existing backup folder. Any already-downloaded albums and videos are skipped automatically. (If you want to pull newly posted albums after a completed backup, delete <code>albums_index.json</code> and <code>videos_index.json</code> inside <code>Metadata/&lt;Child&gt;/</code>, or use the <a href="https://github.com/bogdan00/kinderpedia-backup/tree/main/python" target="_blank" rel="noopener">Python CLI's <code>--refresh-index</code> flag</a>.)
+            </div>
+          </details>
+
+          <details class="faq-item">
+            <summary>Don't want to add a bookmark? (Copy &amp; Paste method)</summary>
+            <div class="faq-answer">
+              Open <a href="https://app.kinderpedia.co" target="_blank" rel="noopener">app.kinderpedia.co</a>, press <kbd id="devtools-kbd">⌘ Cmd + ⌥ Option + J</kbd> to open the Console, paste the snippet below, and press <kbd>Enter</kbd>:
+              <div class="code-box" id="raw-code">// Generating bookmarklet code...</div>
+              <div class="console-actions">
+                <button type="button" id="copy-btn" class="btn-secondary">Copy Snippet</button>
+                <button type="button" id="launch-test-btn" class="btn-secondary">Preview Backup Window Here</button>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <footer class="page-footer">
+      <p>
+        Open-source project on <a href="https://github.com/bogdan00/kinderpedia-backup" target="_blank" rel="noopener">GitHub</a>
+        (also includes an unattended <a href="https://github.com/bogdan00/kinderpedia-backup/tree/main/python" target="_blank" rel="noopener">Python CLI</a> for power users).
+        Not affiliated with Kinderpedia.
       </p>
-
-      <div class="bookmark-cta">
-        <a id="bookmarklet-link" class="bookmarklet-btn" href="#">
-          💾 Kinderpedia Backup
-        </a>
-        <div style="font-size: 12px; color: var(--text-muted); margin-top: 10px;">
-          (Drag this button to your Bookmarks Bar)
-        </div>
-      </div>
-
-      <div class="steps">
-        <div class="step-item">
-          <div class="step-num">1</div>
-          <div class="step-text">
-            <h4>Open Kinderpedia in your Browser</h4>
-            <p>Go to <a href="https://app.kinderpedia.co" target="_blank" style="color:var(--primary);">app.kinderpedia.co</a> and sign in with your parent account as usual.</p>
-          </div>
-        </div>
-
-        <div class="step-item">
-          <div class="step-num">2</div>
-          <div class="step-text">
-            <h4>Click the "Kinderpedia Backup" Bookmark</h4>
-            <p>A floating glassmorphic dashboard will appear directly on top of the Kinderpedia page.</p>
-          </div>
-        </div>
-
-        <div class="step-item">
-          <div class="step-num">3</div>
-          <div class="step-text">
-            <h4>Pick a Destination Folder on Your Computer</h4>
-            <p>Click "Select Folder". Chrome will prompt you to choose where to save the files (e.g., your Desktop or External Drive). It streams files straight to disk with zero RAM buildup!</p>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3 style="margin-bottom: 12px;">How It Works & Capabilities</h3>
-      <div class="features-grid">
-        <div class="feature-card">
-          <h5>⚡ File System Access API</h5>
-          <p>Streams multi-gigabyte photos and video files directly from network sockets straight to disk handles, keeping browser memory under 30 MB.</p>
-        </div>
-        <div class="feature-card">
-          <h5>🛡️ Adaptive Rate Limiter</h5>
-          <p>Uses AIMD + soft-floor request pacing to stream metadata at maximum velocity without triggering HTTP 429 quota bans.</p>
-        </div>
-        <div class="feature-card">
-          <h5>🔄 Instant Resume</h5>
-          <p>Checks local files and JSON manifests on startup. Skips existing photos in &lt;1 second if you pause or resume later.</p>
-        </div>
-        <div class="feature-card">
-          <h5>🎬 Photos, Videos & Docs</h5>
-          <p>Downloads full-resolution photos, classroom videos, and school documents directly into organized folders on your computer.</p>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3 style="margin-bottom: 12px;">Alternative: Manual Paste in Console</h3>
-      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;">
-        If you prefer not to use bookmarks, open DevTools (<kbd>F12</kbd> or <kbd>Cmd</kbd>+<kbd>Option</kbd>+<kbd>I</kbd>) on <a href="https://app.kinderpedia.co" target="_blank" style="color:var(--primary);">app.kinderpedia.co</a>, paste this in the <b>Console</b> tab, and hit Enter:
-      </p>
-      <div class="code-box" id="raw-code">
-        // Generating bookmarklet code...
-      </div>
-      <div class="test-actions">
-        <button id="copy-btn" class="btn btn-secondary">📋 Copy Code</button>
-        <button id="launch-test-btn" class="btn btn-secondary">🧪 Test Overlay in This Tab</button>
-      </div>
-    </div>
+    </footer>
   </div>
 
   <script>
-    // Construct dynamic loader bookmarklet
-    const currentOrigin = window.location.origin;
-    const scriptUrl = new URL("kinderpedia-backup.js", window.location.href).href;
+    (() => {
+      // 1. Build dynamic bookmarklet loader URL pointing next to this page
+      const scriptUrl = new URL("kinderpedia-backup.js", window.location.href).href;
+      const bookmarkletCode =
+        "javascript:(function(){if(window.__kinderpedia_backup_instance){window.__kinderpedia_backup_instance.toggleUI();return;}const s=document.createElement('script');s.src='" +
+        scriptUrl +
+        "?t='+Date.now();document.body.appendChild(s);})();";
 
-    const bookmarkletCode = `javascript:(function(){if(window.__kinderpedia_backup_instance){window.__kinderpedia_backup_instance.toggleUI();return;}const s=document.createElement('script');s.src='${scriptUrl}?t='+Date.now();document.body.appendChild(s);})();`;
+      const linkEl = document.getElementById("bookmarklet-link");
+      const rawCodeEl = document.getElementById("raw-code");
+      const dragStageEl = document.getElementById("drag-stage");
+      const dragFeedbackEl = document.getElementById("drag-feedback");
+      const dropSlotEl = document.getElementById("mock-drop-slot");
 
-    document.getElementById("bookmarklet-link").setAttribute("href", bookmarkletCode);
-    document.getElementById("raw-code").textContent = bookmarkletCode;
+      linkEl.setAttribute("href", bookmarkletCode);
+      rawCodeEl.textContent = bookmarkletCode;
 
-    document.getElementById("copy-btn").addEventListener("click", () => {
-      navigator.clipboard.writeText(bookmarkletCode).then(() => {
-        alert("Bookmarklet code copied to clipboard! Paste it into Chrome Console on app.kinderpedia.co");
+      // 2. Gentle guidance when a user clicks instead of dragging (without breaking drag-and-drop!)
+      linkEl.addEventListener("click", (e) => {
+        e.preventDefault();
+        dragFeedbackEl.className = "drag-feedback is-nudge";
+        dragFeedbackEl.textContent =
+          "Almost! Hold down your mouse button on the blue button and drag it up to your Bookmarks Bar ↑";
       });
-    });
 
-    document.getElementById("launch-test-btn").addEventListener("click", () => {
-      const s = document.createElement("script");
-      s.src = "kinderpedia-backup.js?t=" + Date.now();
-      document.body.appendChild(s);
-    });
+      linkEl.addEventListener("dragstart", () => {
+        dragStageEl.classList.add("is-dragging");
+        dropSlotEl.textContent = "↑ Release on your real Bookmarks Bar above ↑";
+        dragFeedbackEl.className = "drag-feedback is-active-drag";
+        dragFeedbackEl.textContent = "Great! Drop it right onto your browser's Bookmarks Bar at the top of the window.";
+      });
+
+      linkEl.addEventListener("dragend", () => {
+        dragStageEl.classList.remove("is-dragging");
+        dropSlotEl.textContent = '↑ Drop "Kinderpedia Backup" here';
+        dragFeedbackEl.className = "drag-feedback";
+        dragFeedbackEl.textContent = "Dropped it on your Bookmarks Bar? Awesome — move on to Step 2!";
+      });
+
+      // 3. Auto-detect Mac vs Windows/Linux shortcuts with 1-click toggle
+      const ua = navigator.userAgent || "";
+      const platform = navigator.platform || "";
+      let showingMac = /Mac|iPhone|iPad|iPod/i.test(platform) || /Mac OS/i.test(ua);
+
+      const shortcutKeysEl = document.getElementById("shortcut-keys");
+      const osSwitchBtn = document.getElementById("os-switch-btn");
+      const devtoolsKbdEl = document.getElementById("devtools-kbd");
+
+      function renderOsShortcuts() {
+        if (showingMac) {
+          shortcutKeysEl.innerHTML = "<kbd>⌘ Cmd</kbd> + <kbd>⇧ Shift</kbd> + <kbd>B</kbd>";
+          osSwitchBtn.textContent = "(using Windows?)";
+          devtoolsKbdEl.textContent = "⌘ Cmd + ⌥ Option + J";
+        } else {
+          shortcutKeysEl.innerHTML = "<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>B</kbd>";
+          osSwitchBtn.textContent = "(using a Mac?)";
+          devtoolsKbdEl.textContent = "Ctrl + Shift + J";
+        }
+      }
+      renderOsShortcuts();
+
+      osSwitchBtn.addEventListener("click", () => {
+        showingMac = !showingMac;
+        renderOsShortcuts();
+      });
+
+      // 4. Detect mobile devices or non-Chromium browsers (Safari / Firefox) up front
+      const isMobile =
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua) ||
+        (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
+      const supportsDirectoryPicker = typeof window.showDirectoryPicker === "function";
+
+      const compatBanner = document.getElementById("compat-banner");
+      const compatMsg = document.getElementById("compat-message");
+      const compatCopyBtn = document.getElementById("compat-copy-url-btn");
+
+      if (isMobile) {
+        compatMsg.innerHTML =
+          "<strong>Open this page on a computer (Mac or PC)</strong>Phones and tablets can't save gigabytes of folders directly to disk. Copy this link and open it in <b>Google Chrome</b> or <b>Microsoft Edge</b> on your computer.";
+        compatCopyBtn.textContent = "Copy Page Link";
+        compatBanner.classList.add("is-visible");
+      } else if (!supportsDirectoryPicker) {
+        compatMsg.innerHTML =
+          "<strong>Please open this page in Chrome, Edge, or Brave</strong>Your current browser (such as Safari or Firefox) doesn't support direct folder downloads. Copy this link and paste it into Google Chrome or Microsoft Edge.";
+        compatCopyBtn.textContent = "Copy Link for Chrome";
+        compatBanner.classList.add("is-visible");
+      }
+
+      compatCopyBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(window.location.href).then(() => {
+          const orig = compatCopyBtn.textContent;
+          compatCopyBtn.textContent = "✓ Link Copied!";
+          setTimeout(() => {
+            compatCopyBtn.textContent = orig;
+          }, 2200);
+        });
+      });
+
+      // 5. Copy Console snippet & Preview overlay controls
+      const copyBtn = document.getElementById("copy-btn");
+      copyBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(bookmarkletCode).then(() => {
+          copyBtn.textContent = "✓ Copied to Clipboard!";
+          setTimeout(() => {
+            copyBtn.textContent = "Copy Snippet";
+          }, 2200);
+        });
+      });
+
+      document.getElementById("launch-test-btn").addEventListener("click", () => {
+        if (window.__kinderpedia_backup_instance && typeof window.__kinderpedia_backup_instance.toggleUI === "function") {
+          window.__kinderpedia_backup_instance.toggleUI();
+          return;
+        }
+        const s = document.createElement("script");
+        s.src = "kinderpedia-backup.js?t=" + Date.now();
+        document.body.appendChild(s);
+      });
+    })();
   </script>
 </body>
 </html>
