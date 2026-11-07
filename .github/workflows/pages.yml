@@ -3,9 +3,6 @@ name: Deploy Bookmarklet to GitHub Pages
 on:
   push:
     branches: [main]
-    paths:
-      - "bookmarklet/**"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:

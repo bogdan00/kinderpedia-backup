@@ -3,9 +3,13 @@ title = "Kinderpedia Backup Gitleaks Config"
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Allow public bookmarklet anti-bot ping identifier and unit-test synthetic fixtures"
+[[allowlists]]
+description = "Allow public client constants and synthetic unit-test fixtures"
+paths = [
+  '''^python/tests/''',
+]
 regexes = [
   '''kp_sec_98721''',
+  '''Web01Pari3l4em''',
   '''eyJhbGciOiJIUzI1NiJ9\.payload\.sig''',
 ]
