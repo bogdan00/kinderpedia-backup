@@ -1,0 +1,65 @@
+# Secrets, credentials, and runtime session state (NEVER commit)
+.env
+.env.*
+!.env.example
+!python/.env.example
+*session*.json
+*adaptive_rate*.json
+*face_scan_cache*.json
+backup_status.json
+backup_summary.json
+backup_progress.json
+albums_index*.json
+videos_index*.json
+documents_index*.json
+Metadata/
+
+# Downloaded media, reference portraits, & face-organized outputs
+*.jpg
+*.jpeg
+*.png
+!bookmarklet/favicon.png
+*.webp
+*.heic
+*.gif
+*.mp4
+*.mov
+*.pdf
+*.part
+References/
+ByChild/
+
+# Local ML weights / embeddings
+*.onnx
+*.pth
+*.pt
+*.pkl
+*.npy
+*.npz
+
+# Python packaging, caches, & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Node / Cloudflare Wrangler
+node_modules/
+.wrangler/
+.dev.vars
+_site/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

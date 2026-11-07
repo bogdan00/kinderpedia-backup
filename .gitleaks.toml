@@ -1,0 +1,11 @@
+title = "Kinderpedia Backup Gitleaks Config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow public bookmarklet anti-bot ping identifier and unit-test synthetic fixtures"
+regexes = [
+  '''kp_sec_98721''',
+  '''eyJhbGciOiJIUzI1NiJ9\.payload\.sig''',
+]

@@ -1,0 +1,48 @@
+name: Deploy Bookmarklet to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bookmarklet/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Publish Static Bookmarklet Site
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble clean browser static bundle
+        run: |
+          mkdir -p _site
+          cp bookmarklet/index.html _site/
+          cp bookmarklet/favicon.svg _site/
+          cp bookmarklet/favicon.png _site/
+          cp bookmarklet/kinderpedia-backup.js _site/
+          cp bookmarklet/kinderpedia-backup.min.js _site/
+          cp bookmarklet/mux.min.js _site/
+          touch _site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -265,9 +265,16 @@
   // --- Utility Functions ---
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  const STOPWORDS = new Set([
+    "in", "de", "la", "cu", "si", "pe", "din", "un", "una", "ale", "cel", "cea",
+    "mai", "pentru", "dupa", "prin", "sub", "sau", "iar", "dar", "ca", "ce", "se",
+    "au", "sa", "ne", "am", "ai", "va", "le", "ii", "the", "and", "for", "with", "from",
+  ]);
+  const NUMBERED_PHOTO_RE = /^\d{3}_/;
+
   function sanitizeName(name, maxLen = 60) {
     if (!name) return "unnamed";
-    let clean = name
+    let clean = String(name)
       // Normalize non-breaking spaces & wide spaces to standard space
       .replace(/[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/g, " ")
       // Normalize / remove smart curly quotes, guillemets, and ellipsis
@@ -276,10 +283,9 @@
       .replace(/\u2026/g, "")
       // Normalize en-dash, em-dash, horizontal bar to standard ASCII hyphen
       .replace(/[\u2012\u2013\u2014\u2015]/g, "-")
-      // Strip emojis, pictographs, variation selectors, zero-width joiners/spaces (Windows/FAT32 safe)
-      .replace(/\p{Extended_Pictographic}/gu, "")
-      .replace(/[\uFE00-\uFE0F\u200B-\u200D\uFEFF]/g, "")
-      .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
+      // Strip supplementary-plane emojis/flags & BMP dingbats/variation selectors (matches Python naming.py)
+      .replace(/[\u{10000}-\u{10FFFF}]/gu, "")
+      .replace(/[\u2300-\u27BF\u2B50\uFE00-\uFE0F\u200B-\u200D\uFEFF]/g, "")
       // Replace Windows forbidden characters: < > : " / \ | ? * and ASCII control characters
       .replace(/[/\\?%*:|"<>]/g, "_")
       .replace(/[\x00-\x1f\x7f]/g, "")
@@ -287,8 +293,8 @@
       .replace(/_+/g, "_")
       .trim();
 
-    // Windows strictly forbids trailing dots and trailing spaces on files and folders
-    clean = clean.replace(/[. ]+$/, "");
+    // Strip leading/trailing dots and spaces (Windows & hidden-file safe)
+    clean = clean.replace(/^[. ]+/, "").replace(/[. ]+$/, "");
 
     if (clean.length > maxLen) {
       clean = clean.substring(0, maxLen).trim().replace(/[. ]+$/, "");
@@ -304,16 +310,266 @@
 
   function parseDatePrefix(dateStr) {
     if (!dateStr) return { prefix: "unknown_date", timestamp: null };
+    const s = String(dateStr).trim();
+    if (!s) return { prefix: "unknown_date", timestamp: null };
+
+    // Extract YYYY-MM-DD directly from ISO/SQL date strings so browser timezone never shifts the calendar day
+    const iso = s.match(
+      /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?)?/
+    );
+    if (iso) {
+      const prefix = `${iso[1]}-${iso[2]}-${iso[3]}`;
+      if (iso[4] !== undefined) {
+        let norm = `${iso[1]}-${iso[2]}-${iso[3]}T${iso[4]}:${iso[5]}:${iso[6]}`;
+        if (iso[7]) {
+          const tz = iso[7] === "Z" ? "Z" : iso[7].includes(":") ? iso[7] : `${iso[7].slice(0, 3)}:${iso[7].slice(3)}`;
+          norm += tz;
+        }
+        const ms = Date.parse(norm);
+        return { prefix, timestamp: Number.isNaN(ms) ? null : ms / 1000 };
+      }
+      const localMidnight = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]), 0, 0, 0).getTime();
+      return { prefix, timestamp: Number.isNaN(localMidnight) ? null : localMidnight / 1000 };
+    }
+
     try {
-      const d = new Date(dateStr);
-      if (!isNaN(d.getTime())) {
+      const d = new Date(s);
+      if (!Number.isNaN(d.getTime())) {
         const y = d.getFullYear();
         const m = String(d.getMonth() + 1).padStart(2, "0");
         const day = String(d.getDate()).padStart(2, "0");
-        return { prefix: `${y}-${m}-${day}`, timestamp: d.getTime() };
+        return { prefix: `${y}-${m}-${day}`, timestamp: d.getTime() / 1000 };
       }
     } catch (_) {}
+
+    const anyDate = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (anyDate) {
+      return { prefix: `${anyDate[1]}-${anyDate[2]}-${anyDate[3]}`, timestamp: null };
+    }
     return { prefix: "unknown_date", timestamp: null };
+  }
+
+  function splitYearMonth(ymd) {
+    if (typeof ymd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      return [ymd.slice(0, 4), ymd.slice(5, 7)];
+    }
+    return ["Unknown", "00"];
+  }
+
+  function getChildShortName(ctx) {
+    const fn = String(ctx.first_name || "").trim();
+    if (fn) return fn;
+    const parts = String(ctx.child_name || "").trim().split(/\s+/).filter(Boolean);
+    return parts.length > 0 ? parts[0] : `Child_${ctx.child_id}`;
+  }
+
+  function resolveChildFolderNames(contexts) {
+    const shortCounts = new Map();
+    const fullCounts = new Map();
+    for (const c of contexts) {
+      const sKey = sanitizeName(getChildShortName(c), 60).toLowerCase();
+      const fKey = sanitizeName(c.child_name, 60).toLowerCase();
+      shortCounts.set(sKey, (shortCounts.get(sKey) || 0) + 1);
+      fullCounts.set(fKey, (fullCounts.get(fKey) || 0) + 1);
+    }
+
+    const out = new Map();
+    const usedCi = new Set();
+    for (const c of contexts) {
+      const short = sanitizeName(getChildShortName(c), 60);
+      const full = sanitizeName(c.child_name, 60);
+      let cand;
+      if (shortCounts.get(short.toLowerCase()) === 1) {
+        cand = short;
+      } else if (fullCounts.get(full.toLowerCase()) === 1) {
+        cand = full;
+      } else {
+        const schoolTag = c.school_name ? sanitizeName(c.school_name, 30) : `KG_${c.kindergarten_id}`;
+        cand = sanitizeName(`${short} (${schoolTag})`, 60);
+      }
+
+      const base = cand;
+      let k = 2;
+      while (usedCi.has(cand.toLowerCase())) {
+        cand = sanitizeName(`${base} (${k})`, 60);
+        k++;
+      }
+      usedCi.add(cand.toLowerCase());
+      out.set(`${c.child_id}_${c.kindergarten_id}`, cand);
+    }
+    return out;
+  }
+
+  function assignAlbumFolderNames(albums) {
+    const byBase = new Map();
+    for (const a of albums) {
+      if (a == null || a.id == null) continue;
+      const aid = Number(a.id);
+      const { prefix: ymd, timestamp: ts } = parseDatePrefix(a.date || a.updated_at || "");
+      const [yearS, monthS] = splitYearMonth(ymd);
+      const title = sanitizeName(String(a.name || `album_${aid}`), 60);
+      const leafBase = `${ymd} ${title}`;
+      const key = leafBase.toLowerCase();
+      if (!byBase.has(key)) byBase.set(key, []);
+      byBase.get(key).push({
+        ts: ts !== null ? ts : Number.POSITIVE_INFINITY,
+        aid,
+        yearS,
+        monthS,
+        leafBase,
+      });
+    }
+
+    const folderById = new Map();
+    const usedCi = new Set();
+    for (const group of byBase.values()) {
+      group.sort((x, y) => (x.ts !== y.ts ? x.ts - y.ts : x.aid - y.aid));
+      for (let idx = 0; idx < group.length; idx++) {
+        const { aid, yearS, monthS, leafBase } = group[idx];
+        let candLeaf = idx === 0 ? leafBase : `${leafBase} (${idx + 1})`;
+        let k = idx + 2;
+        while (usedCi.has(candLeaf.toLowerCase())) {
+          candLeaf = `${leafBase} (${k})`;
+          k++;
+        }
+        usedCi.add(candLeaf.toLowerCase());
+        folderById.set(aid, `${yearS}/${monthS}/${candLeaf}`);
+      }
+    }
+    return folderById;
+  }
+
+  function normalizeMatchText(text) {
+    return String(text || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function stemSimilarity(videoText, albumText) {
+    const vn = normalizeMatchText(videoText);
+    const an = normalizeMatchText(albumText);
+    if (!vn || !an) return 0;
+    let score = 0;
+    if (vn.length >= 4 && an.length >= 4 && (vn.includes(an) || an.includes(vn))) {
+      score += 2;
+    }
+    const vTokens = vn.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    const aTokens = an.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    for (const w1 of vTokens) {
+      for (const w2 of aTokens) {
+        if (w1 === w2 || (w1.length >= 4 && w2.length >= 4 && w1.slice(0, 5) === w2.slice(0, 5))) {
+          score += 1;
+          break;
+        }
+      }
+    }
+    return score;
+  }
+
+  function extractOwnerId(item) {
+    if (item && item.owner && typeof item.owner === "object" && item.owner.user_id != null) {
+      const parsed = parseInt(item.owner.user_id, 10);
+      return Number.isNaN(parsed) ? null : parsed;
+    }
+    return null;
+  }
+
+  function planVideoTargets(videos, albums, albumFolderById) {
+    const albumsByDay = new Map();
+    for (const a of albums) {
+      if (a == null || a.id == null) continue;
+      const aid = Number(a.id);
+      if (!albumFolderById.has(aid)) continue;
+      const { prefix: ymd } = parseDatePrefix(a.date || a.updated_at || "");
+      if (!albumsByDay.has(ymd)) albumsByDay.set(ymd, []);
+      albumsByDay.get(ymd).push(a);
+    }
+
+    const videosByFolder = new Map();
+    for (const v of videos) {
+      if (v == null || v.id == null) continue;
+      const vid = Number(v.id);
+      const { prefix: vYmd, timestamp: vTs } = parseDatePrefix(v.date || v.updated_at || "");
+      const vCleanTitle = sanitizeName(String(v.name || "video"), 60);
+      const cands = albumsByDay.get(vYmd) || [];
+
+      let targetFolder;
+      if (cands.length === 1) {
+        targetFolder = albumFolderById.get(Number(cands[0].id));
+      } else if (cands.length >= 2) {
+        const vOwner = extractOwnerId(v);
+        const vText = `${v.name || ""} ${v.description || ""}`;
+        let best = cands[0];
+        let bestTuple = null;
+        for (const cand of cands) {
+          const { timestamp: aTs } = parseDatePrefix(cand.date || cand.updated_at || "");
+          const aOwner = extractOwnerId(cand);
+          const aText = `${cand.name || ""} ${cand.description || ""}`;
+          const st = stemSimilarity(vText, aText);
+          const sameO = vOwner !== null && aOwner !== null && vOwner === aOwner ? 1 : 0;
+          const dtDiff = vTs !== null && aTs !== null ? Math.abs(vTs - aTs) : 1e12;
+          const tuple = [st, sameO, -dtDiff, -Number(cand.id)];
+          if (
+            bestTuple === null ||
+            tuple[0] > bestTuple[0] ||
+            (tuple[0] === bestTuple[0] && tuple[1] > bestTuple[1]) ||
+            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] > bestTuple[2]) ||
+            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] === bestTuple[2] && tuple[3] > bestTuple[3])
+          ) {
+            bestTuple = tuple;
+            best = cand;
+          }
+        }
+        targetFolder = albumFolderById.get(Number(best.id));
+      } else {
+        const [yearS, monthS] = splitYearMonth(vYmd);
+        targetFolder = `${yearS}/${monthS}/${vYmd} ${vCleanTitle}`;
+      }
+
+      if (!videosByFolder.has(targetFolder)) videosByFolder.set(targetFolder, []);
+      videosByFolder.get(targetFolder).push({
+        ts: vTs !== null ? vTs : Number.POSITIVE_INFINITY,
+        vid,
+        vCleanTitle,
+      });
+    }
+
+    const out = new Map();
+    for (const [folder, group] of videosByFolder.entries()) {
+      group.sort((x, y) => (x.ts !== y.ts ? x.ts - y.ts : x.vid - y.vid));
+      const usedNamesCi = new Set();
+      for (const { vid, vCleanTitle } of group) {
+        let candName = `${vCleanTitle}.mp4`;
+        let k = 2;
+        while (usedNamesCi.has(candName.toLowerCase())) {
+          candName = `${vCleanTitle} (${k}).mp4`;
+          k++;
+        }
+        usedNamesCi.add(candName.toLowerCase());
+        out.set(vid, { folderRel: folder, fileName: candName });
+      }
+    }
+    return out;
+  }
+
+  async function getNestedDirectoryHandle(baseDirHandle, relPath, dirCache) {
+    const parts = String(relPath).split("/").filter(Boolean);
+    let curPromise = Promise.resolve(baseDirHandle);
+    let prefix = "";
+    for (const part of parts) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      if (dirCache && dirCache.has(prefix)) {
+        curPromise = dirCache.get(prefix);
+      } else {
+        const prevPromise = curPromise;
+        curPromise = prevPromise.then((parent) => parent.getDirectoryHandle(part, { create: true }));
+        if (dirCache) dirCache.set(prefix, curPromise);
+      }
+    }
+    return curPromise;
   }
 
   function formatBytes(bytes) {
@@ -509,6 +765,7 @@
           contexts.push({
             child_id: cid,
             child_name: name,
+            first_name: String(ch.first_name || "").trim(),
             kindergarten_id: kid,
             school_name: acc.kindergarten_name || acc.name || "Kindergarten",
             avatar_url: ch.avatar || acc.avatar || null,
@@ -526,6 +783,7 @@
           contexts.push({
             child_id: cid,
             child_name: [ch.first_name, ch.last_name].filter(Boolean).join(" ") || `Child_${cid}`,
+            first_name: String(ch.first_name || "").trim(),
             kindergarten_id: defaultKid,
             school_name: defaultSchool,
             avatar_url: ch.avatar || null,
@@ -613,6 +871,7 @@
             contexts.push({
               child_id: cid,
               child_name: [prof.firstName, prof.lastName].filter(Boolean).join(" ") || `Child_${cid}`,
+              first_name: String(prof.firstName || prof.first_name || "").trim(),
               kindergarten_id: kid,
               school_name: kg.name || "Kindergarten",
               avatar_url: prof.photo || null,
@@ -1684,20 +1943,15 @@
       });
     }
 
-    async processChildPhotos(ctx, childDir, metadataDir, metaAlbumsDir) {
-      const albumsDir = await childDir.getDirectoryHandle("Albums", { create: true });
-
-      // 1. If finalized albums_index.json already exists, process directly
+    async catalogChildAlbums(ctx, metadataDir) {
       const finalIndex = await this.readJsonIfExists(metadataDir, "albums_index.json");
       if (Array.isArray(finalIndex) && finalIndex.length > 0) {
-        this.ui.log(`📸 Found ${finalIndex.length} albums. Downloading photos...`);
         this.stats.totalExpectedAlbums = finalIndex.length;
         this.stats.totalExpectedPhotos = finalIndex.reduce((acc, a) => acc + (parseInt(a.count_images, 10) || 0), 0);
-        await this.downloadAlbumList(ctx, albumsDir, metadataDir, metaAlbumsDir, finalIndex);
-        return;
+        this.refreshLiveUI(ctx.child_name);
+        return finalIndex;
       }
 
-      // 2. Continuous background cataloging + simultaneous photo streaming
       const partialState = await this.readJsonIfExists(metadataDir, "albums_index_partial.json");
       let allAlbums = [];
       const seenIds = new Set();
@@ -1714,14 +1968,10 @@
         this.ui.log(`📸 Resuming photo albums from disk...`);
       }
 
-      const albumQueue = [...allAlbums];
       let catalogingComplete = partialState?.complete === true;
+      let page = startPage;
 
-      // PRODUCER: Catalog all album pages continuously in the background so totalExpectedPhotos keeps increasing in real time!
-      const catalogerPromise = (async () => {
-        if (catalogingComplete) return;
-
-        let page = startPage;
+      if (!catalogingComplete) {
         while (!this.isCancelled) {
           while (this.isPaused && !this.isCancelled) await sleep(500);
           if (this.isCancelled) break;
@@ -1765,17 +2015,14 @@
             if (item.id && !seenIds.has(item.id)) {
               seenIds.add(item.id);
               allAlbums.push(item);
-              albumQueue.push(item);
               this.stats.totalExpectedAlbums++;
-              this.stats.totalExpectedPhotos += (parseInt(item.count_images, 10) || 0);
+              this.stats.totalExpectedPhotos += parseInt(item.count_images, 10) || 0;
               addedThisPage++;
             }
           }
 
-          // Live update UI so totalExpectedPhotos increases in real-time as pages arrive
           this.refreshLiveUI(ctx.child_name);
 
-          // Persist partial index state to disk
           await this.writeJsonAtomic(metadataDir, "albums_index_partial.json", {
             complete: false,
             next_page: page + 1,
@@ -1786,77 +2033,80 @@
           });
 
           if (page === 1) {
-            this.ui.log(`📸 Discovered initial albums. Cataloging and downloading photos concurrently...`);
+            this.ui.log(`📸 Discovered initial albums. Cataloging album index...`);
           }
 
           if (items.length < 30 || addedThisPage === 0) break;
           page++;
         }
+      }
 
-        catalogingComplete = true;
+      if (!this.isCancelled) {
+        await this.writeJsonAtomic(metadataDir, "albums_index.json", allAlbums);
+        await this.writeJsonAtomic(metadataDir, "albums_index_partial.json", {
+          complete: true,
+          next_page: page,
+          total_albums: allAlbums.length,
+          total_photos_est: this.stats.totalExpectedPhotos,
+          updated_at: new Date().toISOString(),
+          items: allAlbums,
+        });
+        this.ui.log(`📸 Cataloged ${allAlbums.length} albums (${this.stats.totalExpectedPhotos.toLocaleString()} total photos).`);
+      }
 
-        if (!this.isCancelled) {
-          await this.writeJsonAtomic(metadataDir, "albums_index.json", allAlbums);
-          await this.writeJsonAtomic(metadataDir, "albums_index_partial.json", {
-            complete: true,
-            next_page: page,
-            total_albums: allAlbums.length,
-            total_photos_est: this.stats.totalExpectedPhotos,
-            updated_at: new Date().toISOString(),
-            items: allAlbums,
-          });
-          this.ui.log(`📸 Cataloged all ${allAlbums.length} albums (${this.stats.totalExpectedPhotos.toLocaleString()} total photos).`);
+      return allAlbums;
+    }
+
+    async processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog) {
+      let allAlbums = [];
+      let albumFolderMap = new Map();
+      try {
+        allAlbums = await this.catalogChildAlbums(ctx, metadataDir);
+        albumFolderMap = assignAlbumFolderNames(allAlbums);
+      } finally {
+        if (typeof resolveAlbumsCatalog === "function") {
+          resolveAlbumsCatalog({ allAlbums, albumFolderMap });
         }
-      })();
+      }
 
-      // CONSUMER: Concurrently processes and downloads albums from the queue
-      const consumerPromise = (async () => {
-        while (!this.isCancelled) {
-          while (this.isPaused && !this.isCancelled) await sleep(500);
-          if (this.isCancelled) break;
+      if (this.isCancelled || !allAlbums.length) return;
 
-          if (albumQueue.length === 0) {
-            if (catalogingComplete) break;
-            await sleep(200);
-            continue;
-          }
-
-          const album = albumQueue.shift();
-          await this.downloadSingleAlbum(ctx, albumsDir, metadataDir, metaAlbumsDir, album);
-        }
-      })();
-
-      await Promise.all([catalogerPromise, consumerPromise]);
-
+      await this.downloadAlbumList(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, allAlbums, albumFolderMap);
       if (!this.isCancelled) {
         this.ui.log(`📸 All ${allAlbums.length} albums downloaded.`);
       }
     }
 
-    async downloadSingleAlbum(ctx, albumsDir, metadataDir, metaAlbumsDir, album) {
+    async downloadSingleAlbum(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, album, folderRel) {
       if (this.isCancelled) return;
       while (this.isPaused && !this.isCancelled) await sleep(500);
 
       const aid = album.id;
       const aname = album.name || `album_${aid}`;
       const expectedCnt = parseInt(album.count_images, 10) || 0;
-      const { prefix } = parseDatePrefix(album.date || album.updated_at);
-      const folderName = `${prefix}_${aid}_${sanitizeName(aname, 60)}`;
-      const albumMetaFileName = `${folderName}.json`;
-      const albumDir = await albumsDir.getDirectoryHandle(folderName, { create: true });
+      const leafName = String(folderRel).split("/").pop();
+      const albumMetaFileName = `${leafName}.json`;
+      const albumDir = await getNestedDirectoryHandle(albumsDir, folderRel, dirCache);
 
-      // FAST-PATH: If album is already marked completed, check if files actually exist on disk
+      // FAST-PATH: Count only numbered album photos (`001_<id>.jpg`), ignoring co-located `.mp4` videos
       let meta = await this.readJsonIfExists(metaAlbumsDir, albumMetaFileName);
       if (meta?.completed === true && Array.isArray(meta?.images) && (meta.images.length >= expectedCnt || expectedCnt === 0)) {
-        let diskFileCount = 0;
+        let diskPhotoCount = 0;
         try {
           if (typeof albumDir.values === "function") {
             for await (const entry of albumDir.values()) {
-              if (entry.kind === "file" && !entry.name.endsWith(".json")) diskFileCount++;
+              if (
+                entry.kind === "file" &&
+                NUMBERED_PHOTO_RE.test(entry.name) &&
+                !entry.name.endsWith(".json") &&
+                !entry.name.endsWith(".part")
+              ) {
+                diskPhotoCount++;
+              }
             }
           }
         } catch (_) {}
-        if (diskFileCount >= meta.images.length && meta.images.length > 0) {
+        if (diskPhotoCount >= meta.images.length && meta.images.length > 0) {
           this.stats.photosSkipped += meta.images.length;
           this.stats.albumsDone++;
           this.refreshLiveUI(ctx.child_name);
@@ -1874,7 +2124,7 @@
         await this.writeJsonAtomic(metaAlbumsDir, albumMetaFileName, meta);
       }
 
-      // Build all photo tasks for this album
+      // Build all photo tasks for this album (`001_<id>.<ext>`)
       const allTasks = images.map((img, i) => {
         let url = img.download_url || img.fullsize || img.url_original || img.url_large || img.url || img.src || img.thumb;
         if (typeof url === "string") {
@@ -1882,23 +2132,29 @@
           else if (url.startsWith("/")) url = "https://app.kinderpedia.co" + url;
         }
         const ext = (img.extension || "jpg").replace(/^\./, "");
-        const fname = `${String(i + 1).padStart(3, "0")}_${img.id}.${ext}`;
+        const imgId = sanitizeName(String(img.id || i + 1), 32);
+        const fname = `${String(i + 1).padStart(3, "0")}_${imgId}.${ext}`;
         return { url, fname, id: img.id };
       });
 
-      // Fast directory scan: if file count matches all images, skip album in 0.001s
-      let existingFilesCount = 0;
+      // Fast directory scan: count numbered photos only (ignoring co-located .mp4 videos)
+      let existingPhotosCount = 0;
       try {
         if (typeof albumDir.values === "function") {
           for await (const entry of albumDir.values()) {
-            if (entry.kind === "file" && !entry.name.endsWith(".json")) {
-              existingFilesCount++;
+            if (
+              entry.kind === "file" &&
+              NUMBERED_PHOTO_RE.test(entry.name) &&
+              !entry.name.endsWith(".json") &&
+              !entry.name.endsWith(".part")
+            ) {
+              existingPhotosCount++;
             }
           }
         }
       } catch (_) {}
 
-      if (existingFilesCount >= allTasks.length && allTasks.length > 0) {
+      if (existingPhotosCount >= allTasks.length && allTasks.length > 0) {
         meta.completed = true;
         meta.completed_at = new Date().toISOString();
         meta.photo_count = allTasks.length;
@@ -1984,22 +2240,21 @@
       }
     }
 
-    async downloadAlbumList(ctx, albumsDir, metadataDir, metaAlbumsDir, albumList) {
+    async downloadAlbumList(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, albumList, albumFolderMap) {
       for (const album of albumList) {
         if (this.isCancelled) break;
-        await this.downloadSingleAlbum(ctx, albumsDir, metadataDir, metaAlbumsDir, album);
+        const folderRel = albumFolderMap.get(Number(album.id));
+        if (!folderRel) continue;
+        await this.downloadSingleAlbum(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, album, folderRel);
       }
     }
 
-    async processChildVideos(ctx, childDir, metadataDir) {
-      const videosDir = await childDir.getDirectoryHandle("Videos", { create: true });
-
+    async catalogChildVideos(ctx, metadataDir) {
       const finalIndex = await this.readJsonIfExists(metadataDir, "videos_index.json");
       if (Array.isArray(finalIndex) && finalIndex.length > 0) {
-        this.ui.log(`🎬 Found ${finalIndex.length} videos. Downloading...`);
         this.stats.totalVideos = finalIndex.length;
-        await this.downloadVideoList(ctx, videosDir, finalIndex);
-        return;
+        this.refreshLiveUI(ctx.child_name);
+        return finalIndex;
       }
 
       const partialState = await this.readJsonIfExists(metadataDir, "videos_index_partial.json");
@@ -2017,14 +2272,10 @@
         this.ui.log(`🎬 Resuming videos from disk...`);
       }
 
-      const videoQueue = [...allVideos];
       let videoCatalogingComplete = partialState?.complete === true;
+      let page = startPage;
 
-      // PRODUCER: Catalog all video pages continuously in the background
-      const videoCatalogerPromise = (async () => {
-        if (videoCatalogingComplete) return;
-
-        let page = startPage;
+      if (!videoCatalogingComplete) {
         while (!this.isCancelled) {
           while (this.isPaused && !this.isCancelled) await sleep(500);
           if (this.isCancelled) break;
@@ -2065,7 +2316,6 @@
             if (item.id && !seenIds.has(item.id)) {
               seenIds.add(item.id);
               allVideos.push(item);
-              videoQueue.push(item);
               this.stats.totalVideos++;
               addedThisPage++;
             }
@@ -2082,57 +2332,48 @@
           });
 
           if (page === 1) {
-            this.ui.log(`🎬 Discovered initial videos. Cataloging and downloading concurrently...`);
+            this.ui.log(`🎬 Discovered initial videos. Cataloging video index...`);
           }
 
           if (items.length < 30 || addedThisPage === 0) break;
           page++;
         }
+      }
 
-        videoCatalogingComplete = true;
+      if (!this.isCancelled) {
+        await this.writeJsonAtomic(metadataDir, "videos_index.json", allVideos);
+        await this.writeJsonAtomic(metadataDir, "videos_index_partial.json", {
+          complete: true,
+          next_page: page,
+          total_videos: allVideos.length,
+          updated_at: new Date().toISOString(),
+          items: allVideos,
+        });
+        this.ui.log(`🎬 Cataloged ${allVideos.length} videos (matching into day albums).`);
+      }
 
-        if (!this.isCancelled) {
-          await this.writeJsonAtomic(metadataDir, "videos_index.json", allVideos);
-          await this.writeJsonAtomic(metadataDir, "videos_index_partial.json", {
-            complete: true,
-            next_page: page,
-            total_videos: allVideos.length,
-            updated_at: new Date().toISOString(),
-            items: allVideos,
-          });
-          this.ui.log(`🎬 All ${allVideos.length} videos cataloged.`);
-        }
-      })();
-
-      // CONSUMER: Concurrently downloads videos from queue
-      const videoConsumerPromise = (async () => {
-        while (!this.isCancelled) {
-          while (this.isPaused && !this.isCancelled) await sleep(500);
-          if (this.isCancelled) break;
-
-          if (videoQueue.length === 0) {
-            if (videoCatalogingComplete) break;
-            await sleep(200);
-            continue;
-          }
-
-          const vid = videoQueue.shift();
-          await this.downloadSingleVideo(ctx, videosDir, vid);
-        }
-      })();
-
-      await Promise.all([videoCatalogerPromise, videoConsumerPromise]);
+      return allVideos;
     }
 
-    async downloadSingleVideo(ctx, videosDir, vid) {
+    async processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise) {
+      const allVideos = await this.catalogChildVideos(ctx, metadataDir);
+      const { allAlbums, albumFolderMap } = await albumsCatalogPromise;
+      if (this.isCancelled || !allVideos.length) return;
+
+      const metaVideosDir = await metadataDir.getDirectoryHandle("Videos", { create: true });
+      const videoTargets = planVideoTargets(allVideos, allAlbums, albumFolderMap);
+      await this.downloadVideoList(ctx, albumsDir, metaVideosDir, dirCache, allVideos, videoTargets);
+    }
+
+    async downloadSingleVideo(ctx, albumsDir, metaVideosDir, dirCache, vid, target) {
       if (this.isCancelled) return;
       while (this.isPaused && !this.isCancelled) await sleep(500);
 
-      const { prefix } = parseDatePrefix(vid.date || vid.updated_at);
-      const vname = `${prefix}_${vid.id}_${sanitizeName(vid.name || "video", 60)}.mp4`;
-      
+      const { folderRel, fileName: vname } = target;
+      const targetAlbumDir = await getNestedDirectoryHandle(albumsDir, folderRel, dirCache);
+
       // Video must be at least 10 KB to be considered valid and skipped
-      const exists = await this.checkFileExists(videosDir, vname, 10000);
+      const exists = await this.checkFileExists(targetAlbumDir, vname, 10000);
       if (exists) {
         this.stats.videosSkipped++;
         this.refreshLiveUI(ctx.child_name);
@@ -2141,8 +2382,15 @@
 
       let videoUrl = vid.url || vid.share_url || "";
       if (!videoUrl) {
+        const cachedVid = await this.readJsonIfExists(metaVideosDir, `${vid.id}.json`);
+        if (cachedVid) {
+          videoUrl = cachedVid.url || cachedVid.share_url || "";
+        }
+      }
+      if (!videoUrl) {
         try {
           const details = await this.client.getVideoDetails(ctx.kindergarten_id, ctx.child_id, vid.id);
+          await this.writeJsonAtomic(metaVideosDir, `${vid.id}.json`, { ...vid, ...details });
           videoUrl = details.url || details.share_url || "";
         } catch (_) {}
       }
@@ -2182,68 +2430,77 @@
 
         try {
           this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 30)}"...`);
-          const vHandle = await videosDir.getFileHandle(vname, { create: true });
+          const vHandle = await targetAlbumDir.getFileHandle(vname, { create: true });
           await this.vimeo.downloadVideo(videoUrl, vHandle, workerCfg, (curr, total) => {
             this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 25)}" (${curr}/${total} segments)...`);
           }, !!this.vimeoHelperAvailable);
-          
+
           // Post-download integrity verification
           const vFile = await vHandle.getFile();
           if (!vFile || vFile.size < 10000) {
-            try { await videosDir.removeEntry(vname); } catch (_) {}
+            try { await targetAlbumDir.removeEntry(vname); } catch (_) {}
             throw new Error(`Video file is incomplete (${vFile?.size || 0} bytes)`);
           }
           this.stats.videosSaved++;
           this.stats.bytesSaved += vFile.size;
-          this.ui.log(`🎬 Video downloaded: "${sanitizeName(vid.name || vid.id, 40)}" (${(vFile.size / (1024 * 1024)).toFixed(1)} MB)`);
+          this.ui.log(`🎬 Video downloaded: "${folderRel}/${vname}" (${(vFile.size / (1024 * 1024)).toFixed(1)} MB)`);
         } catch (err) {
-          try { await videosDir.removeEntry(vname); } catch (_) {}
+          try { await targetAlbumDir.removeEntry(vname); } catch (_) {}
           console.warn("[Video] Download failed:", err);
         }
       } else if (videoUrl && (videoUrl.includes(".mp4") || videoUrl.includes("kinderpedia.co"))) {
         try {
           this.ui.setActivity(`🎬 Downloading video: "${sanitizeName(vid.name || vid.id, 30)}"...`);
-          const res = await this.streamBinaryDirect(videoUrl, videosDir, vname, 10000);
+          const res = await this.streamBinaryDirect(videoUrl, targetAlbumDir, vname, 10000);
           if (res.status === "downloaded") {
             this.stats.videosSaved++;
             this.stats.bytesSaved += res.bytes;
-            this.ui.log(`🎬 Video downloaded: "${sanitizeName(vid.name || vid.id, 40)}"`);
+            this.ui.log(`🎬 Video downloaded: "${folderRel}/${vname}"`);
           }
         } catch (err) {
-          try { await videosDir.removeEntry(vname); } catch (_) {}
+          try { await targetAlbumDir.removeEntry(vname); } catch (_) {}
           console.warn("[Video] Download failed:", err);
         }
       }
       this.refreshLiveUI(ctx.child_name);
     }
 
-    async downloadVideoList(ctx, videosDir, videoList) {
+    async downloadVideoList(ctx, albumsDir, metaVideosDir, dirCache, videoList, videoTargets) {
       for (const vid of videoList) {
         if (this.isCancelled) break;
-        await this.downloadSingleVideo(ctx, videosDir, vid);
+        const target = videoTargets.get(Number(vid.id));
+        if (!target) continue;
+        await this.downloadSingleVideo(ctx, albumsDir, metaVideosDir, dirCache, vid, target);
       }
     }
 
     async processChildDocs(ctx, childDir, metadataDir) {
       const docsDir = await childDir.getDirectoryHandle("Documents", { create: true });
       const docs = await this.loadOrFetchDocs(ctx, metadataDir);
+      const usedDocNames = new Map();
       for (let dIdx = 0; dIdx < docs.length; dIdx++) {
         if (this.isCancelled) break;
         const doc = docs[dIdx];
-        const durl = doc.url || doc.file_url;
+        const durl = doc.url || doc.file_url || doc.document_url || doc.download_url;
         if (!durl) continue;
-        let dname = sanitizeName(doc.name || `doc_${doc.id}`, 60);
+        const did = sanitizeName(String(doc.id || dIdx + 1), 32);
+        let dname = sanitizeName(doc.name || doc.title || `doc_${did}`, 60);
         const ext = (doc.extension || "pdf").replace(/^\./, "");
-        if (dname.toLowerCase().endsWith("." + ext.toLowerCase())) {
-          dname = dname.substring(0, dname.length - (ext.length + 1));
+        if (dname.toLowerCase().endsWith("." + ext.toLowerCase()) && dname.length > ext.length + 1) {
+          dname = dname.substring(0, dname.length - (ext.length + 1)).replace(/[. ]+$/, "") || `doc_${did}`;
         }
-        const fname = `${dname}.${ext}`;
-        
+        let fname = `${dname}.${ext}`;
+        const prevDid = usedDocNames.get(fname.toLowerCase());
+        if (prevDid !== undefined && prevDid !== did) {
+          fname = `${dname}_${did}.${ext}`;
+        }
+        usedDocNames.set(fname.toLowerCase(), did);
+
         // Documents must match expected size or at least 100 bytes
         const expectedBytes = typeof doc.size === "number" && doc.size > 0 ? doc.size : 100;
         const exists = await this.checkFileExists(docsDir, fname, expectedBytes);
         if (exists) continue;
-        
+
         try {
           this.ui.setActivity(`📄 Downloading document: ${fname}...`);
           const res = await this.streamBinaryDirect(durl, docsDir, fname, expectedBytes);
@@ -2386,17 +2643,27 @@
         await this.client.checkActiveSession();
         contexts = this.client.childrenContexts;
       }
-      this.ui.log(`Found children: ${contexts.map((c) => c.child_name).join(", ")}`);
+      const childFolderMap = resolveChildFolderNames(contexts);
+      this.ui.log(
+        `Found children: ${contexts
+          .map((c) => `${c.child_name} (→ ${childFolderMap.get(`${c.child_id}_${c.kindergarten_id}`)})`)
+          .join(", ")}`
+      );
 
       this.ui.startDownloadingUI();
       const rootMetadataDir = await this.rootDirHandle.getDirectoryHandle("Metadata", { create: true });
 
       for (const ctx of contexts) {
         if (this.isCancelled) break;
-        this.ui.log(`📂 Starting backup for ${ctx.child_name}...`);
-        const childDir = await this.rootDirHandle.getDirectoryHandle(sanitizeName(ctx.child_name), { create: true });
-        const metadataDir = await rootMetadataDir.getDirectoryHandle(sanitizeName(ctx.child_name), { create: true });
+        const childFolderName =
+          childFolderMap.get(`${ctx.child_id}_${ctx.kindergarten_id}`) ||
+          sanitizeName(getChildShortName(ctx), 60);
+        this.ui.log(`📂 Starting backup for ${ctx.child_name} (folder "${childFolderName}")...`);
+        const childDir = await this.rootDirHandle.getDirectoryHandle(childFolderName, { create: true });
+        const albumsDir = await childDir.getDirectoryHandle("Albums", { create: true });
+        const metadataDir = await rootMetadataDir.getDirectoryHandle(childFolderName, { create: true });
         const metaAlbumsDir = await metadataDir.getDirectoryHandle("Albums", { create: true });
+        const dirCache = new Map();
 
         // Avatar (downloaded in background if present)
         if (ctx.avatar_url) {
@@ -2418,14 +2685,19 @@
           t0: performance.now(),
         };
 
-        // MAXIMUM CONCURRENCY: Photos, Videos, and Docs streams run in parallel!
+        let resolveAlbumsCatalog;
+        const albumsCatalogPromise = new Promise((r) => {
+          resolveAlbumsCatalog = r;
+        });
+
+        // MAXIMUM CONCURRENCY: Photos, Videos (matched into day albums), and Docs run in parallel!
         await Promise.all([
-          this.processChildPhotos(ctx, childDir, metadataDir, metaAlbumsDir),
-          this.processChildVideos(ctx, childDir, metadataDir),
+          this.processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog),
+          this.processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise),
           this.processChildDocs(ctx, childDir, metadataDir),
         ]);
 
-        this.ui.log(`🎉 Backup complete for ${ctx.child_name}!`);
+        this.ui.log(`🎉 Backup complete for ${childFolderName}!`);
       }
 
       this.ui.log(this.isCancelled ? "🛑 Backup cancelled." : "🎉 All backups complete!");
