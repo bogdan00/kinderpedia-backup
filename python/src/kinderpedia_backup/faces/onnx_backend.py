@@ -10,7 +10,9 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageOps
 
+from ..console import log
 from .alignment import (
+    ALIGNMENT_VERSION,
     SCRFD_STRIDE_HEADS,
     align_face_112,
     crop_face_portrait,
@@ -111,16 +113,40 @@ class _OpenCvDnnRunner(_EngineRunner):
         self._det.setInput(blob)
         outs = self._det.forward(self._det_outs)
         result = {name: np.asarray(arr) for name, arr in zip(self._det_outs, outs, strict=True)}
-        # Ensure all expected SCRFD output keys exist if OpenCV prefixes layer names:
-        if "448" not in result and len(outs) == len(_SCRFD_OUT_NAMES):
-            for expected, arr in zip(_SCRFD_OUT_NAMES, outs, strict=True):
-                result[expected] = np.asarray(arr)
+        if not all(name in result for name in _SCRFD_OUT_NAMES):
+            # OpenCV builds that do not expose the ONNX tensor names: identify heads by shape,
+            # never by position (graph order is type-major, not the stride-major name table).
+            result.update(map_scrfd_outputs_by_shape(list(outs), det_size=int(blob.shape[-1])))
         return result
 
     def run_embedder(self, batch: NDArray[np.float32]) -> NDArray[np.float32]:
         self._rec.setInput(batch)
         out = self._rec.forward(self._rec_outs)[0]
         return np.asarray(out, dtype=np.float32)
+
+
+def map_scrfd_outputs_by_shape(outs: list[NDArray[Any]], *, det_size: int) -> dict[str, NDArray[Any]]:
+    """
+    Name anonymous SCRFD output tensors from their shapes: the last dimension identifies the head
+    (1 = score, 4 = bbox distances, 10 = keypoints) and the anchor count `2 * (det_size / stride)^2`
+    identifies the stride. Returns `{}` unless all nine heads are found exactly once.
+    """
+    head_pos_by_width = {1: 0, 4: 1, 10: 2}  # (score, bbox, kps) position in SCRFD_STRIDE_HEADS
+    names_by_rows = {2 * (det_size // stride) ** 2: (s, b, k) for stride, s, b, k in SCRFD_STRIDE_HEADS}
+    mapped: dict[str, NDArray[Any]] = {}
+    for arr_raw in outs:
+        arr = np.asarray(arr_raw)
+        if arr.ndim == 0:
+            return {}
+        width = int(arr.shape[-1])
+        rows = int(arr.size // max(width, 1))
+        if width not in head_pos_by_width or rows not in names_by_rows:
+            return {}
+        key = names_by_rows[rows][head_pos_by_width[width]]
+        if key in mapped:
+            return {}
+        mapped[key] = arr
+    return mapped if len(mapped) == len(_SCRFD_OUT_NAMES) else {}
 
 
 def _probe_engine_kind(backend: str) -> str:
@@ -146,6 +172,21 @@ def _probe_engine_kind(backend: str) -> str:
         f"No ONNX runtime available for backend={backend!r}. "
         'Install the faces extras via: pip install "./python[faces]"'
     )
+
+
+def describe_engine(engine_kind: str) -> str:
+    """Human-readable engine name + version for scan logs (providers are logged once a session exists)."""
+    try:
+        if engine_kind == "onnxruntime":
+            import onnxruntime as ort
+
+            avail = ", ".join(ort.get_available_providers())
+            return f"onnxruntime {ort.__version__} (available providers: {avail})"
+        import cv2
+
+        return f"OpenCV DNN {cv2.__version__} (CPU)"
+    except Exception:  # pragma: no cover - purely informational
+        return engine_kind
 
 
 class ScrfdArcFaceRecognizer:
@@ -176,10 +217,17 @@ class ScrfdArcFaceRecognizer:
         self._tls = threading.local()
         self._ort_lock = threading.Lock()
         self._shared_ort_runner: _OrtRunner | None = None
+        log(f"[Faces] Inference engine: {describe_engine(self.engine_kind)} (model {self.model_id})")
+        if self.engine_kind == "opencv" and backend.strip().lower() == "auto":
+            log(
+                "[Faces] onnxruntime is not installed; using the slower OpenCV DNN fallback. "
+                'Install it for CoreML/CUDA acceleration: pip install "onnxruntime>=1.17"'
+            )
 
     @property
     def model_id(self) -> str:
-        return f"scrfd_10g_{self.det_size}_arcface_r50_v1"
+        # `_align{N}` tracks the crop geometry: embeddings from a different alignment are not comparable.
+        return f"scrfd_10g_{self.det_size}_arcface_r50_v1_align{ALIGNMENT_VERSION}"
 
     def _runner(self) -> _EngineRunner:
         if self.engine_kind == "onnxruntime":
@@ -190,6 +238,10 @@ class ScrfdArcFaceRecognizer:
                             self.det_path,
                             self.rec_path,
                             det_size=self.det_size,
+                        )
+                        log(
+                            "[Faces] onnxruntime execution providers: "
+                            + ", ".join(self._shared_ort_runner.active_providers)
                         )
             return self._shared_ort_runner
 

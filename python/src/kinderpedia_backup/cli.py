@@ -34,6 +34,7 @@ from .security import (
     write_json_atomic,
 )
 from .sync import (
+    AuthExpiredError,
     KinderpediaClient,
     StatusTracker,
     TwoFactorRequiredError,
@@ -44,6 +45,12 @@ from .sync import (
 
 
 def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.epilog = (
+        "Exit codes: 0 = backup complete; 1 = partial (some photos/videos/documents/album manifests "
+        "failed -- re-run to retry) or nothing to back up; 2 = usage/configuration error; "
+        "3 = aborted because the Kinderpedia session expired and could not be refreshed; "
+        "130 = interrupted."
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -92,7 +99,12 @@ def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--refresh-index",
         action="store_true",
-        help="Incremental sync: re-fetch album/video/document listings to pull newly posted media",
+        help=(
+            "Force a full refresh: re-list every album/video/document and refetch every album's photo "
+            "manifest. A plain `sync` is already incremental (it fetches listing pages until it reaches "
+            "a page with no new/changed albums and only refetches albums whose (updated_at, "
+            "count_images) changed)."
+        ),
     )
     parser.add_argument(
         "--discover-only",
@@ -347,6 +359,49 @@ def run_sync(args: argparse.Namespace) -> int:
 
     logged_in = False
     children: list[ChildContext] = []
+    interactive_tty = sys.stdin.isatty() and not args.password_stdin
+
+    def _login(email_in: str, password_in: str | None, code_in: str | None) -> int:
+        """Authenticate (prompting on a TTY when needed). Returns 0 on success or an exit code."""
+        nonlocal email
+        email = email_in
+        pw = password_in
+        if not email:
+            if interactive_tty:
+                email = input("Kinderpedia parent email: ").strip()
+            if not email:
+                log(
+                    "ERROR: No saved session and no email provided. "
+                    "Pass --email, set KINDERPEDIA_EMAIL in .env, or run interactively."
+                )
+                return 2
+        if not pw:
+            if interactive_tty:
+                pw = getpass.getpass(f"Kinderpedia password for {email}: ")
+            if not pw:
+                log(
+                    "ERROR: No active session and no password provided. "
+                    "Prompt interactively, pipe via --password-stdin, or set KINDERPEDIA_PASSWORD in .env (chmod 600)."
+                )
+                return 2
+        try:
+            client.login(email=email, password=pw, confirmation_code=code_in)
+        except TwoFactorRequiredError:
+            if not interactive_tty:
+                log("ERROR: Account requires a 2FA code; pass --code or KINDERPEDIA_2FA_CODE.")
+                return 2
+            code_prompt = input("Enter Kinderpedia 2FA confirmation code: ").strip()
+            try:
+                client.login(email=email, password=pw, confirmation_code=code_prompt)
+            except Exception as exc:
+                log(f"Authentication failed: {redact_secrets(str(exc))}")
+                return 1
+        except Exception as exc:
+            log(f"Authentication failed: {redact_secrets(str(exc))}")
+            return 1
+        finally:
+            pw = None
+        return 0
 
     if not args.password_stdin and client.load_session(legacy_session_file=backup_dir / ".session.json"):
         try:
@@ -360,39 +415,10 @@ def run_sync(args: argparse.Namespace) -> int:
                 logged_in = True
 
     if not logged_in:
-        interactive_tty = sys.stdin.isatty() and not args.password_stdin
-        if not email:
-            if interactive_tty:
-                email = input("Kinderpedia parent email: ").strip()
-            if not email:
-                log(
-                    "ERROR: No saved session and no email provided. "
-                    "Pass --email, set KINDERPEDIA_EMAIL in .env, or run interactively."
-                )
-                return 2
-        if not password:
-            if interactive_tty:
-                password = getpass.getpass(f"Kinderpedia password for {email}: ")
-            if not password:
-                log(
-                    "ERROR: No active session and no password provided. "
-                    "Prompt interactively, pipe via --password-stdin, or set KINDERPEDIA_PASSWORD in .env (chmod 600)."
-                )
-                return 2
-        try:
-            client.login(email=email, password=password, confirmation_code=code)
-        except TwoFactorRequiredError:
-            if not interactive_tty:
-                log("ERROR: Account requires a 2FA code; pass --code or KINDERPEDIA_2FA_CODE.")
-                return 2
-            code = input("Enter Kinderpedia 2FA confirmation code: ").strip()
-            client.login(email=email, password=password, confirmation_code=code)
-        except Exception as exc:
-            log(f"Authentication failed: {redact_secrets(str(exc))}")
-            return 1
-        finally:
-            password = None
-
+        rc_login = _login(email, password, code)
+        password = None
+        if rc_login != 0:
+            return rc_login
         _, children = client.get_me_and_children()
 
     if not children:
@@ -427,24 +453,46 @@ def run_sync(args: argparse.Namespace) -> int:
     )
 
     all_stats: list[ChildBackupStats] = []
+    auth_abort: str | None = None
+    reauth_used = False
     try:
         with keep_system_awake(enabled=not args.no_keep_awake and not args.discover_only):
-            for ctx in children:
-                st = backup_child_context(
-                    client,
-                    ctx,
-                    backup_dir=backup_dir,
-                    tracker=tracker,
-                    child_folder_name=folder_names[(ctx.child_id, ctx.kindergarten_id)],
-                    workers=args.workers,
-                    video_workers=args.video_workers,
-                    discover_only=args.discover_only,
-                    refresh_index=args.refresh_index,
-                    skip_photos=args.skip_photos,
-                    skip_videos=args.skip_videos,
-                    skip_documents=args.skip_documents,
-                )
+            pending = list(children)
+            while pending:
+                ctx = pending[0]
+                try:
+                    st = backup_child_context(
+                        client,
+                        ctx,
+                        backup_dir=backup_dir,
+                        tracker=tracker,
+                        child_folder_name=folder_names[(ctx.child_id, ctx.kindergarten_id)],
+                        workers=args.workers,
+                        video_workers=args.video_workers,
+                        discover_only=args.discover_only,
+                        refresh_index=args.refresh_index,
+                        skip_photos=args.skip_photos,
+                        skip_videos=args.skip_videos,
+                        skip_documents=args.skip_documents,
+                    )
+                except AuthExpiredError as exc:
+                    # Circuit breaker: the JWT expired mid-run and refreshing it failed. Rather than
+                    # failing every remaining album one by one, re-authenticate once on a TTY or abort.
+                    log(f"\n[Auth] {redact_secrets(str(exc))}")
+                    if interactive_tty and not reauth_used:
+                        reauth_used = True
+                        progress.close()
+                        log("[Auth] Please sign in again to continue (already-downloaded media is kept).")
+                        if _login(email, None, None) == 0:
+                            continue  # retry the same child; cached metadata makes this cheap
+                    auth_abort = (
+                        "Kinderpedia session expired and could not be refreshed. Already-downloaded media "
+                        "is kept; sign in again (or remove the saved session with --logout) and re-run "
+                        "the same command to resume."
+                    )
+                    break
                 all_stats.append(st)
+                pending.pop(0)
     except KeyboardInterrupt:
         progress.close()
         set_active_progress(None)
@@ -454,29 +502,49 @@ def run_sync(args: argparse.Namespace) -> int:
         progress.close()
         set_active_progress(None)
 
-    tracker.update(phase="complete", child="", force=True)
+    total_failures = sum(st.total_failures for st in all_stats)
+    if auth_abort is not None:
+        status = "FAILED"
+    elif total_failures > 0:
+        status = "PARTIAL"
+    else:
+        status = "COMPLETE"
+
+    tracker.update(phase="complete" if status == "COMPLETE" else status.lower(), child="", force=True)
     if not args.discover_only:
         manifest_path = ensure_within_directory(backup_dir, backup_dir / "Metadata" / "backup_summary.json")
         write_json_atomic(
             manifest_path,
             {
                 "completed_at": datetime.now().isoformat(),
+                "status": status.lower(),
+                "total_failures": total_failures,
+                "aborted_reason": auth_abort,
                 "adaptive_rate": client.rate_ctrl.snapshot().to_dict(),
                 "children": [s.to_public_dict() for s in all_stats],
             },
         )
 
-    log("\n=== BACKUP COMPLETE ===")
+    if status == "COMPLETE":
+        log("\n=== BACKUP COMPLETE ===")
+    elif status == "PARTIAL":
+        log(f"\n=== BACKUP PARTIAL: {total_failures} item(s) failed -- re-run the same command to retry ===")
+    else:
+        log(f"\n=== BACKUP FAILED: {auth_abort} ===")
     for st in all_stats:
         log(
             f"  {st.child_name} (KG {st.kindergarten_id}): "
             f"Albums={st.albums_count} (new photos={st.photos_downloaded}, "
-            f"existing={st.photos_skipped_existing}, failed={st.photos_failed}) | "
+            f"existing={st.photos_skipped_existing}, failed={st.photos_failed}, "
+            f"album manifests failed={st.albums_failed}) | "
             f"Videos={st.videos_count} (new={st.videos_downloaded}, "
             f"existing={st.videos_skipped_existing}, failed={st.videos_failed}) | "
             f"Docs={st.documents_downloaded} new / {st.documents_skipped_existing} existing"
+            f" / {st.documents_failed} failed"
         )
-    return 0
+    if auth_abort is not None:
+        return 3
+    return 1 if total_failures > 0 else 0
 
 
 def run_faces(args: argparse.Namespace) -> int:
