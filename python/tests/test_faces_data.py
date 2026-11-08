@@ -354,11 +354,14 @@ class LabelPreservingRescanTests(_ArchiveCase):
     def test_scan_bumps_data_version_and_last_scan_at(self) -> None:
         self.scan(_ScanStub())
         with FacesIndexDB(self.db_path) as db:
-            v1 = db.get_data_version()
+            g1 = db.get_scan_generation()
             self.assertIsNotNone(db.get_meta("last_scan_at"))
-        self.scan(_ScanStub())
-        with FacesIndexDB(self.db_path) as db:
-            self.assertEqual(db.get_data_version(), v1 + 1)
+            tok = db.get_data_version()
+            db.set_meta("ui_write", "1")  # own writes never change the token
+            self.assertEqual(db.get_data_version(), tok)
+            self.scan(_ScanStub())  # another connection commits + bumps the generation
+            self.assertNotEqual(db.get_data_version(), tok)
+            self.assertEqual(db.get_scan_generation(), g1 + 1)
 
 
 class RelinkUnitTests(unittest.TestCase):

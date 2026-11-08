@@ -703,12 +703,22 @@ class FacesIndexDB:
     # Cross-process change signal (`faces scan` -> running `faces ui`)
     # ------------------------------------------------------------------
 
-    def get_data_version(self) -> int:
-        """Monotonic counter bumped by `faces scan` (and photo reconciliation) after it commits.
+    def get_data_version(self) -> str:
+        """Opaque change token for cross-process cache invalidation (compare for equality only).
 
-        A long-running process (the Web UI) polls this cheaply and drops its in-memory caches
-        (`invalidate_caches()`) when the value changes, since the scan runs in another process.
+        Combines SQLite's `PRAGMA data_version` — which changes only when ANOTHER connection or
+        process commits (never on this connection's own writes) — with `get_scan_generation()`,
+        bumped when a `faces scan` ends. A long-running process (the Web UI) polls this cheaply and
+        drops its in-memory caches (`invalidate_caches()`) when the value changes; its own label
+        writes never change it.
         """
+        with self._lock:
+            pragma = self._conn.execute("PRAGMA data_version").fetchone()
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
+        return f"{row['value'] if row is not None else 0}:{int(pragma[0])}"
+
+    def get_scan_generation(self) -> int:
+        """Monotonic counter (`meta.data_version`) incremented at the end of every `faces scan`."""
         with self._lock:
             row = self._conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
         try:
