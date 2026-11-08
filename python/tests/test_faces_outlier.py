@@ -473,10 +473,12 @@ class EvaluateToolTests(unittest.TestCase):
             )
 
     def test_selection_rule_prefers_simpler_cell_on_ties(self) -> None:
-        cells = evaluate.parse_grid("min_sim=0.3,0.25;det_penalty=0.05,0")
+        cells = evaluate.parse_grid("min_sim=0.3,0.25;min_faces=8,4")
         self.assertEqual(len(cells), 4)
         keys = sorted(evaluate.simplicity_key(c) for c in cells)
-        self.assertEqual(keys[0], (0.0, LABEL_OUTLIER_MIN_FACES, 0.25))
+        self.assertEqual(keys[0][:2], (4, 0.25))
+        lo, hi = evaluate.wilson_interval(95, 5)
+        self.assertTrue(lo < 0.95 < hi)
         with self.assertRaises(ValueError):
             evaluate.parse_grid("bogus=1")
 

@@ -683,7 +683,6 @@ def recompute_active_matching(
     auto_band_knn_min_sim: float = 0.52,
     label_outlier_min_sim: float = LABEL_OUTLIER_MIN_SIM,
     label_outlier_min_faces: int = LABEL_OUTLIER_MIN_FACES,
-    anchor_det_penalty: float = 0.0,
     diagnostics: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """
@@ -703,15 +702,19 @@ def recompute_active_matching(
       the same child (`auto_band_knn_min_sim`; a closed-set vote alone cannot spot an un-enrolled
       look-alike); otherwise the face goes to the review queue.
     - `album_cohesion` absorbs same-album faces only at local similarity >= `album_cohesion_absorb_sim`.
-    - kNN promotion of a candidate needs score >= `knn_promote_min_score`
-      (default `auto_high_threshold - 0.05`).
+    - kNN promotion of a candidate needs score >= `auto_high_threshold - 0.05`.
     - Anchor scores blend the best and second-best anchor (`anchor_top2_weight`) so one atypical or
       mislabelled anchor cannot pull in its whole neighbourhood.
-    The anchor outlier guard, det-score anchor discount and kNN voter cap are available but off: they
-    did not improve hidden-label accuracy on a real archive.
+    - Label-consistency guard (`faces/label_guard.py`, always on): a confirmed label whose best
+      similarity to the person's other confirmed faces that year is < `label_outlier_min_sim`
+      (person-years with >= `label_outlier_min_faces` faces) keeps its tag but is never used as
+      positive evidence (anchor, album/temporal anchor, kNN voter) unless the user kept it
+      (`label_keeps`). It is label hygiene, not an accuracy gain: on the hidden-label replay every
+      setting ties with the guard off (docs/faces-handover.md §10); the flagged faces are surfaced
+      for review via `get_suspicious_labels()`.
 
-    `diagnostics`, when given, is filled with per-section timings and the final score matrix
-    (offline evaluation / calibration only; it does not change any result).
+    `diagnostics`, when given, is filled with per-section timings, the final score matrix, the kNN
+    vote and the flagged labels (offline evaluation / calibration only; it does not change any result).
     """
     timings: dict[str, float] = {}
     t_mark = [time.perf_counter()]
@@ -811,16 +814,13 @@ def recompute_active_matching(
 
     chosen_anchor_face_ids: set[int] = set()
     anchors_by_pid: dict[int, tuple[NDArray[np.float32], NDArray[np.int32]]] = {}
-    anchor_det_pen_by_pid: dict[int, NDArray[np.float32]] = {}
 
     for pid in active_people:
         vecs: list[NDArray[np.float32]] = []
         yrs: list[int] = []
-        dets: list[float] = []
         for s_emb, s_yr in seeds_by_pid.get(pid, []):
             vecs.append(s_emb)
             yrs.append(s_yr)
-            dets.append(1.0)  # curated reference photos
 
         # Select up to `max_anchors_per_year` pose-diverse confirmed faces per year:
         person_years = sorted({yr for (p, yr) in confirmed_by_pid_year if p == pid})
@@ -840,23 +840,16 @@ def recompute_active_matching(
                 max_pair_sim=0.86,
             )
             for rel_k in keep_rel:
-                f_id, det_v, f_emb = items[int(rel_k)]
+                f_id, _det, f_emb = items[int(rel_k)]
                 chosen_anchor_face_ids.add(f_id)
                 vecs.append(f_emb)
                 yrs.append(yr)
-                dets.append(det_v)
 
         if vecs:
             anchors_by_pid[pid] = (
                 np.stack(vecs, axis=0).astype(np.float32),
                 np.asarray(yrs, dtype=np.int32),
             )
-            if anchor_det_penalty > 0.0:
-                # Blurry / small anchors are noisier: discount their similarities slightly.
-                det_arr = np.asarray(dets, dtype=np.float32)
-                anchor_det_pen_by_pid[pid] = (
-                    anchor_det_penalty * np.clip((0.80 - det_arr) / 0.25, 0.0, 1.0)
-                ).astype(np.float32)
 
     enrolled_pids = [pid for pid in active_people if pid in anchors_by_pid]
     _tick("anchor_select")
@@ -899,9 +892,6 @@ def recompute_active_matching(
         for col_idx, pid, c_start, c_end in pbatch:
             _, a_years = anchors_by_pid[pid]
             raw_sims = batch_raw_sims[:, c_start:c_end]
-            det_pen = anchor_det_pen_by_pid.get(pid)
-            if det_pen is not None and np.any(det_pen > 0.0):
-                raw_sims = raw_sims - det_pen[np.newaxis, :]
 
             # Apply Year-Windowed Sibling Guard when dated anchors exist:
             dated_mask = a_years > 0

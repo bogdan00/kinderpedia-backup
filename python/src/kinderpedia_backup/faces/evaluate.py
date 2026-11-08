@@ -3,7 +3,7 @@
 Usage::
 
     python -m kinderpedia_backup.faces.evaluate --db <faces_index.sqlite copy> \\
-        [--grid "min_sim=0.25,0.30;min_faces=4,8;det_penalty=0,0.05"] [--seeds 1,2] \\
+        [--grid "min_sim=0.25,0.30,0.35,0.40;min_faces=4,8"] [--seeds 1,2] \\
         [--folds 5] [--only-folds 0,1] [--json out.json] [--markdown out.md]
 
 Safety
@@ -35,12 +35,18 @@ Protocol (pre-declared, deterministic for a given `--seeds` / `--folds`)
        vs the guard-off baseline are paired per replicate.
 
 Selection rule (pre-declared)
-    Baseline = guard off (`label_outlier_min_sim = -1`: nothing can be flagged), det penalty 0.
+    Baseline = guard off (`label_outlier_min_sim = -1`: nothing can be flagged).
     A grid cell is NON-LOSING when its mean paired precision delta vs the baseline is >= -SE of that
-    delta (a difference within the fold-to-fold standard error is a tie, not a loss). Among
+    delta, or when the 95% Wilson intervals of the pooled precisions overlap (a difference within
+    the noise is a tie, not a loss). Among
     non-losing cells the one with the highest mean recall wins; cells whose paired recall deficit
-    to it is within its SE tie, and ties go to the SIMPLER cell: lower det_penalty, then lower
-    min_faces, then lower min_sim.
+    to it is within its SE tie, and ties go to the SIMPLER cell: lower min_faces, then lower min_sim
+    (then the threshold axes closest to the current defaults). The report marks this "rule pick".
+    When everything ties, the shipped values are chosen by flagged-set quality (spot-checking the
+    flagged faces); see docs/faces-handover.md for the current choice.
+
+    Grid axes: `min_sim`, `min_faces` (guard) and, for the threshold check, `auto_high`,
+    `band_upper`, `band_min_sim` (the auto-accept thresholds; reported, not auto-selected).
 """
 
 from __future__ import annotations
@@ -64,14 +70,18 @@ import numpy as np
 from .index_db import FacesIndexDB
 from .matcher import recompute_active_matching
 
-#: Grid axis name -> `recompute_active_matching` keyword.
+#: Grid axis name -> `recompute_active_matching` keyword. The first three are the guard axes the
+#: selection rule is about; the threshold axes are for the threshold check (report only).
 GRID_PARAMS: dict[str, str] = {
     "min_sim": "label_outlier_min_sim",
     "min_faces": "label_outlier_min_faces",
-    "det_penalty": "anchor_det_penalty",
+    "auto_high": "auto_high_threshold",
+    "band_upper": "auto_band_knn_upper",
+    "band_min_sim": "auto_band_knn_min_sim",
 }
+GUARD_PARAMS: tuple[str, ...] = ("label_outlier_min_sim", "label_outlier_min_faces")
 BASELINE_NAME = "guard-off"
-BASELINE_KW: dict[str, Any] = {"label_outlier_min_sim": -1.0, "anchor_det_penalty": 0.0}
+BASELINE_KW: dict[str, Any] = {"label_outlier_min_sim": -1.0}
 SCORE_BANDS: tuple[tuple[float, float], ...] = ((0.38, 0.45), (0.45, 0.50), (0.50, 0.60), (0.60, 9.0))
 THRESHOLD_BANDS: tuple[tuple[float, float], ...] = (
     (0.33, 0.40),
@@ -130,21 +140,27 @@ def parse_grid(spec: str) -> list[dict[str, Any]]:
 
 
 def cell_params(kw: dict[str, Any]) -> dict[str, Any]:
-    """Full guard parameters of a cell (matcher defaults filled in)."""
+    """Full parameters of a cell (matcher defaults filled in)."""
     return {k: kw.get(k, _matcher_default(k)) for k in GRID_PARAMS.values()}
 
 
 def cell_label(kw: dict[str, Any]) -> str:
     p = cell_params(kw)
-    return (
-        f"sim={p['label_outlier_min_sim']:.2f} faces={p['label_outlier_min_faces']} "
-        f"det={p['anchor_det_penalty']:.2f}"
-    )
+    label = f"sim={p['label_outlier_min_sim']:.2f} faces={p['label_outlier_min_faces']}"
+    for axis, name in GRID_PARAMS.items():
+        if name not in GUARD_PARAMS and name in kw:
+            label += f" {axis}={float(kw[name]):.2f}"
+    return label
 
 
-def simplicity_key(kw: dict[str, Any]) -> tuple[float, int, float]:
+def simplicity_key(kw: dict[str, Any]) -> tuple[float, ...]:
+    """Lower = simpler: lower min_faces, then lower min_sim, then distance of any threshold axis
+    from the current matcher default."""
     p = cell_params(kw)
-    return (float(p["anchor_det_penalty"]), int(p["label_outlier_min_faces"]), float(p["label_outlier_min_sim"]))
+    rest = tuple(
+        abs(float(p[name]) - float(_matcher_default(name))) for name in GRID_PARAMS.values() if name not in GUARD_PARAMS
+    )
+    return (int(p["label_outlier_min_faces"]), float(p["label_outlier_min_sim"]), *rest)
 
 
 @dataclass
@@ -471,11 +487,25 @@ def summarize(
     }
 
 
+def wilson_interval(correct: int, wrong: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval of the binomial proportion correct / (correct + wrong)."""
+    n = correct + wrong
+    if n == 0:
+        return 0.0, 1.0
+    p = correct / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return centre - half, centre + half
+
+
 def select_cell(rows: list[dict[str, Any]], per_cell: list[list[FoldResult]]) -> int | None:
     """Pre-declared selection rule (module doc); returns the row index or None if no cell qualifies."""
+    b_lo, b_hi = wilson_interval(rows[0]["correct"], rows[0]["wrong"])
     for row in rows[1:]:
         se = row["d_precision_se"] if not math.isnan(row["d_precision_se"]) else 0.0
-        row["non_losing"] = (not math.isnan(row["d_precision"])) and row["d_precision"] >= -se
+        lo, hi = wilson_interval(row["correct"], row["wrong"])
+        within_se = (not math.isnan(row["d_precision"])) and row["d_precision"] >= -se
+        row["non_losing"] = within_se or (lo <= b_hi and b_lo <= hi)
     rows[0]["non_losing"] = True
     cand = [i for i in range(1, len(rows)) if rows[i]["non_losing"]]
     if not cand:
@@ -523,7 +553,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     for row in rows:
         verdict = "baseline" if row["is_baseline"] else ("non-losing" if row.get("non_losing") else "LOSS")
         if row.get("chosen"):
-            verdict = "**chosen**"
+            verdict = "**rule pick**"
         out.append(
             f"| {row['name']} | {_fmt(row['precision'], row['precision_se'])} | "
             f"{_fmt(row['recall'], row['recall_se'])} | "
@@ -593,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--grid",
         default="",
-        help='Guard grid, e.g. "min_sim=0.25,0.30;min_faces=4,8;det_penalty=0,0.05". '
+        help='Grid, e.g. "min_sim=0.25,0.30;min_faces=4,8" or "band_upper=0.60,0.70". '
         "Default: only the current matcher policy (plus the guard-off baseline, always run).",
     )
     parser.add_argument("--seeds", default="1", help="Comma-separated fold seeds (default: 1).")

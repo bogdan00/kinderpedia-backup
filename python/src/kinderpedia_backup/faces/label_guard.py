@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-LABEL_OUTLIER_MIN_SIM = 0.30
+LABEL_OUTLIER_MIN_SIM = 0.40
 LABEL_OUTLIER_MIN_FACES = 8
 
 
