@@ -218,10 +218,34 @@ def umeyama_similarity_2d(src: NDArray[np.float32], dst: NDArray[np.float32] = A
     return mat
 
 
+#: Version tag of the face-alignment warp, folded into the recognizer `model_id` so that any change
+#: to the crop geometry invalidates cached embeddings. v2 = OpenCV pixel-index convention (see below).
+ALIGNMENT_VERSION = 2
+
+
+def pil_affine_coeffs_from_cv2(inv_2x3: NDArray[np.float64]) -> tuple[float, float, float, float, float, float]:
+    """
+    Convert an inverse (destination -> source) affine matrix written in OpenCV's pixel-index
+    convention into Pillow `Image.transform(AFFINE)` coefficients.
+
+    `cv2.warpAffine(..., WARP_INVERSE_MAP)` samples the source at `A @ dst + t`, where integer
+    coordinates are pixel centres. Pillow treats pixel centres as `i + 0.5` and samples the source at
+    `A @ (dst + 0.5) + t' - 0.5`. Equating both gives `t' = t + 0.5 - 0.5 * A @ (1, 1)`.
+    Without this correction the crop is shifted by up to ~1 px (more on small, upscaled faces), which
+    perturbs ArcFace embeddings versus the canonical `insightface.norm_crop` alignment.
+    """
+    a, b, c = float(inv_2x3[0, 0]), float(inv_2x3[0, 1]), float(inv_2x3[0, 2])
+    d, e, f = float(inv_2x3[1, 0]), float(inv_2x3[1, 1]), float(inv_2x3[1, 2])
+    return (a, b, c + 0.5 - 0.5 * (a + b), d, e, f + 0.5 - 0.5 * (d + e))
+
+
 def align_face_112(rgb_img: Image.Image, landmarks: NDArray[np.float32]) -> NDArray[np.float32]:
     """
     Warp a detected face via 5-point Umeyama alignment onto a canonical `112x112` RGB crop
     and return a `(3, 112, 112)` float32 tensor normalized as `(pixel - 127.5) / 127.5`.
+
+    Geometrically equivalent to `cv2.warpAffine(img, M, (112, 112))` with `M` the forward
+    Umeyama matrix (the ArcFace training alignment), implemented with Pillow.
     """
     fwd_2x3 = umeyama_similarity_2d(landmarks, ARCFACE_DST_112)
     hom = np.vstack([fwd_2x3, np.array([0.0, 0.0, 1.0], dtype=np.float64)])
@@ -230,14 +254,7 @@ def align_face_112(rgb_img: Image.Image, landmarks: NDArray[np.float32]) -> NDAr
     except np.linalg.LinAlgError:
         inv = np.eye(3, dtype=np.float64)
 
-    coeffs = (
-        float(inv[0, 0]),
-        float(inv[0, 1]),
-        float(inv[0, 2]),
-        float(inv[1, 0]),
-        float(inv[1, 1]),
-        float(inv[1, 2]),
-    )
+    coeffs = pil_affine_coeffs_from_cv2(inv[:2])
     aligned = rgb_img.transform(
         (112, 112),
         Image.Transform.AFFINE,
