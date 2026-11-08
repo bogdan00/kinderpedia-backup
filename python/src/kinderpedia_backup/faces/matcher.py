@@ -308,12 +308,23 @@ def rebuild_yearly_clusters(
         centroids: list[NDArray[np.float32]] = []
         medoid_local_idx: list[int] = []
 
-        for loc_i_raw in order:
-            loc_i = int(loc_i_raw)
-            if assigned[loc_i] != -1 or int(density[loc_i]) < (min_cluster_photos - 1):
-                continue
+        # Similarity columns of upcoming medoid candidates are computed in blocks (one SGEMM per
+        # block instead of one matrix-vector product per candidate on 20k+ face buckets).
+        elig_order = [int(i) for i in order if int(density[int(i)]) >= (min_cluster_photos - 1)]
+        elig_pos = {j: p for p, j in enumerate(elig_order)}
+        block_cols: dict[int, int] = {}
+        block_sims: NDArray[np.float32] = np.zeros((idx_arr.shape[0], 0), dtype=np.float32)
+        next_block = 0
 
-            sims = sub_embs @ sub_embs[loc_i]
+        for loc_i in elig_order:
+            if assigned[loc_i] != -1:
+                continue
+            if loc_i not in block_cols:
+                upcoming = [j for j in elig_order[next_block:] if assigned[j] == -1][:128]
+                next_block = elig_pos[upcoming[-1]] + 1
+                block_cols = {j: c for c, j in enumerate(upcoming)}
+                block_sims = sub_embs @ sub_embs[upcoming].T
+            sims = block_sims[:, block_cols[loc_i]]
             core_members = np.where((assigned == -1) & (sims >= core_sim))[0]
             if core_members.size < (min_cluster_photos - 1):
                 continue
@@ -489,13 +500,16 @@ def _max_sim_to_others(embs: NDArray[np.float32], chunk_size: int = 2048) -> NDA
     return out
 
 
-def _robust_anchor_score(sims: NDArray[np.float32], top2_weight: float) -> NDArray[np.float32]:
+def _robust_anchor_score(
+    sims: NDArray[np.float32], top2_weight: float, min_anchors: int = 4
+) -> NDArray[np.float32]:
     """
     Blend the best and second-best anchor similarity so a single atypical (or mistaken) anchor
     cannot pull in a whole ring of weak look-alikes on its own. Falls back to the max when a
-    person only has one anchor.
+    person has fewer than `min_anchors` anchors (e.g. only an avatar per age): there the second
+    anchor is usually a different age, not a second opinion.
     """
-    if top2_weight <= 0.0 or sims.shape[1] < 2:
+    if top2_weight <= 0.0 or sims.shape[1] < max(2, min_anchors):
         return np.asarray(np.max(sims, axis=1), dtype=np.float32)
     top2 = -np.partition(-sims, 1, axis=1)[:, :2]
     best = np.max(top2, axis=1)
@@ -609,7 +623,7 @@ def recompute_active_matching(
     auto_high_threshold: float = 0.45,
     candidate_threshold: float = 0.33,
     max_anchors_per_year: int = 8,
-    anchor_top2_weight: float = 0.0,
+    anchor_top2_weight: float = 0.35,
     distant_year_sibling_penalty: float = 0.075,
     mid_year_drift_penalty: float = 0.030,
     hard_neg_min_sim: float = 0.58,
@@ -621,7 +635,7 @@ def recompute_active_matching(
     social_peer_boost: float = 0.040,
     social_cross_circle_penalty: float = 0.075,
     album_cohesion_boost: float = 0.065,
-    album_cohesion_absorb_sim: float = 0.42,
+    album_cohesion_absorb_sim: float = 0.55,
     pressure_boost: float = 0.06,
     pressure_penalty: float = 0.12,
     temporal_window_days: int = 3,
@@ -639,7 +653,8 @@ def recompute_active_matching(
     knn_gate_min_labels: int = 25,
     album_absent_sim: float = 0.40,
     album_absent_strong_margin: float = 0.05,
-    auto_band_knn_upper: float = 0.0,
+    auto_band_knn_upper: float = 0.60,
+    auto_band_knn_min_sim: float = 0.52,
     knn_promote_min_score: float | None = None,
     album_cohesion_require_knn: bool = False,
     anchor_outlier_min_sim: float = 0.0,
@@ -658,6 +673,19 @@ def recompute_active_matching(
     5. Social Peer Co-Occurrence & Small-Photo Cross-Circle Suppression (boosts known classroom peers and
        suppresses siblings/other-classroom kids in intimate 2-8 face photos while tapering to 0 on >=9 face events)
     6. Global Photo-Level Bipartite 1-to-1 Exclusivity (1 face box = at most 1 person, 1 person = at most 1 face box)
+
+    Auto-acceptance policy (calibrated on hidden-label replays of the user's own decisions):
+    - `auto_high_threshold <= score < auto_band_knn_upper` is auto-accepted only when the labelled
+      neighbourhood agrees (`knn_trust_frac`) and its nearest labelled face is close enough to be
+      the same child (`auto_band_knn_min_sim`; a closed-set vote alone cannot spot an un-enrolled
+      look-alike); otherwise the face goes to the review queue.
+    - `album_cohesion` absorbs same-album faces only at local similarity >= `album_cohesion_absorb_sim`.
+    - kNN promotion of a candidate needs score >= `knn_promote_min_score`
+      (default `auto_high_threshold - 0.05`).
+    - Anchor scores blend the best and second-best anchor (`anchor_top2_weight`) so one atypical or
+      mislabelled anchor cannot pull in its whole neighbourhood.
+    The anchor outlier guard, det-score anchor discount and kNN voter cap are available but off: they
+    did not improve hidden-label accuracy on a real archive.
 
     `diagnostics`, when given, is filled with per-section timings and the final score matrix
     (offline evaluation / calibration only; it does not change any result).
@@ -1430,7 +1458,7 @@ def recompute_active_matching(
         by_photo[p_id].append((score, fid, pid, r_idx, c_idx))
 
     n_enr_cols = len(enrolled_pids)
-    promote_min = -1.0 if knn_promote_min_score is None else float(knn_promote_min_score)
+    promote_min = auto_high_threshold - 0.05 if knn_promote_min_score is None else float(knn_promote_min_score)
     auto_assignments: list[tuple[int, int, int, AssignmentStatus, float, AssignmentSource]] = []
     for p_id, candidates in by_photo.items():
         if len(candidates) > 1:
@@ -1456,7 +1484,10 @@ def recompute_active_matching(
                         src_kind = "album_cohesion"
             if knn_enabled:
                 trusts = status == "auto_high" and _knn_trusts(r_idx, pid, False)
-                if status == "auto_high" and not trusts and (
+                band_trusts = trusts and (
+                    score >= auto_band_knn_upper or float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+                )
+                if status == "auto_high" and not band_trusts and (
                     score < auto_band_knn_upper
                     or (src_kind == "album_cohesion" and album_cohesion_require_knn)
                 ):
@@ -1466,7 +1497,12 @@ def recompute_active_matching(
                     src_kind = "model_match"
                 elif trusts and src_kind != "album_cohesion":
                     src_kind = "model_trusted"
-                elif status == "candidate" and score >= promote_min and _knn_trusts(r_idx, pid, True):
+                elif (
+                    status == "candidate"
+                    and score >= promote_min
+                    and float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+                    and _knn_trusts(r_idx, pid, True)
+                ):
                     status = "auto_high"
                     src_kind = "model_trusted"
             auto_assignments.append((p_id, pid, fid, status, score, src_kind))

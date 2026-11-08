@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from kinderpedia_backup.faces import BoundingBox, DetectedFace, FacesIndexDB, recompute_active_matching
 from kinderpedia_backup.faces.alignment import (
     ARCFACE_DST_112,
     SCRFD_STRIDE_HEADS,
@@ -17,6 +20,7 @@ from kinderpedia_backup.faces.alignment import (
     decode_scrfd_outputs,
     umeyama_similarity_2d,
 )
+from kinderpedia_backup.faces.models import PhotoProvenance
 from kinderpedia_backup.faces.onnx_backend import _OpenCvDnnRunner, map_scrfd_outputs_by_shape
 from kinderpedia_backup.faces.weights import default_models_dir
 
@@ -258,6 +262,204 @@ class BackendParityTests(unittest.TestCase):
         a = cv_emb[0] / np.linalg.norm(cv_emb[0])
         b = ort_emb[0] / np.linalg.norm(ort_emb[0])
         self.assertGreater(float(a @ b), 0.999)
+
+
+class _SyntheticClassroom:
+    """
+    ArcFace-like synthetic embeddings: every identity is a random unit centre in 512-D and a face is
+    `alpha * centre + sqrt(1 - alpha^2) * noise`, so same-person cosine ~ alpha^2 (0.5-0.8), strangers
+    ~0 +- 0.05, and a look-alike (centre cosine `c`) lands at ~c * alpha^2 -- the ambiguous band the
+    matcher's thresholds are tuned for. No real data involved.
+    """
+
+    def __init__(self, seed: int) -> None:
+        self.rng = np.random.default_rng(seed)
+        self.centres: dict[str, NDArray[np.float64]] = {}
+        self.items: list[tuple[str, NDArray[np.float32]]] = []  # (identity, embedding) per photo
+
+    def _unit(self, v: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.asarray(v / np.linalg.norm(v))
+
+    def identity(self, name: str, *, like: str | None = None, centre_sim: float = 0.0) -> None:
+        raw = self._unit(self.rng.standard_normal(512))
+        if like is not None:
+            base = self.centres[like]
+            raw = self._unit(raw - (raw @ base) * base)
+            raw = centre_sim * base + np.sqrt(1.0 - centre_sim**2) * raw
+        self.centres[name] = self._unit(raw)
+
+    def faces(self, name: str, count: int, *, alpha: tuple[float, float] = (0.74, 0.88)) -> None:
+        c = self.centres[name]
+        for _ in range(count):
+            a = float(self.rng.uniform(*alpha))
+            noise = self._unit(self.rng.standard_normal(512))
+            noise = self._unit(noise - (noise @ c) * c)
+            self.items.append((name, (a * c + np.sqrt(1.0 - a * a) * noise).astype(np.float32)))
+
+    def save(self, db: FacesIndexDB) -> list[tuple[str, int, int]]:
+        order = self.rng.permutation(len(self.items))
+        batch: list[tuple[PhotoProvenance, int, int, int, int, str, list[DetectedFace]]] = []
+        for slot, i in enumerate(order.tolist()):
+            month, day = 1 + (slot * 5 // 28) % 12, 1 + (slot * 5) % 28
+            leaf = f"2026-{month:02d}-{day:02d} Day {slot}"
+            batch.append(
+                (
+                    PhotoProvenance(
+                        f"Alex/Albums/2026/{month:02d}/{leaf}/{slot:03d}.jpg",
+                        "Alex",
+                        "2026",
+                        f"{month:02d}",
+                        leaf,
+                        f"{slot:03d}.jpg",
+                        album_date=f"2026-{month:02d}-{day:02d}",
+                    ),
+                    400,
+                    300,
+                    100 + slot,
+                    1,
+                    "synthetic",
+                    [
+                        DetectedFace(
+                            box=BoundingBox(top=10, right=110, bottom=110, left=10),
+                            embedding=tuple(float(x) for x in self.items[i][1].tolist()),
+                            confidence=0.9,
+                        )
+                    ],
+                )
+            )
+        saved = db.upsert_scanned_batch(batch)
+        return [(self.items[i][0], p_id, f_ids[0]) for i, (p_id, f_ids) in zip(order.tolist(), saved, strict=True)]
+
+
+def _model_rows(db: FacesIndexDB) -> dict[int, tuple[int, str, str]]:
+    return {
+        int(r[0]): (int(r[1]), str(r[2]), str(r[3]))
+        for r in db._conn.execute(
+            "SELECT face_id, person_id, status, source FROM assignments "
+            "WHERE status IN ('auto_high', 'candidate') AND face_id IS NOT NULL"
+        )
+    }
+
+
+class MatcherRealisticEmbeddingTests(unittest.TestCase):
+    KIDS = ("Maya", "Leo", "Sofia", "Nina")
+
+    def _classroom(self, seed: int) -> _SyntheticClassroom:
+        cls = _SyntheticClassroom(seed)
+        for kid in self.KIDS:
+            cls.identity(kid)
+            cls.faces(kid, 36)
+        cls.identity("Theo", like="Leo", centre_sim=0.62)  # un-enrolled look-alike of Leo
+        cls.faces("Theo", 14)
+        for i in range(30):
+            cls.identity(f"stranger{i}")
+            cls.faces(f"stranger{i}", 1)
+        return cls
+
+    def test_auto_matches_are_precise_on_non_orthogonal_embeddings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "faces_index.sqlite") as db:
+            photos = self._classroom(seed=21).save(db)
+            pid_of = {kid: db.ensure_person(kid) for kid in self.KIDS}
+            labelled: set[int] = set()
+            per_kid: dict[str, int] = dict.fromkeys(self.KIDS, 0)
+            for who, p_id, f_id in photos:
+                if who in per_kid and per_kid[who] < 12:
+                    db.tag_single_face(photo_id=p_id, face_id=f_id, person_id=pid_of[who])
+                    per_kid[who] += 1
+                    labelled.add(f_id)
+            recompute_active_matching(db)
+            rows = _model_rows(db)
+            auto_ok = auto_bad = kid_open = 0
+            for who, _p_id, f_id in photos:
+                if f_id in labelled:
+                    continue
+                got = rows.get(f_id)
+                truth = pid_of.get(who)
+                kid_open += truth is not None
+                if got is not None and got[1] == "auto_high":
+                    if got[0] == truth:
+                        auto_ok += 1
+                    else:
+                        auto_bad += 1
+                        self.assertNotEqual(who[:8], "stranger", "a stranger was auto-attributed")
+            self.assertEqual(auto_bad, 0)
+            self.assertGreaterEqual(auto_ok, int(0.8 * kid_open))
+            # Look-alikes (cosine ~0.4-0.5 to Leo's faces) may be queued for review but never auto-accepted:
+            theo = [f for who, _, f in photos if who == "Theo"]
+            self.assertTrue(all(rows.get(f, (0, "none", ""))[1] != "auto_high" for f in theo))
+
+    def test_calibration_band_requires_labelled_neighbour_agreement(self) -> None:
+        cls = _SyntheticClassroom(seed=5)
+        for kid in ("Maya", "Leo"):
+            cls.identity(kid)
+            cls.faces(kid, 30)
+        # One ambiguous face, roughly equally close to both kids (scores ~0.45-0.6 for each):
+        mix = cls._unit(0.62 * cls.centres["Maya"] + 0.58 * cls.centres["Leo"] + 0.53 * cls._unit(cls.rng.standard_normal(512)))
+        cls.items.append(("ambiguous", mix.astype(np.float32)))
+        with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "faces_index.sqlite") as db:
+            photos = cls.save(db)
+            pid_of = {kid: db.ensure_person(kid) for kid in ("Maya", "Leo")}
+            for who, p_id, f_id in photos:
+                if who in pid_of:
+                    db.tag_single_face(photo_id=p_id, face_id=f_id, person_id=pid_of[who])
+            amb = next(f for who, _, f in photos if who == "ambiguous")
+            legacy: dict[str, object] = {}
+            recompute_active_matching(db, auto_band_knn_upper=0.0, diagnostics=legacy)
+            got_legacy = _model_rows(db).get(amb)
+            assert got_legacy is not None
+            self.assertEqual(got_legacy[1], "auto_high")  # old policy: auto-accepted on score alone
+            recompute_active_matching(db)
+            got = _model_rows(db).get(amb)
+            assert got is not None
+            self.assertEqual(got[1], "candidate")  # new policy: the split neighbourhood sends it to review
+
+
+class OfflineDecisionReplayTests(unittest.TestCase):
+    """
+    Replays synthetic "historic" batch decisions (approvals of the child, rejections of look-alikes)
+    with the decisions hidden from the matcher, and asserts the precision of what the matcher would
+    have auto-accepted at `auto_high_threshold`.
+    """
+
+    def test_precision_at_auto_high_threshold_on_hidden_decisions(self) -> None:
+        cls = _SyntheticClassroom(seed=8)
+        for kid in ("Maya", "Leo", "Sofia"):
+            cls.identity(kid)
+            cls.faces(kid, 40, alpha=(0.70, 0.88))
+        for i, (kid, sim) in enumerate((("Maya", 0.66), ("Leo", 0.60), ("Sofia", 0.70), ("Maya", 0.55))):
+            cls.identity(f"lookalike{i}", like=kid, centre_sim=sim)
+            cls.faces(f"lookalike{i}", 12)
+        lookalike_of = {"lookalike0": "Maya", "lookalike1": "Leo", "lookalike2": "Sofia", "lookalike3": "Maya"}
+        with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "faces_index.sqlite") as db:
+            photos = cls.save(db)
+            pid_of = {kid: db.ensure_person(kid) for kid in ("Maya", "Leo", "Sofia")}
+            decisions: list[tuple[int, int, int, bool]] = []  # (photo, face, person, approved)
+            for who, p_id, f_id in photos:
+                if who in pid_of:
+                    decisions.append((p_id, f_id, pid_of[who], True))
+                else:
+                    decisions.append((p_id, f_id, pid_of[lookalike_of[who]], False))
+            for kid, pid in pid_of.items():
+                del kid
+                db.apply_batch_decisions(
+                    person_id=pid,
+                    approved=[(p, f) for p, f, q, ok in decisions if q == pid and ok],
+                    disproved=[(p, f) for p, f, q, ok in decisions if q == pid and not ok],
+                )
+            hidden = decisions[::4]  # replay a quarter of the history
+            with db._conn:
+                db._conn.executemany(
+                    "DELETE FROM assignments WHERE photo_id = ? AND person_id = ?", [(p, q) for p, _f, q, _ok in hidden]
+                )
+            diag: dict[str, Any] = {}
+            recompute_active_matching(db, diagnostics=diag)
+            final = {(a[2], a[1]): a[3] for a in diag["assignments"]}
+            auto = [(ok) for _p, f, q, ok in hidden if final.get((f, q)) == "auto_high"]
+            self.assertGreaterEqual(len(auto), 10)
+            precision = sum(auto) / len(auto)
+            self.assertGreaterEqual(precision, 0.95, f"precision at auto_high_threshold = {precision:.2f}")
+            rejected_auto = sum(1 for ok in auto if not ok)
+            self.assertLessEqual(rejected_auto, 0)
 
 
 if __name__ == "__main__":
