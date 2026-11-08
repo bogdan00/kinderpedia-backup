@@ -157,7 +157,19 @@ def _pack_person_cluster(
 
 
 class FacesIndexDB:
-    """Thread-safe SQLite WAL database backing `faces scan`, `faces ui`, and URL/folder exports."""
+    """Thread-safe SQLite WAL database backing `faces scan`, `faces ui`, and URL/folder exports.
+
+    Concurrency rules:
+    - One shared connection; every cursor touch happens under `_lock` (an `RLock`), and rows are
+      materialized before it is released.
+    - Lock order: `_faces_matrix_lock` is the OUTER lock and `_lock` the INNER one. Code holding
+      `_faces_matrix_lock` may take `_lock` (e.g. the cold matrix load); code holding `_lock` must
+      NEVER take `_faces_matrix_lock` — so never call `load_all_faces_matrix()` (or anything that
+      reaches it, e.g. `_select_impactful_rows`) while holding `_lock`; release it first.
+    - Long CPU/filesystem work (SGEMMs, `materialize_flat_folders` I/O) runs without `_lock`.
+    - Cross-process: `faces scan` holds `Metadata/faces_scan.lock` and bumps `get_data_version()`
+      when it finishes; a long-lived reader (the Web UI) polls that value to drop its caches.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path.resolve()
@@ -1397,8 +1409,13 @@ class FacesIndexDB:
     def load_all_faces_matrix(self, *, dim: int = 512) -> dict[str, Any]:
         """
         Return all face vectors and metadata as contiguous numpy arrays.
-        Cached in memory across active-learning sweeps (`0.03ms` warm vs `~0.8s` cold SQLite BLOB read)
+        Cached in memory across active-learning sweeps (`0.03ms` warm vs `~1s` cold SQLite BLOB read)
         while reading live `suppress_auto` flags from SQLite on every call.
+
+        The cold load streams rows with `fetchmany` straight into a preallocated `(N, dim)` float32
+        matrix and L2-normalizes it in place, so peak memory stays close to the final matrix size
+        (no list of 120k `sqlite3.Row`s + joined blob + float32 copy + normalized copy).
+        Lock order: takes `_faces_matrix_lock` then `_lock` (never call while holding `_lock`).
         """
         with self._faces_matrix_lock:
             cached = self._faces_matrix_cache
@@ -1409,8 +1426,23 @@ class FacesIndexDB:
                     "suppressed_auto": self._query_suppressed_mask(face_ids_c),
                 }
 
+            chunk_rows = 4096
             with self._lock:
-                rows = self._conn.execute(
+                cnt_row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM faces WHERE is_manual = 0"
+                ).fetchone()
+                cap = max(1, int(cnt_row["n"]) if cnt_row is not None else 0)
+                embs_buf = np.empty((cap, dim), dtype=np.float32)
+                face_ids = np.empty((cap,), dtype=np.int64)
+                photo_ids = np.empty((cap,), dtype=np.int64)
+                det_scores = np.empty((cap,), dtype=np.float32)
+                min_dims = np.empty((cap,), dtype=np.int32)
+                suppressed_auto = np.empty((cap,), dtype=bool)
+                date_ords = np.empty((cap,), dtype=np.int32)
+                archive_children: list[str] = []
+                years: list[str] = []
+                album_keys: list[str] = []
+                cur = self._conn.execute(
                     """
                     SELECT
                         f.face_id,
@@ -1431,9 +1463,46 @@ class FacesIndexDB:
                     WHERE f.is_manual = 0
                     ORDER BY f.face_id ASC
                     """
-                ).fetchall()
+                )
+                n = 0
+                while True:
+                    chunk = cur.fetchmany(chunk_rows)
+                    if not chunk:
+                        break
+                    k = len(chunk)
+                    if n + k > cap:  # rows were added between COUNT and SELECT (other process)
+                        cap = max(cap * 2, n + k)
+                        embs_buf = np.resize(embs_buf, (cap, dim))
+                        face_ids = np.resize(face_ids, (cap,))
+                        photo_ids = np.resize(photo_ids, (cap,))
+                        det_scores = np.resize(det_scores, (cap,))
+                        min_dims = np.resize(min_dims, (cap,))
+                        suppressed_auto = np.resize(suppressed_auto, (cap,))
+                        date_ords = np.resize(date_ords, (cap,))
+                    embs_buf[n : n + k] = np.frombuffer(
+                        b"".join(r["embedding_f16"] for r in chunk), dtype=np.float16
+                    ).reshape(k, dim)
+                    for j, r in enumerate(chunk):
+                        i = n + j
+                        face_ids[i] = int(r["face_id"])
+                        photo_ids[i] = int(r["photo_id"])
+                        det_scores[i] = float(r["det_score"])
+                        min_dims[i] = min(int(r["bw"]), int(r["bh"]))
+                        suppressed_auto[i] = bool(r["suppress_auto"])
+                        ach = str(r["archive_child"])
+                        yr = str(r["year"])
+                        archive_children.append(ach)
+                        years.append(yr)
+                        album_keys.append(f"{ach}/{r['album_leaf']}")
+                        date_ords[i] = photo_date_ord(
+                            str(r["album_date"] or ""),
+                            str(r["image_dateadd"] or ""),
+                            yr,
+                            str(r["month"] or ""),
+                        )
+                    n += k
+                    del chunk
 
-            n = len(rows)
             if n == 0:
                 empty_payload: dict[str, Any] = {
                     "dim": dim,
@@ -1456,42 +1525,29 @@ class FacesIndexDB:
                 self._faces_matrix_cache = empty_payload
                 return dict(empty_payload)
 
-            face_ids = np.fromiter((int(r["face_id"]) for r in rows), dtype=np.int64, count=n)
-            photo_ids = np.fromiter((int(r["photo_id"]) for r in rows), dtype=np.int64, count=n)
-            det_scores = np.fromiter((float(r["det_score"]) for r in rows), dtype=np.float32, count=n)
-            min_dims = np.fromiter(
-                (min(int(r["bw"]), int(r["bh"])) for r in rows), dtype=np.int32, count=n
-            )
-            suppressed_auto = np.fromiter(
-                (bool(r["suppress_auto"]) for r in rows), dtype=bool, count=n
-            )
-            archive_children = [str(r["archive_child"]) for r in rows]
-            years = [str(r["year"]) for r in rows]
-            album_keys = [f"{r['archive_child']}/{r['album_leaf']}" for r in rows]
+            embs = embs_buf[:n] if n < cap else embs_buf
+            face_ids = face_ids[:n]
+            photo_ids = photo_ids[:n]
+            det_scores = det_scores[:n]
+            min_dims = min_dims[:n]
+            suppressed_auto = suppressed_auto[:n]
+            date_ords = date_ords[:n]
+            norm_block = 16384
+            for s in range(0, n, norm_block):
+                blk = embs[s : s + norm_block]
+                norms = np.linalg.norm(blk, axis=1, keepdims=True)
+                np.maximum(norms, np.float32(1e-8), out=norms)
+                blk /= norms
+            embs.setflags(write=False)
+
             year_ints = np.fromiter(
                 (int(y) if y.isdigit() and len(y) == 4 else 0 for y in years),
                 dtype=np.int32,
                 count=n,
             )
-            blobs = [bytes(r["embedding_f16"]) for r in rows]
-            date_ords = np.fromiter(
-                (
-                    photo_date_ord(
-                        str(r["album_date"] or ""),
-                        str(r["image_dateadd"] or ""),
-                        str(r["year"] or ""),
-                        str(r["month"] or ""),
-                    )
-                    for r in rows
-                ),
-                dtype=np.int32,
-                count=n,
-            )
-            embs = unpack_embeddings_f32(blobs, dim=dim)
-            embs.setflags(write=False)
-
             tmp_alb: dict[str, list[int]] = {}
             tmp_photo: dict[int, list[int]] = {}
+            photo_list = photo_ids.tolist()
             for idx_i in range(n):
                 akey = album_keys[idx_i]
                 alb_list = tmp_alb.get(akey)
@@ -1499,7 +1555,7 @@ class FacesIndexDB:
                     tmp_alb[akey] = [idx_i]
                 else:
                     alb_list.append(idx_i)
-                pid_i = int(photo_ids[idx_i])
+                pid_i = int(photo_list[idx_i])
                 ph_list = tmp_photo.get(pid_i)
                 if ph_list is None:
                     tmp_photo[pid_i] = [idx_i]
