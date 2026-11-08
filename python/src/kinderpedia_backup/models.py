@@ -55,6 +55,7 @@ class ChildBackupStats:
     albums_count: int = 0
     albums_indexed: int = 0
     albums_resumed_cached: int = 0
+    albums_failed: int = 0
     expected_photos_count: int = 0
     photos_downloaded: int = 0
     photos_skipped_existing: int = 0
@@ -68,6 +69,12 @@ class ChildBackupStats:
     documents_count: int = 0
     documents_downloaded: int = 0
     documents_skipped_existing: int = 0
+    documents_failed: int = 0
+
+    @property
+    def total_failures(self) -> int:
+        """Photos, videos, documents and album manifests that could not be backed up this run."""
+        return self.photos_failed + self.videos_failed + self.documents_failed + self.albums_failed
 
     def to_public_dict(self) -> dict[str, Any]:
         data = asdict(self)

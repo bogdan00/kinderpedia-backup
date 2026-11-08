@@ -13,6 +13,463 @@
  */
 
 (() => {
+  // ---------------------------------------------------------------------------
+  // Layout contract (pure functions, no DOM): shared byte-for-byte with the Python CLI
+  // (python/src/kinderpedia_backup/sync/naming.py + folder_map.py) and pinned by the golden fixture
+  // python/tests/fixtures/layout_contract.json (run: node --test bookmarklet/tests/).
+  // Defined before any browser checks so Node can load this file and test them headlessly.
+  // ---------------------------------------------------------------------------
+  const STOPWORDS = new Set([
+    "in", "de", "la", "cu", "si", "pe", "din", "un", "una", "ale", "cel", "cea",
+    "mai", "pentru", "dupa", "prin", "sub", "sau", "iar", "dar", "ca", "ce", "se",
+    "au", "sa", "ne", "am", "ai", "va", "le", "ii", "the", "and", "for", "with", "from",
+  ]);
+  const NUMBERED_PHOTO_RE = /^\d{3}_/;
+  const FOLDER_MAP_FILE = "folder_map.json";
+
+  function sanitizeName(name, maxLen = 60) {
+    if (!name) return "unnamed";
+    let clean = String(name)
+      // Normalize NEL, non-breaking spaces & wide spaces to standard space
+      .replace(/[\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/g, " ")
+      // Normalize / remove smart curly quotes, guillemets, and ellipsis
+      .replace(/[\u201c\u201d\u201e\u00ab\u00bb\u201f]/g, "")
+      .replace(/[\u2018\u2019\u201a\u201b]/g, "'")
+      .replace(/\u2026/g, "")
+      // Normalize en-dash, em-dash, horizontal bar to standard ASCII hyphen
+      .replace(/[\u2012\u2013\u2014\u2015]/g, "-")
+      // Strip supplementary-plane emojis/flags & BMP dingbats/variation selectors (matches Python naming.py)
+      .replace(/[\u{10000}-\u{10FFFF}]/gu, "")
+      .replace(/[\u2300-\u27BF\u2B50\uFE00-\uFE0F\u200B-\u200D\uFEFF]/g, "")
+      // Replace Windows forbidden characters: < > : " / \ | ? * and ASCII control characters
+      .replace(/[/\\?%*:|"<>]/g, "_")
+      .replace(/[\x00-\x1f\x7f]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/_+/g, "_")
+      .trim();
+
+    // Strip leading/trailing dots and spaces (Windows & hidden-file safe)
+    clean = clean.replace(/^[. ]+/, "").replace(/[. ]+$/, "");
+
+    if (clean.length > maxLen) {
+      clean = clean.substring(0, maxLen).trim().replace(/[. ]+$/, "");
+    }
+
+    // Protect against Windows reserved DOS device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    if (/^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i.test(clean)) {
+      clean = `_${clean}`;
+    }
+
+    return clean || "unnamed";
+  }
+
+  const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?)?/;
+  const TEXT_DATE_RE = /^(?:[A-Za-z]+\.?,\s*)?(\d{1,2})\s+([A-Za-z]+|\d{1,2})\.?\s+(\d{4})(?:\s*,?\s*(\d{1,2}):(\d{2}))?$/;
+  const ANY_DATE_RE = /(\d{4})-(\d{2})-(\d{2})/;
+  const MONTHS = new Map();
+  [
+    ["january", "jan"], ["february", "feb"], ["march", "mar"], ["april", "apr"], ["may"], ["june", "jun"],
+    ["july", "jul"], ["august", "aug"], ["september", "sep", "sept"], ["october", "oct"], ["november", "nov"],
+    ["december", "dec"],
+  ].forEach((names, idx) => names.forEach((n) => MONTHS.set(n, idx + 1)));
+
+  function validYmd(y, mo, d) {
+    if (!(mo >= 1 && mo <= 12 && d >= 1)) return false;
+    const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return d <= days[mo - 1];
+  }
+
+  function localTs(y, mo, d, hh = 0, mm = 0, ss = 0) {
+    const dt = new Date(y, mo - 1, d, hh, mm, ss);
+    dt.setFullYear(y); // years 0-99 must not map to 19xx
+    const ms = dt.getTime();
+    return Number.isNaN(ms) ? null : ms / 1000;
+  }
+
+  /**
+   * Canonical, locale-independent date parsing (mirrors Python `parse_date_prefix`):
+   * 1. ISO/SQL `YYYY-MM-DD[( |T)HH:MM[:SS[.fff]][Z|+HH[:]MM]]` anchored at the start; the prefix is the
+   *    literal digits; fractional seconds ignored; offset-less times are local; invalid dates -> null ts.
+   * 2. `[Weekday,] DD <English month|MM> YYYY[ [,] HH:MM]` (local time).
+   * 3. Any embedded `YYYY-MM-DD` (prefix only). Never falls back to engine-specific `Date.parse`.
+   */
+  function parseDatePrefix(dateStr) {
+    if (dateStr === null || dateStr === undefined || dateStr === "") return { prefix: "unknown_date", timestamp: null };
+    const s = String(dateStr).trim();
+    if (!s) return { prefix: "unknown_date", timestamp: null };
+
+    const iso = s.match(ISO_DATE_RE);
+    if (iso) {
+      const prefix = `${iso[1]}-${iso[2]}-${iso[3]}`;
+      const y = Number(iso[1]);
+      const mo = Number(iso[2]);
+      const d = Number(iso[3]);
+      if (!validYmd(y, mo, d)) return { prefix, timestamp: null };
+      if (iso[4] === undefined) return { prefix, timestamp: localTs(y, mo, d) };
+      const hh = Number(iso[4]);
+      const mi = Number(iso[5]);
+      const ss = iso[6] !== undefined ? Number(iso[6]) : 0;
+      if (hh > 23 || mi > 59 || ss > 59) return { prefix, timestamp: null };
+      const tz = iso[7];
+      if (!tz) return { prefix, timestamp: localTs(y, mo, d, hh, mi, ss) };
+      let offsetMin = 0;
+      if (tz !== "Z") {
+        const digits = tz.slice(1).replace(":", "");
+        const oh = Number(digits.slice(0, 2));
+        const om = Number(digits.slice(2));
+        if (oh > 23 || om > 59) return { prefix, timestamp: null };
+        offsetMin = (oh * 60 + om) * (tz[0] === "-" ? -1 : 1);
+      }
+      const utcDate = new Date(Date.UTC(y, mo - 1, d, hh, mi, ss));
+      utcDate.setUTCFullYear(y);
+      return { prefix, timestamp: utcDate.getTime() / 1000 - offsetMin * 60 };
+    }
+
+    const txt = s.match(TEXT_DATE_RE);
+    if (txt) {
+      const d = Number(txt[1]);
+      const y = Number(txt[3]);
+      const monRaw = txt[2].toLowerCase();
+      const mo = /^\d+$/.test(monRaw) ? Number(monRaw) : MONTHS.get(monRaw) || 0;
+      if (validYmd(y, mo, d)) {
+        const hh = txt[4] !== undefined ? Number(txt[4]) : 0;
+        const mi = txt[5] !== undefined ? Number(txt[5]) : 0;
+        if (hh <= 23 && mi <= 59) {
+          const prefix = `${String(y).padStart(4, "0")}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+          return { prefix, timestamp: localTs(y, mo, d, hh, mi) };
+        }
+      }
+    }
+
+    const anyDate = s.match(ANY_DATE_RE);
+    if (anyDate) {
+      return { prefix: `${anyDate[1]}-${anyDate[2]}-${anyDate[3]}`, timestamp: null };
+    }
+    return { prefix: "unknown_date", timestamp: null };
+  }
+
+  function splitYearMonth(ymd) {
+    if (typeof ymd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+      return [ymd.slice(0, 4), ymd.slice(5, 7)];
+    }
+    return ["Unknown", "00"];
+  }
+
+  function getChildShortName(ctx) {
+    const fn = String(ctx.first_name || "").trim();
+    if (fn) return fn;
+    const parts = String(ctx.child_name || "").trim().split(/\s+/).filter(Boolean);
+    return parts.length > 0 ? parts[0] : `child_${ctx.child_id}`;
+  }
+
+  function resolveChildFolderNames(contexts) {
+    const shortCounts = new Map();
+    const fullCounts = new Map();
+    for (const c of contexts) {
+      const sKey = sanitizeName(getChildShortName(c), 60).toLowerCase();
+      const fKey = sanitizeName(c.child_name, 60).toLowerCase();
+      shortCounts.set(sKey, (shortCounts.get(sKey) || 0) + 1);
+      fullCounts.set(fKey, (fullCounts.get(fKey) || 0) + 1);
+    }
+
+    const out = new Map();
+    const usedCi = new Set();
+    for (const c of contexts) {
+      const short = sanitizeName(getChildShortName(c), 60);
+      const full = sanitizeName(c.child_name, 60);
+      let cand;
+      if (shortCounts.get(short.toLowerCase()) === 1) {
+        cand = short;
+      } else if (fullCounts.get(full.toLowerCase()) === 1) {
+        cand = full;
+      } else {
+        const schoolTag = c.school_name ? sanitizeName(c.school_name, 30) : `KG_${c.kindergarten_id}`;
+        cand = sanitizeName(`${short} (${schoolTag})`, 60);
+      }
+
+      const base = cand;
+      let k = 2;
+      while (usedCi.has(cand.toLowerCase())) {
+        cand = sanitizeName(`${base} (${k})`, 60);
+        k++;
+      }
+      usedCi.add(cand.toLowerCase());
+      out.set(`${c.child_id}_${c.kindergarten_id}`, cand);
+    }
+    return out;
+  }
+
+  const leafOf = (folderRel) => String(folderRel).split("/").pop();
+
+  /**
+   * `existing`: persisted Map<albumId, folderRel> from Metadata/<Child>/folder_map.json. Known albums keep
+   * their folder verbatim and every persisted leaf is reserved, so only unknown IDs get new names.
+   */
+  function assignAlbumFolderNames(albums, existing = new Map()) {
+    const usedCi = new Set();
+    for (const folder of existing.values()) usedCi.add(leafOf(folder).toLowerCase());
+    const folderById = new Map();
+    const seenIds = new Set();
+    const byBase = new Map();
+    for (const a of albums) {
+      if (a == null || a.id == null) continue;
+      const aid = Number(a.id);
+      if (existing.has(aid)) {
+        folderById.set(aid, existing.get(aid));
+        continue;
+      }
+      if (seenIds.has(aid)) continue; // duplicate listing entry: first occurrence wins
+      seenIds.add(aid);
+      const { prefix: ymd, timestamp: ts } = parseDatePrefix(a.date || a.updated_at || "");
+      const [yearS, monthS] = splitYearMonth(ymd);
+      const title = sanitizeName(String(a.name || `album_${aid}`), 60);
+      const leafBase = `${ymd} ${title}`;
+      const key = leafBase.toLowerCase();
+      if (!byBase.has(key)) byBase.set(key, []);
+      byBase.get(key).push({
+        ts: ts !== null ? ts : Number.POSITIVE_INFINITY,
+        aid,
+        yearS,
+        monthS,
+        leafBase,
+      });
+    }
+
+    for (const group of byBase.values()) {
+      group.sort((x, y) => (x.ts !== y.ts ? (x.ts < y.ts ? -1 : 1) : x.aid - y.aid));
+      for (let idx = 0; idx < group.length; idx++) {
+        const { aid, yearS, monthS, leafBase } = group[idx];
+        let candLeaf = idx === 0 ? leafBase : `${leafBase} (${idx + 1})`;
+        let k = idx + 2;
+        while (usedCi.has(candLeaf.toLowerCase())) {
+          candLeaf = `${leafBase} (${k})`;
+          k++;
+        }
+        usedCi.add(candLeaf.toLowerCase());
+        folderById.set(aid, `${yearS}/${monthS}/${candLeaf}`);
+      }
+    }
+    return folderById;
+  }
+
+  function normalizeMatchText(text) {
+    return String(text || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/\p{Mn}/gu, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function stemSimilarity(videoText, albumText) {
+    const vn = normalizeMatchText(videoText);
+    const an = normalizeMatchText(albumText);
+    if (!vn || !an) return 0;
+    let score = 0;
+    if (vn.length >= 4 && an.length >= 4 && (vn.includes(an) || an.includes(vn))) {
+      score += 2;
+    }
+    const vTokens = vn.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    const aTokens = an.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    for (const w1 of vTokens) {
+      for (const w2 of aTokens) {
+        if (w1 === w2 || (w1.length >= 4 && w2.length >= 4 && w1.slice(0, 5) === w2.slice(0, 5))) {
+          score += 1;
+          break;
+        }
+      }
+    }
+    return score;
+  }
+
+  function extractOwnerId(item) {
+    if (item && item.owner && typeof item.owner === "object" && item.owner.user_id != null) {
+      const parsed = parseInt(item.owner.user_id, 10);
+      return Number.isNaN(parsed) ? null : parsed;
+    }
+    return null;
+  }
+
+  /**
+   * `existing`: persisted Map<videoId, {folderRel, fileName}>; pinned videos keep their target and their
+   * file names stay reserved in their folders.
+   */
+  function planVideoTargets(videos, albums, albumFolderById, existing = new Map()) {
+    const albumsByDay = new Map();
+    for (const a of albums) {
+      if (a == null || a.id == null) continue;
+      const aid = Number(a.id);
+      if (!albumFolderById.has(aid)) continue;
+      const { prefix: ymd } = parseDatePrefix(a.date || a.updated_at || "");
+      if (!albumsByDay.has(ymd)) albumsByDay.set(ymd, []);
+      albumsByDay.get(ymd).push(a);
+    }
+
+    const out = new Map();
+    const usedByFolder = new Map();
+    for (const { folderRel, fileName } of existing.values()) {
+      if (!usedByFolder.has(folderRel)) usedByFolder.set(folderRel, new Set());
+      usedByFolder.get(folderRel).add(fileName.toLowerCase());
+    }
+
+    const videosByFolder = new Map();
+    const seenVids = new Set();
+    for (const v of videos) {
+      if (v == null || v.id == null) continue;
+      const vid = Number(v.id);
+      if (existing.has(vid)) {
+        out.set(vid, existing.get(vid));
+        continue;
+      }
+      if (seenVids.has(vid)) continue; // duplicate listing entry: first occurrence wins
+      seenVids.add(vid);
+      const { prefix: vYmd, timestamp: vTs } = parseDatePrefix(v.date || v.updated_at || "");
+      const vCleanTitle = sanitizeName(String(v.name || "video"), 60);
+      const cands = albumsByDay.get(vYmd) || [];
+
+      let targetFolder;
+      if (cands.length === 1) {
+        targetFolder = albumFolderById.get(Number(cands[0].id));
+      } else if (cands.length >= 2) {
+        const vOwner = extractOwnerId(v);
+        const vText = `${v.name || ""} ${v.description || ""}`;
+        let best = cands[0];
+        let bestTuple = null;
+        for (const cand of cands) {
+          const { timestamp: aTs } = parseDatePrefix(cand.date || cand.updated_at || "");
+          const aOwner = extractOwnerId(cand);
+          const aText = `${cand.name || ""} ${cand.description || ""}`;
+          const st = stemSimilarity(vText, aText);
+          const sameO = vOwner !== null && aOwner !== null && vOwner === aOwner ? 1 : 0;
+          const dtDiff = vTs !== null && aTs !== null ? Math.abs(vTs - aTs) : 1e12;
+          const tuple = [st, sameO, -dtDiff, -Number(cand.id)];
+          if (
+            bestTuple === null ||
+            tuple[0] > bestTuple[0] ||
+            (tuple[0] === bestTuple[0] && tuple[1] > bestTuple[1]) ||
+            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] > bestTuple[2]) ||
+            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] === bestTuple[2] && tuple[3] > bestTuple[3])
+          ) {
+            bestTuple = tuple;
+            best = cand;
+          }
+        }
+        targetFolder = albumFolderById.get(Number(best.id));
+      } else {
+        const [yearS, monthS] = splitYearMonth(vYmd);
+        targetFolder = `${yearS}/${monthS}/${vYmd} ${vCleanTitle}`;
+      }
+
+      if (!videosByFolder.has(targetFolder)) videosByFolder.set(targetFolder, []);
+      videosByFolder.get(targetFolder).push({
+        ts: vTs !== null ? vTs : Number.POSITIVE_INFINITY,
+        vid,
+        vCleanTitle,
+      });
+    }
+
+    for (const [folder, group] of videosByFolder.entries()) {
+      group.sort((x, y) => (x.ts !== y.ts ? (x.ts < y.ts ? -1 : 1) : x.vid - y.vid));
+      if (!usedByFolder.has(folder)) usedByFolder.set(folder, new Set());
+      const usedNamesCi = usedByFolder.get(folder);
+      for (const { vid, vCleanTitle } of group) {
+        let candName = `${vCleanTitle}.mp4`;
+        let k = 2;
+        while (usedNamesCi.has(candName.toLowerCase())) {
+          candName = `${vCleanTitle} (${k}).mp4`;
+          k++;
+        }
+        usedNamesCi.add(candName.toLowerCase());
+        out.set(vid, { folderRel: folder, fileName: candName });
+      }
+    }
+    return out;
+  }
+
+  /** `(updated_at, count_images)` change-detection key of a gallery album listing entry (Python parity). */
+  function albumListingSignature(album) {
+    if (!album || typeof album !== "object") return "\u0000-1";
+    const count = parseInt(album.count_images, 10) || 0;
+    return `${album.updated_at || ""}\u0000${count}`;
+  }
+
+  function mergeIncrementalListing(fresh, cached) {
+    const seen = new Set();
+    const out = [];
+    for (const item of [...fresh, ...cached]) {
+      if (!item || item.id == null) continue;
+      const k = String(item.id);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(item);
+    }
+    return out;
+  }
+
+  function albumFolderFromLeaf(leaf) {
+    const m = String(leaf).match(/^(\d{4}-\d{2}-\d{2}) /);
+    const [yearS, monthS] = splitYearMonth(m ? m[1] : "");
+    return `${yearS}/${monthS}/${leaf}`;
+  }
+
+  function isSafeRelFolder(rel) {
+    if (typeof rel !== "string" || !rel || rel.includes("\\") || rel.includes("\u0000")) return false;
+    if (rel.startsWith("/") || /^[A-Za-z]:/.test(rel)) return false;
+    return rel.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+  }
+
+  /** Validate a decoded folder_map.json -> { albums: Map<id, folderRel>, videos: Map<id, {folderRel, fileName}> }. */
+  function parseFolderMap(data) {
+    if (!data || typeof data !== "object" || !data.albums || typeof data.albums !== "object") return null;
+    const albums = new Map();
+    for (const [k, v] of Object.entries(data.albums)) {
+      const id = Number(k);
+      if (Number.isInteger(id) && isSafeRelFolder(v)) albums.set(id, v);
+    }
+    const videos = new Map();
+    if (data.videos && typeof data.videos === "object") {
+      for (const [k, v] of Object.entries(data.videos)) {
+        const id = Number(k);
+        if (!Number.isInteger(id) || !v || typeof v !== "object") continue;
+        if (isSafeRelFolder(v.folder) && isSafeRelFolder(v.file) && !v.file.includes("/")) {
+          videos.set(id, { folderRel: v.folder, fileName: v.file });
+        }
+      }
+    }
+    return { albums, videos };
+  }
+
+  function serializeFolderMap(albums, videos) {
+    const byId = (a, b) => a[0] - b[0];
+    const out = { version: 1, albums: {}, videos: {} };
+    for (const [id, folder] of [...albums.entries()].sort(byId)) out.albums[String(id)] = folder;
+    for (const [id, t] of [...videos.entries()].sort(byId)) out.videos[String(id)] = { folder: t.folderRel, file: t.fileName };
+    return out;
+  }
+
+  const layoutApi = {
+    sanitizeName,
+    parseDatePrefix,
+    splitYearMonth,
+    getChildShortName,
+    resolveChildFolderNames,
+    assignAlbumFolderNames,
+    normalizeMatchText,
+    stemSimilarity,
+    planVideoTargets,
+    albumListingSignature,
+    mergeIncrementalListing,
+    albumFolderFromLeaf,
+    parseFolderMap,
+    serializeFolderMap,
+  };
+  // Headless (Node `node --test`) consumers get the pure layout API; the browser UI below never runs there.
+  if (typeof module === "object" && module && module.exports && typeof window === "undefined") {
+    module.exports = layoutApi;
+    return;
+  }
+
   if (window.__kinderpedia_backup_instance) {
     if (typeof window.__kinderpedia_backup_instance.toggleUI === "function") {
       window.__kinderpedia_backup_instance.toggleUI();
@@ -264,296 +721,6 @@
 
   // --- Utility Functions ---
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const STOPWORDS = new Set([
-    "in", "de", "la", "cu", "si", "pe", "din", "un", "una", "ale", "cel", "cea",
-    "mai", "pentru", "dupa", "prin", "sub", "sau", "iar", "dar", "ca", "ce", "se",
-    "au", "sa", "ne", "am", "ai", "va", "le", "ii", "the", "and", "for", "with", "from",
-  ]);
-  const NUMBERED_PHOTO_RE = /^\d{3}_/;
-
-  function sanitizeName(name, maxLen = 60) {
-    if (!name) return "unnamed";
-    let clean = String(name)
-      // Normalize non-breaking spaces & wide spaces to standard space
-      .replace(/[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/g, " ")
-      // Normalize / remove smart curly quotes, guillemets, and ellipsis
-      .replace(/[\u201c\u201d\u201e\u00ab\u00bb\u201f]/g, "")
-      .replace(/[\u2018\u2019\u201a\u201b]/g, "'")
-      .replace(/\u2026/g, "")
-      // Normalize en-dash, em-dash, horizontal bar to standard ASCII hyphen
-      .replace(/[\u2012\u2013\u2014\u2015]/g, "-")
-      // Strip supplementary-plane emojis/flags & BMP dingbats/variation selectors (matches Python naming.py)
-      .replace(/[\u{10000}-\u{10FFFF}]/gu, "")
-      .replace(/[\u2300-\u27BF\u2B50\uFE00-\uFE0F\u200B-\u200D\uFEFF]/g, "")
-      // Replace Windows forbidden characters: < > : " / \ | ? * and ASCII control characters
-      .replace(/[/\\?%*:|"<>]/g, "_")
-      .replace(/[\x00-\x1f\x7f]/g, "")
-      .replace(/\s+/g, " ")
-      .replace(/_+/g, "_")
-      .trim();
-
-    // Strip leading/trailing dots and spaces (Windows & hidden-file safe)
-    clean = clean.replace(/^[. ]+/, "").replace(/[. ]+$/, "");
-
-    if (clean.length > maxLen) {
-      clean = clean.substring(0, maxLen).trim().replace(/[. ]+$/, "");
-    }
-
-    // Protect against Windows reserved DOS device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
-    if (/^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i.test(clean)) {
-      clean = `_${clean}`;
-    }
-
-    return clean || "unnamed";
-  }
-
-  function parseDatePrefix(dateStr) {
-    if (!dateStr) return { prefix: "unknown_date", timestamp: null };
-    const s = String(dateStr).trim();
-    if (!s) return { prefix: "unknown_date", timestamp: null };
-
-    // Extract YYYY-MM-DD directly from ISO/SQL date strings so browser timezone never shifts the calendar day
-    const iso = s.match(
-      /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?)?/
-    );
-    if (iso) {
-      const prefix = `${iso[1]}-${iso[2]}-${iso[3]}`;
-      if (iso[4] !== undefined) {
-        let norm = `${iso[1]}-${iso[2]}-${iso[3]}T${iso[4]}:${iso[5]}:${iso[6]}`;
-        if (iso[7]) {
-          const tz = iso[7] === "Z" ? "Z" : iso[7].includes(":") ? iso[7] : `${iso[7].slice(0, 3)}:${iso[7].slice(3)}`;
-          norm += tz;
-        }
-        const ms = Date.parse(norm);
-        return { prefix, timestamp: Number.isNaN(ms) ? null : ms / 1000 };
-      }
-      const localMidnight = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]), 0, 0, 0).getTime();
-      return { prefix, timestamp: Number.isNaN(localMidnight) ? null : localMidnight / 1000 };
-    }
-
-    try {
-      const d = new Date(s);
-      if (!Number.isNaN(d.getTime())) {
-        const y = d.getFullYear();
-        const m = String(d.getMonth() + 1).padStart(2, "0");
-        const day = String(d.getDate()).padStart(2, "0");
-        return { prefix: `${y}-${m}-${day}`, timestamp: d.getTime() / 1000 };
-      }
-    } catch (_) {}
-
-    const anyDate = s.match(/(\d{4})-(\d{2})-(\d{2})/);
-    if (anyDate) {
-      return { prefix: `${anyDate[1]}-${anyDate[2]}-${anyDate[3]}`, timestamp: null };
-    }
-    return { prefix: "unknown_date", timestamp: null };
-  }
-
-  function splitYearMonth(ymd) {
-    if (typeof ymd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
-      return [ymd.slice(0, 4), ymd.slice(5, 7)];
-    }
-    return ["Unknown", "00"];
-  }
-
-  function getChildShortName(ctx) {
-    const fn = String(ctx.first_name || "").trim();
-    if (fn) return fn;
-    const parts = String(ctx.child_name || "").trim().split(/\s+/).filter(Boolean);
-    return parts.length > 0 ? parts[0] : `Child_${ctx.child_id}`;
-  }
-
-  function resolveChildFolderNames(contexts) {
-    const shortCounts = new Map();
-    const fullCounts = new Map();
-    for (const c of contexts) {
-      const sKey = sanitizeName(getChildShortName(c), 60).toLowerCase();
-      const fKey = sanitizeName(c.child_name, 60).toLowerCase();
-      shortCounts.set(sKey, (shortCounts.get(sKey) || 0) + 1);
-      fullCounts.set(fKey, (fullCounts.get(fKey) || 0) + 1);
-    }
-
-    const out = new Map();
-    const usedCi = new Set();
-    for (const c of contexts) {
-      const short = sanitizeName(getChildShortName(c), 60);
-      const full = sanitizeName(c.child_name, 60);
-      let cand;
-      if (shortCounts.get(short.toLowerCase()) === 1) {
-        cand = short;
-      } else if (fullCounts.get(full.toLowerCase()) === 1) {
-        cand = full;
-      } else {
-        const schoolTag = c.school_name ? sanitizeName(c.school_name, 30) : `KG_${c.kindergarten_id}`;
-        cand = sanitizeName(`${short} (${schoolTag})`, 60);
-      }
-
-      const base = cand;
-      let k = 2;
-      while (usedCi.has(cand.toLowerCase())) {
-        cand = sanitizeName(`${base} (${k})`, 60);
-        k++;
-      }
-      usedCi.add(cand.toLowerCase());
-      out.set(`${c.child_id}_${c.kindergarten_id}`, cand);
-    }
-    return out;
-  }
-
-  function assignAlbumFolderNames(albums) {
-    const byBase = new Map();
-    for (const a of albums) {
-      if (a == null || a.id == null) continue;
-      const aid = Number(a.id);
-      const { prefix: ymd, timestamp: ts } = parseDatePrefix(a.date || a.updated_at || "");
-      const [yearS, monthS] = splitYearMonth(ymd);
-      const title = sanitizeName(String(a.name || `album_${aid}`), 60);
-      const leafBase = `${ymd} ${title}`;
-      const key = leafBase.toLowerCase();
-      if (!byBase.has(key)) byBase.set(key, []);
-      byBase.get(key).push({
-        ts: ts !== null ? ts : Number.POSITIVE_INFINITY,
-        aid,
-        yearS,
-        monthS,
-        leafBase,
-      });
-    }
-
-    const folderById = new Map();
-    const usedCi = new Set();
-    for (const group of byBase.values()) {
-      group.sort((x, y) => (x.ts !== y.ts ? x.ts - y.ts : x.aid - y.aid));
-      for (let idx = 0; idx < group.length; idx++) {
-        const { aid, yearS, monthS, leafBase } = group[idx];
-        let candLeaf = idx === 0 ? leafBase : `${leafBase} (${idx + 1})`;
-        let k = idx + 2;
-        while (usedCi.has(candLeaf.toLowerCase())) {
-          candLeaf = `${leafBase} (${k})`;
-          k++;
-        }
-        usedCi.add(candLeaf.toLowerCase());
-        folderById.set(aid, `${yearS}/${monthS}/${candLeaf}`);
-      }
-    }
-    return folderById;
-  }
-
-  function normalizeMatchText(text) {
-    return String(text || "")
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]+/g, " ")
-      .trim();
-  }
-
-  function stemSimilarity(videoText, albumText) {
-    const vn = normalizeMatchText(videoText);
-    const an = normalizeMatchText(albumText);
-    if (!vn || !an) return 0;
-    let score = 0;
-    if (vn.length >= 4 && an.length >= 4 && (vn.includes(an) || an.includes(vn))) {
-      score += 2;
-    }
-    const vTokens = vn.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
-    const aTokens = an.split(" ").filter((w) => w.length >= 3 && !STOPWORDS.has(w));
-    for (const w1 of vTokens) {
-      for (const w2 of aTokens) {
-        if (w1 === w2 || (w1.length >= 4 && w2.length >= 4 && w1.slice(0, 5) === w2.slice(0, 5))) {
-          score += 1;
-          break;
-        }
-      }
-    }
-    return score;
-  }
-
-  function extractOwnerId(item) {
-    if (item && item.owner && typeof item.owner === "object" && item.owner.user_id != null) {
-      const parsed = parseInt(item.owner.user_id, 10);
-      return Number.isNaN(parsed) ? null : parsed;
-    }
-    return null;
-  }
-
-  function planVideoTargets(videos, albums, albumFolderById) {
-    const albumsByDay = new Map();
-    for (const a of albums) {
-      if (a == null || a.id == null) continue;
-      const aid = Number(a.id);
-      if (!albumFolderById.has(aid)) continue;
-      const { prefix: ymd } = parseDatePrefix(a.date || a.updated_at || "");
-      if (!albumsByDay.has(ymd)) albumsByDay.set(ymd, []);
-      albumsByDay.get(ymd).push(a);
-    }
-
-    const videosByFolder = new Map();
-    for (const v of videos) {
-      if (v == null || v.id == null) continue;
-      const vid = Number(v.id);
-      const { prefix: vYmd, timestamp: vTs } = parseDatePrefix(v.date || v.updated_at || "");
-      const vCleanTitle = sanitizeName(String(v.name || "video"), 60);
-      const cands = albumsByDay.get(vYmd) || [];
-
-      let targetFolder;
-      if (cands.length === 1) {
-        targetFolder = albumFolderById.get(Number(cands[0].id));
-      } else if (cands.length >= 2) {
-        const vOwner = extractOwnerId(v);
-        const vText = `${v.name || ""} ${v.description || ""}`;
-        let best = cands[0];
-        let bestTuple = null;
-        for (const cand of cands) {
-          const { timestamp: aTs } = parseDatePrefix(cand.date || cand.updated_at || "");
-          const aOwner = extractOwnerId(cand);
-          const aText = `${cand.name || ""} ${cand.description || ""}`;
-          const st = stemSimilarity(vText, aText);
-          const sameO = vOwner !== null && aOwner !== null && vOwner === aOwner ? 1 : 0;
-          const dtDiff = vTs !== null && aTs !== null ? Math.abs(vTs - aTs) : 1e12;
-          const tuple = [st, sameO, -dtDiff, -Number(cand.id)];
-          if (
-            bestTuple === null ||
-            tuple[0] > bestTuple[0] ||
-            (tuple[0] === bestTuple[0] && tuple[1] > bestTuple[1]) ||
-            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] > bestTuple[2]) ||
-            (tuple[0] === bestTuple[0] && tuple[1] === bestTuple[1] && tuple[2] === bestTuple[2] && tuple[3] > bestTuple[3])
-          ) {
-            bestTuple = tuple;
-            best = cand;
-          }
-        }
-        targetFolder = albumFolderById.get(Number(best.id));
-      } else {
-        const [yearS, monthS] = splitYearMonth(vYmd);
-        targetFolder = `${yearS}/${monthS}/${vYmd} ${vCleanTitle}`;
-      }
-
-      if (!videosByFolder.has(targetFolder)) videosByFolder.set(targetFolder, []);
-      videosByFolder.get(targetFolder).push({
-        ts: vTs !== null ? vTs : Number.POSITIVE_INFINITY,
-        vid,
-        vCleanTitle,
-      });
-    }
-
-    const out = new Map();
-    for (const [folder, group] of videosByFolder.entries()) {
-      group.sort((x, y) => (x.ts !== y.ts ? x.ts - y.ts : x.vid - y.vid));
-      const usedNamesCi = new Set();
-      for (const { vid, vCleanTitle } of group) {
-        let candName = `${vCleanTitle}.mp4`;
-        let k = 2;
-        while (usedNamesCi.has(candName.toLowerCase())) {
-          candName = `${vCleanTitle} (${k}).mp4`;
-          k++;
-        }
-        usedNamesCi.add(candName.toLowerCase());
-        out.set(vid, { folderRel: folder, fileName: candName });
-      }
-    }
-    return out;
-  }
 
   async function getNestedDirectoryHandle(baseDirHandle, relPath, dirCache) {
     const parts = String(relPath).split("/").filter(Boolean);
@@ -1943,13 +2110,84 @@
       });
     }
 
+    async fetchGalleryPage(ctx, mode, page, orderBy) {
+      const query = new URLSearchParams({
+        mode,
+        page: String(page),
+        items_per_page: "30",
+        order_by: orderBy,
+        order_type: "DESC",
+      });
+      const resp = await this.client.httpJson(`/data/gallery?${query}`, {
+        headers: {
+          "X-KINDERGARTEN-ID": String(ctx.kindergarten_id),
+          "X-CHILD-ID": String(ctx.child_id),
+        },
+      });
+      const payload = resp.response || resp.result || resp;
+      if (payload && Array.isArray(payload[mode])) return payload[mode];
+      if (payload && Array.isArray(payload.items)) return payload.items;
+      if (Array.isArray(payload)) return payload;
+      return [];
+    }
+
+    /**
+     * Incremental listing (mirrors Python `list_albums(known=...)` / `list_videos(known_ids=...)`): pages are
+     * ordered newest-first, so scanning stops at the first page whose items are all known (and, for albums,
+     * have an unchanged `(updated_at, count_images)`). Returns the fresh items merged into the cached index.
+     */
+    async catalogIncremental(ctx, metadataDir, cached, { mode, orderBy, indexFile, isUnchanged }) {
+      const fresh = [];
+      const seen = new Set();
+      let page = 1;
+      while (!this.isCancelled) {
+        while (this.isPaused && !this.isCancelled) await sleep(500);
+        if (this.isCancelled) break;
+        this.ui.setActivity(`🔍 Checking ${mode} page ${page} for new items...`);
+        let items;
+        try {
+          items = await this.fetchGalleryPage(ctx, mode, page, orderBy);
+        } catch (e) {
+          this.ui.log(`⚠️ Error checking ${mode} page ${page}: ${e.message}`);
+          break;
+        }
+        if (!items.length) break;
+        let added = 0;
+        let pageUnchanged = true;
+        for (const item of items) {
+          if (!item || item.id == null) continue;
+          if (!isUnchanged(item)) pageUnchanged = false;
+          if (!seen.has(String(item.id))) {
+            seen.add(String(item.id));
+            fresh.push(item);
+            added++;
+          }
+        }
+        if (pageUnchanged || items.length < 30 || added === 0) break;
+        page++;
+      }
+      const merged = mergeIncrementalListing(fresh, cached);
+      if (!this.isCancelled) {
+        await this.writeJsonAtomic(metadataDir, indexFile, merged);
+      }
+      return { merged, freshCount: fresh.filter((x) => !isUnchanged(x)).length };
+    }
+
     async catalogChildAlbums(ctx, metadataDir) {
       const finalIndex = await this.readJsonIfExists(metadataDir, "albums_index.json");
       if (Array.isArray(finalIndex) && finalIndex.length > 0) {
-        this.stats.totalExpectedAlbums = finalIndex.length;
-        this.stats.totalExpectedPhotos = finalIndex.reduce((acc, a) => acc + (parseInt(a.count_images, 10) || 0), 0);
+        const known = new Map(finalIndex.filter((a) => a && a.id != null).map((a) => [String(a.id), albumListingSignature(a)]));
+        const { merged, freshCount } = await this.catalogIncremental(ctx, metadataDir, finalIndex, {
+          mode: "albums",
+          orderBy: "updated_at",
+          indexFile: "albums_index.json",
+          isUnchanged: (a) => known.get(String(a.id)) === albumListingSignature(a),
+        });
+        this.stats.totalExpectedAlbums = merged.length;
+        this.stats.totalExpectedPhotos = merged.reduce((acc, a) => acc + (parseInt(a.count_images, 10) || 0), 0);
+        this.ui.log(`📸 ${freshCount} new/changed album(s) since the last backup (${merged.length} total).`);
         this.refreshLiveUI(ctx.child_name);
-        return finalIndex;
+        return merged;
       }
 
       const partialState = await this.readJsonIfExists(metadataDir, "albums_index_partial.json");
@@ -2057,12 +2295,71 @@
       return allAlbums;
     }
 
-    async processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog) {
+    async dirExists(baseDirHandle, relPath) {
+      try {
+        let cur = baseDirHandle;
+        for (const part of String(relPath).split("/").filter(Boolean)) {
+          cur = await cur.getDirectoryHandle(part);
+        }
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    /**
+     * Load Metadata/<Child>/folder_map.json, or rebuild the album part from Metadata/<Child>/Albums/*.json
+     * (`album_listing.id`) for archives created before the map existed (mirrors Python `rebuild_folder_map`).
+     */
+    async loadFolderMap(metadataDir, metaAlbumsDir, albumsDir) {
+      const parsed = parseFolderMap(await this.readJsonIfExists(metadataDir, FOLDER_MAP_FILE));
+      if (parsed) return parsed;
+      const albums = new Map();
+      const candidates = new Map();
+      try {
+        for await (const entry of metaAlbumsDir.values()) {
+          if (entry.kind !== "file" || !entry.name.endsWith(".json")) continue;
+          const leaf = entry.name.slice(0, -5);
+          let meta = null;
+          try {
+            meta = JSON.parse(await (await entry.getFile()).text());
+          } catch (_) {
+            continue;
+          }
+          const id = meta && meta.album_listing && meta.album_listing.id;
+          if (id == null || !Number.isInteger(Number(id))) continue;
+          if (!candidates.has(Number(id))) candidates.set(Number(id), []);
+          candidates.get(Number(id)).push(leaf);
+        }
+      } catch (_) {}
+      for (const [id, leaves] of candidates.entries()) {
+        leaves.sort();
+        let chosen = leaves[0];
+        if (leaves.length > 1) {
+          for (const leaf of leaves) {
+            if (await this.dirExists(albumsDir, albumFolderFromLeaf(leaf))) {
+              chosen = leaf;
+              break;
+            }
+          }
+        }
+        albums.set(id, albumFolderFromLeaf(chosen));
+      }
+      if (albums.size) this.ui.log(`🗂️ Rebuilt ${albums.size} album folder identities from Metadata.`);
+      return { albums, videos: new Map() };
+    }
+
+    async processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog, folderMap) {
       let allAlbums = [];
       let albumFolderMap = new Map();
       try {
         allAlbums = await this.catalogChildAlbums(ctx, metadataDir);
-        albumFolderMap = assignAlbumFolderNames(allAlbums);
+        // Persisted identity: known album IDs keep their folders; only unknown IDs get new names.
+        albumFolderMap = assignAlbumFolderNames(allAlbums, folderMap.albums);
+        for (const [id, folder] of albumFolderMap.entries()) folderMap.albums.set(id, folder);
+        if (!this.isCancelled && (allAlbums.length || folderMap.albums.size)) {
+          await this.writeJsonAtomic(metadataDir, FOLDER_MAP_FILE, serializeFolderMap(folderMap.albums, folderMap.videos));
+        }
       } finally {
         if (typeof resolveAlbumsCatalog === "function") {
           resolveAlbumsCatalog({ allAlbums, albumFolderMap });
@@ -2090,7 +2387,14 @@
 
       // FAST-PATH: Count only numbered album photos (`001_<id>.jpg`), ignoring co-located `.mp4` videos
       let meta = await this.readJsonIfExists(metaAlbumsDir, albumMetaFileName);
-      if (meta?.completed === true && Array.isArray(meta?.images) && (meta.images.length >= expectedCnt || expectedCnt === 0)) {
+      // Reuse the cached manifest unless the listing's (updated_at, count_images) changed since it was fetched
+      // or it is empty for a non-empty album (mirrors Python engine `_prepare_album`).
+      const manifestFresh =
+        !!meta &&
+        Array.isArray(meta.images) &&
+        albumListingSignature(meta.album_listing) === albumListingSignature(album) &&
+        (meta.images.length > 0 || expectedCnt === 0);
+      if (manifestFresh && meta.completed === true) {
         let diskPhotoCount = 0;
         try {
           if (typeof albumDir.values === "function") {
@@ -2115,8 +2419,8 @@
       }
 
       // Fetch album image manifest if missing or incomplete
-      let images = meta?.images || [];
-      if (!images.length || images.length < expectedCnt) {
+      let images = manifestFresh ? meta.images : [];
+      if (!manifestFresh) {
         this.ui.setActivity(`🔍 Fetching photo list: "${sanitizeName(aname, 35)}"...`);
         const res = await this.client.getAlbumImages(ctx.kindergarten_id, ctx.child_id, aid, expectedCnt);
         images = res.images;
@@ -2252,9 +2556,16 @@
     async catalogChildVideos(ctx, metadataDir) {
       const finalIndex = await this.readJsonIfExists(metadataDir, "videos_index.json");
       if (Array.isArray(finalIndex) && finalIndex.length > 0) {
-        this.stats.totalVideos = finalIndex.length;
+        const knownIds = new Set(finalIndex.filter((v) => v && v.id != null).map((v) => String(v.id)));
+        const { merged } = await this.catalogIncremental(ctx, metadataDir, finalIndex, {
+          mode: "videos",
+          orderBy: "dateadd",
+          indexFile: "videos_index.json",
+          isUnchanged: (v) => knownIds.has(String(v.id)),
+        });
+        this.stats.totalVideos = merged.length;
         this.refreshLiveUI(ctx.child_name);
-        return finalIndex;
+        return merged;
       }
 
       const partialState = await this.readJsonIfExists(metadataDir, "videos_index_partial.json");
@@ -2355,13 +2666,15 @@
       return allVideos;
     }
 
-    async processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise) {
+    async processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise, folderMap) {
       const allVideos = await this.catalogChildVideos(ctx, metadataDir);
       const { allAlbums, albumFolderMap } = await albumsCatalogPromise;
       if (this.isCancelled || !allVideos.length) return;
 
       const metaVideosDir = await metadataDir.getDirectoryHandle("Videos", { create: true });
-      const videoTargets = planVideoTargets(allVideos, allAlbums, albumFolderMap);
+      const videoTargets = planVideoTargets(allVideos, allAlbums, albumFolderMap, folderMap.videos);
+      for (const [id, target] of videoTargets.entries()) folderMap.videos.set(id, target);
+      await this.writeJsonAtomic(metadataDir, FOLDER_MAP_FILE, serializeFolderMap(folderMap.albums, folderMap.videos));
       await this.downloadVideoList(ctx, albumsDir, metaVideosDir, dirCache, allVideos, videoTargets);
     }
 
@@ -2664,6 +2977,7 @@
         const metadataDir = await rootMetadataDir.getDirectoryHandle(childFolderName, { create: true });
         const metaAlbumsDir = await metadataDir.getDirectoryHandle("Albums", { create: true });
         const dirCache = new Map();
+        const folderMap = await this.loadFolderMap(metadataDir, metaAlbumsDir, albumsDir);
 
         // Avatar (downloaded in background if present)
         if (ctx.avatar_url) {
@@ -2692,8 +3006,8 @@
 
         // MAXIMUM CONCURRENCY: Photos, Videos (matched into day albums), and Docs run in parallel!
         await Promise.all([
-          this.processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog),
-          this.processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise),
+          this.processChildPhotos(ctx, albumsDir, metadataDir, metaAlbumsDir, dirCache, resolveAlbumsCatalog, folderMap),
+          this.processChildVideos(ctx, albumsDir, metadataDir, dirCache, albumsCatalogPromise, folderMap),
           this.processChildDocs(ctx, childDir, metadataDir),
         ]);
 

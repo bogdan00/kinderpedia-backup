@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -13,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,64 @@ class TwoFactorRequiredError(RuntimeError):
     """Raised when Kinderpedia requires a 2FA confirmation code during login."""
 
 
+class AuthExpiredError(RuntimeError):
+    """Raised when an authenticated Kinderpedia call returns HTTP 401 and refreshing the JWT failed.
+
+    Every subsequent API call would fail the same way, so callers should abort the run (or
+    re-authenticate) instead of failing each remaining album individually.
+    """
+
+
+class IncompleteDownloadError(RuntimeError):
+    """Raised when a transfer ended before the size announced by Content-Length/Content-Range."""
+
+
+def album_listing_signature(album: object) -> tuple[str, int]:
+    """`(updated_at, count_images)` change-detection key of a gallery album listing entry."""
+    if not isinstance(album, dict):
+        return ("", -1)
+    try:
+        count = int(album.get("count_images") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return (str(album.get("updated_at") or ""), count)
+
+
+_CONTENT_RANGE_RE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", re.I)
+_UNSATISFIED_RANGE_RE = re.compile(r"^\s*bytes\s+\*/(\d+)\s*$", re.I)
+
+
+_FFMPEG_PROGRESS_KEYS = frozenset({"total_size", "out_time_us", "out_time_ms", "frame", "progress"})
+
+
+def _header(resp: Any, name: str) -> str:
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return ""
+    return str(headers.get(name) or "")
+
+
+def _resumable_part_path(url: str, dest: Path) -> Path:
+    """Stable per-(dest, URL path) `.part` name so retries/re-runs can resume with HTTP Range.
+
+    The query string is excluded (signed CDN URLs rotate their tokens) but the path is included so a
+    fallback URL never appends onto bytes fetched from a different source.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    digest = hashlib.sha1(f"{parsed.netloc}{parsed.path}".encode(), usedforsecurity=False).hexdigest()[:10]
+    return dest.with_name(f"{dest.name}.{digest}.part")
+
+
+def hls_playlist_duration(m3u8: str) -> float:
+    """Sum of `#EXTINF` segment durations (seconds) in a media playlist; 0.0 if none."""
+    total = 0.0
+    for ln in m3u8.splitlines():
+        if ln.startswith("#EXTINF:"):
+            with contextlib.suppress(ValueError):
+                total += float(ln[len("#EXTINF:") :].split(",", 1)[0].strip())
+    return total
+
+
 class KinderpediaClient:
     """Authenticated HTTP client for Kinderpedia parent accounts and Vimeo embeds."""
 
@@ -56,6 +116,7 @@ class KinderpediaClient:
         self.session_file = self.state_dir / "session.json"
         self.ffmpeg_bin = ffmpeg_bin if ffmpeg_bin is not None else find_ffmpeg()
         self._warned_missing_ffmpeg = False
+        self.ffmpeg_stall_timeout = 180.0
 
         self.web_api_key = os.environ.get("KINDERPEDIA_WEB_API_KEY", DEFAULT_WEB_API_KEY)
         self.mobile_client_id = os.environ.get("KINDERPEDIA_MOBILE_CLIENT_ID", DEFAULT_MOBILE_CLIENT_ID)
@@ -149,6 +210,8 @@ class KinderpediaClient:
 
         safe_url = redact_secrets(url)
         is_web_api = "apiv20.kinderpedia.co" in url
+        host = urllib.parse.urlsplit(url).hostname or ""
+        is_kinderpedia = host == "kinderpedia.co" or host.endswith(".kinderpedia.co")
         last_err: Exception | None = None
 
         for attempt in range(retries):
@@ -183,6 +246,10 @@ class KinderpediaClient:
                         form_body=form_body,
                         retry_auth=False,
                         retries=retries,
+                    )
+                if resp.status_code == 401 and is_kinderpedia and "Authorization" in hdrs:
+                    raise AuthExpiredError(
+                        f"HTTP 401 on {safe_url}: Kinderpedia session expired and could not be refreshed"
                     )
                 if resp.status_code == 429 and attempt + 1 < retries:
                     retry_after = resp.headers.get("Retry-After", "")
@@ -559,7 +626,19 @@ class KinderpediaClient:
         child_id: int,
         *,
         partial_file: Path | None = None,
+        known: Mapping[int, tuple[str, int]] | None = None,
     ) -> list[dict[str, Any]]:
+        """
+        List gallery albums (`order_by=updated_at DESC`).
+
+        Incremental mode (`known` = `{album_id: album_listing_signature}` from the cached index):
+        stops after the first page whose albums are all known with an unchanged
+        `(updated_at, count_images)` -- since the listing is ordered by `updated_at DESC`, every
+        new or modified album sorts before such a page. Returns only the pages fetched; callers
+        merge them with the cached index. `partial_file` is ignored in incremental mode.
+        """
+        if known is not None:
+            partial_file = None
         albums: list[dict[str, Any]] = []
         seen_ids: set[int] = set()
         page = 1
@@ -603,15 +682,21 @@ class KinderpediaClient:
                 break
 
             new_count = 0
+            page_unchanged = True
             for a in page_items:
                 if not isinstance(a, dict) or "id" not in a:
                     continue
                 aid = int(a["id"])
+                if known is not None and known.get(aid) != album_listing_signature(a):
+                    page_unchanged = False
                 if aid not in seen_ids:
                     seen_ids.add(aid)
                     albums.append(a)
                     new_count += 1
             log(f"  [Albums] page {page}: +{new_count} albums (total so far: {len(albums)})")
+            if known is not None and page_unchanged:
+                log(f"  [Albums] page {page} fully known & unchanged; incremental scan stops here.")
+                break
 
             if partial_file is not None:
                 total_photos_est = sum(int(x.get("count_images") or 0) for x in albums)
@@ -649,9 +734,15 @@ class KinderpediaClient:
     def get_album_images(
         self, kindergarten_id: int, child_id: int, album_id: int, expected_count: int = 0
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """
+        Fetch an album's image manifest. Raises `AuthExpiredError` on an unrecoverable 401, and
+        `RuntimeError` when no images could be fetched for a non-empty album because of errors (so
+        the album is counted as failed instead of being recorded as a completed empty album).
+        """
         hdrs = self.web_api_headers(kindergarten_id, child_id)
         album_meta: dict[str, Any] = {}
         images: list[dict[str, Any]] = []
+        errors: list[str] = []
 
         try:
             raw_imgs = self._http_json(
@@ -664,7 +755,10 @@ class KinderpediaClient:
             cand = unwrapped.get("images", []) if isinstance(unwrapped, dict) else []
             if isinstance(cand, list):
                 images = [img for img in cand if isinstance(img, dict)]
+        except AuthExpiredError:
+            raise
         except Exception as exc:
+            errors.append(f"images-plugin: {redact_secrets(str(exc))}")
             log(f"  [Warn] images-plugin/{album_id}: {redact_secrets(str(exc))}")
 
         if not images and expected_count > 0:
@@ -680,9 +774,14 @@ class KinderpediaClient:
                         album_meta = det["album"]
                     if isinstance(det.get("images"), list) and len(det["images"]) > len(images):
                         images = [img for img in det["images"] if isinstance(img, dict)]
+            except AuthExpiredError:
+                raise
             except Exception as exc:
+                errors.append(f"gallery details: {redact_secrets(str(exc))}")
                 log(f"  [Warn] gallery/{album_id} details: {redact_secrets(str(exc))}")
 
+        if not images and expected_count > 0 and errors:
+            raise RuntimeError(f"Could not fetch images for album {album_id}: {'; '.join(errors)}")
         return album_meta, images
 
     def list_videos(
@@ -691,7 +790,11 @@ class KinderpediaClient:
         child_id: int,
         *,
         partial_file: Path | None = None,
+        known_ids: Collection[int] | None = None,
     ) -> list[dict[str, Any]]:
+        """List videos (`order_by=dateadd DESC`); with `known_ids`, stop after the first all-known page."""
+        if known_ids is not None:
+            partial_file = None
         videos: list[dict[str, Any]] = []
         seen_ids: set[int] = set()
         page = 1
@@ -735,15 +838,21 @@ class KinderpediaClient:
                 break
 
             new_count = 0
+            page_known = True
             for v in page_items:
                 if not isinstance(v, dict) or "id" not in v:
                     continue
                 vid = int(v["id"])
+                if known_ids is not None and vid not in known_ids:
+                    page_known = False
                 if vid not in seen_ids:
                     seen_ids.add(vid)
                     videos.append(v)
                     new_count += 1
             log(f"  [Videos] page {page}: +{new_count} videos (total so far: {len(videos)})")
+            if known_ids is not None and page_known:
+                log(f"  [Videos] page {page} fully known; incremental scan stops here.")
+                break
 
             if partial_file is not None:
                 write_json_atomic(
@@ -794,7 +903,14 @@ class KinderpediaClient:
         child_id: int,
         *,
         partial_file: Path | None = None,
+        known_ids: Collection[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """
+        Walk document folders breadth-first. With `known_ids`, paging inside each folder stops at the
+        first page whose documents are all known (folders themselves are still visited).
+        """
+        if known_ids is not None:
+            partial_file = None
         docs: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         completed_entities: set[str] = set()
@@ -848,6 +964,8 @@ class KinderpediaClient:
                             },
                             headers=self.web_api_headers(kindergarten_id, child_id),
                         )
+                    except AuthExpiredError:
+                        raise
                     except Exception:
                         break
                     payload = self._unwrap_web_api(raw)
@@ -866,6 +984,7 @@ class KinderpediaClient:
                         break
 
                     new_count = 0
+                    page_known = True
                     for d in items:
                         if not isinstance(d, dict):
                             continue
@@ -874,11 +993,13 @@ class KinderpediaClient:
                                 queue.append((entity_type, int(d["id"])))
                             continue
                         did = str(d.get("id") or d.get("file_id") or d.get("url") or "")
+                        if known_ids is not None and did not in known_ids:
+                            page_known = False
                         if did and did not in seen_ids:
                             seen_ids.add(did)
                             docs.append(d)
                             new_count += 1
-                    if new_count == 0 or len(items) < 30:
+                    if new_count == 0 or len(items) < 30 or (known_ids is not None and page_known):
                         break
                     page += 1
 
@@ -915,6 +1036,14 @@ class KinderpediaClient:
             if url not in self.url_cache:
                 self.url_cache[url] = path
 
+    @staticmethod
+    def _identity_content_length(resp: Any) -> int | None:
+        """Body length announced by the server, unless a content-encoding makes it incomparable."""
+        if (_header(resp, "Content-Encoding") or "identity").lower() != "identity":
+            return None
+        raw = _header(resp, "Content-Length").strip()
+        return int(raw) if raw.isdigit() else None
+
     def download_binary(
         self,
         url: str,
@@ -922,6 +1051,14 @@ class KinderpediaClient:
         extra_headers: dict[str, str] | None = None,
         retries: int = 6,
     ) -> int:
+        """
+        Stream `url` into `dest` via a stable `<dest>.<hash>.part` file.
+
+        Interrupted transfers resume with `Range: bytes=<size>-` on the next attempt (or the next run)
+        when the server answers `206` with a matching `Content-Range`; a `200` reply restarts from
+        byte 0. The final size is verified against `Content-Range`/`Content-Length` before the
+        atomic rename, so a truncated body is never promoted to `dest`.
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
         with self._cache_lock:
             cached = self.url_cache.get(url)
@@ -930,49 +1067,79 @@ class KinderpediaClient:
             return dest.stat().st_size
 
         safe_url = redact_secrets(url)
-        tmp = dest.with_suffix(dest.suffix + f".{os.getpid()}.{threading.get_ident()}.part")
+        part = _resumable_part_path(url, dest)
         hdrs = {"User-Agent": "Mozilla/5.0 (Linux; Android 17) KinderpediaBackup/1.0"}
         if extra_headers:
             hdrs.update(extra_headers)
         for attempt in range(retries):
             try:
-                with self.http.get(url, headers=hdrs, stream=True, timeout=(15, 60)) as resp:
-                    if resp.status_code in (401, 403) and "Authorization" not in hdrs and "kinderpedia.co" in url:
+                offset = part.stat().st_size if part.exists() else 0
+                req_hdrs = dict(hdrs)
+                if offset > 0:
+                    req_hdrs["Range"] = f"bytes={offset}-"
+                expected_total: int | None = None
+                with self.http.get(url, headers=req_hdrs, stream=True, timeout=(15, 60)) as resp:
+                    status = resp.status_code
+                    if status in (401, 403) and "Authorization" not in hdrs and "kinderpedia.co" in url:
                         hdrs["Authorization"] = f"Bearer {self.token}"
                         continue
-                    if resp.status_code in (404, 410):
-                        raise FileNotFoundError(f"HTTP {resp.status_code} for {safe_url}")
-                    if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < retries:
+                    if status in (404, 410):
+                        raise FileNotFoundError(f"HTTP {status} for {safe_url}")
+                    if status == 416 and offset > 0:
+                        m_unsat = _UNSATISFIED_RANGE_RE.match(_header(resp, "Content-Range"))
+                        if not (m_unsat and int(m_unsat.group(1)) == offset):
+                            part.unlink(missing_ok=True)
+                            continue
+                        expected_total = offset  # the .part already holds the complete body
+                    elif status in (429, 500, 502, 503, 504) and attempt + 1 < retries:
                         pause_s = min(90.0, 2.0 * (2**attempt)) + random.uniform(0.5, 2.5)
                         time.sleep(pause_s)
                         continue
-                    if resp.status_code >= 400:
-                        raise RuntimeError(f"HTTP {resp.status_code} downloading {safe_url}")
-                    with open(tmp, "wb") as out:
-                        for chunk in resp.iter_content(chunk_size=256 * 1024):
-                            if chunk:
-                                out.write(chunk)
-                sz = tmp.stat().st_size
+                    elif status >= 400:
+                        raise RuntimeError(f"HTTP {status} downloading {safe_url}")
+                    else:
+                        mode = "wb"
+                        m_range = _CONTENT_RANGE_RE.match(_header(resp, "Content-Range"))
+                        if status == 206 and m_range is not None:
+                            start = int(m_range.group(1))
+                            if start != offset:
+                                part.unlink(missing_ok=True)
+                                continue
+                            if offset > 0:
+                                mode = "ab"
+                            if m_range.group(3) != "*":
+                                expected_total = int(m_range.group(3))
+                        else:
+                            length = self._identity_content_length(resp)
+                            expected_total = length
+                        with open(part, mode) as out:
+                            for chunk in resp.iter_content(chunk_size=256 * 1024):
+                                if chunk:
+                                    out.write(chunk)
+                sz = part.stat().st_size
                 if sz == 0:
                     raise RuntimeError(f"Downloaded 0 bytes from {safe_url}")
-                replace_atomic(tmp, dest)
+                if expected_total is not None and sz != expected_total:
+                    if sz > expected_total:
+                        part.unlink(missing_ok=True)
+                    raise IncompleteDownloadError(
+                        f"Size mismatch for {safe_url}: got {sz} of {expected_total} bytes"
+                    )
+                replace_atomic(part, dest)
                 self.register_cached_url(url, dest)
                 return sz
             except FileNotFoundError:
                 with contextlib.suppress(OSError):
-                    if tmp.exists():
-                        tmp.unlink()
+                    part.unlink(missing_ok=True)
                 raise
             except Exception as exc:
-                with contextlib.suppress(OSError):
-                    if tmp.exists():
-                        tmp.unlink()
+                # Keep the .part: the next attempt (or run) resumes it with an HTTP Range request.
                 if attempt + 1 < retries:
                     pause_s = min(90.0, 2.0 * (2**attempt)) + random.uniform(0.5, 2.5)
                     time.sleep(pause_s)
                     continue
                 raise RuntimeError(redact_secrets(str(exc))) from None
-        return 0
+        raise RuntimeError(f"Download failed after {retries} attempts: {safe_url}")
 
     def download_with_fallbacks(self, urls: list[str], dest: Path) -> int:
         last_err: Exception | None = None
@@ -1160,16 +1327,104 @@ class KinderpediaClient:
                 str(tmp),
             ]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
-        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        duration_s = hls_playlist_duration(master_m3u8)
+        if duration_s <= 0 and best_variant_url and best_variant_url != hls_master_url:
+            with contextlib.suppress(Exception):
+                duration_s = hls_playlist_duration(self._fetch_text(best_variant_url))
+        # Stall watchdog + a generous duration-proportional ceiling (instead of a fixed 600 s wall).
+        max_runtime = max(900.0, duration_s * 3 + 300) if duration_s > 0 else None
+        cmd[1:1] = ["-nostats", "-progress", "pipe:1"]
+        try:
+            returncode, stderr_txt = self._run_ffmpeg_watchdog(
+                cmd, stall_timeout=self.ffmpeg_stall_timeout, max_runtime=max_runtime
+            )
+        except Exception:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
+        if returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
             with contextlib.suppress(OSError):
                 if tmp.exists():
                     tmp.unlink()
-            raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {redact_secrets(proc.stderr[:350])}")
+            raise RuntimeError(f"ffmpeg failed ({returncode}): {redact_secrets(stderr_txt[:350])}")
         sz = tmp.stat().st_size
         replace_atomic(tmp, dest)
         self.register_cached_url(video_url, dest)
         return sz
+
+    @staticmethod
+    def _run_ffmpeg_watchdog(
+        cmd: list[str],
+        *,
+        stall_timeout: float,
+        max_runtime: float | None = None,
+        poll_s: float = 0.25,
+    ) -> tuple[int, str]:
+        """
+        Run ffmpeg (invoked with `-progress pipe:1`) and kill it when its progress counters
+        (`total_size`, `out_time_us`, ...) stop changing for `stall_timeout` seconds, or when the
+        optional `max_runtime` ceiling elapses. Returns `(returncode, stderr)`.
+        """
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+        lock = threading.Lock()
+        last_progress = [time.monotonic()]
+        stderr_parts: list[str] = []
+
+        def _pump_progress() -> None:
+            if proc.stdout is None:
+                return
+            last_values: dict[str, str] = {}
+            for line in proc.stdout:
+                key, sep, val = line.strip().partition("=")
+                if not sep:
+                    continue
+                if key in _FFMPEG_PROGRESS_KEYS and last_values.get(key) != val:
+                    last_values[key] = val
+                    with lock:
+                        last_progress[0] = time.monotonic()
+
+        def _pump_stderr() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                if sum(len(x) for x in stderr_parts) < 64_000:
+                    stderr_parts.append(line)
+
+        readers = [threading.Thread(target=fn, daemon=True) for fn in (_pump_progress, _pump_stderr)]
+        for t in readers:
+            t.start()
+        started = time.monotonic()
+        killed_reason = ""
+        while True:
+            try:
+                proc.wait(timeout=poll_s)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            with lock:
+                idle = now - last_progress[0]
+            if idle > stall_timeout:
+                killed_reason = f"stalled (no progress for {idle:.0f}s)"
+            elif max_runtime is not None and now - started > max_runtime:
+                killed_reason = f"exceeded {max_runtime:.0f}s runtime ceiling"
+            if killed_reason:
+                proc.kill()
+                proc.wait()
+                break
+        for t in readers:
+            t.join(timeout=5)
+        stderr_txt = "".join(stderr_parts)
+        if killed_reason:
+            raise RuntimeError(f"ffmpeg {killed_reason}: {redact_secrets(stderr_txt[-350:])}")
+        return proc.returncode, stderr_txt
 
     def _fetch_text(self, url: str) -> str:
         r = self.http.get(

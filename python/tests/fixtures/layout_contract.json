@@ -1,0 +1,916 @@
+{
+  "_comment": "Layout contract shared by python/src/kinderpedia_backup/sync/{naming,folder_map}.py and bookmarklet/kinderpedia-backup.js. Consumed by python/tests/test_layout_contract.py and bookmarklet/tests/layout_contract.test.mjs. Timestamps: number = exact POSIX seconds; 'local' = local-time epoch of the 'local' [Y, M, D, h, m, s] components; null = none.",
+  "sanitize_name": [
+    {
+      "input": "\u201cSummer\u201d: Group <Big>? \ud83c\udf1f...",
+      "expected": "Summer_ Group _Big_"
+    },
+    {
+      "input": "CON",
+      "expected": "_CON"
+    },
+    {
+      "input": "lpt1",
+      "expected": "_lpt1"
+    },
+    {
+      "input": "..",
+      "expected": "unnamed"
+    },
+    {
+      "input": ".",
+      "expected": "unnamed"
+    },
+    {
+      "input": "",
+      "expected": "unnamed"
+    },
+    {
+      "input": "../../../etc/passwd",
+      "expected": "_.._.._etc_passwd"
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "input": "abcdefghi jklm",
+      "max_len": 10,
+      "expected": "abcdefghi"
+    },
+    {
+      "input": "abcdefgh. xyz",
+      "max_len": 10,
+      "expected": "abcdefgh"
+    },
+    {
+      "input": "Line\u0085Break",
+      "expected": "Line Break",
+      "note": "U+0085 (NEL) is canonical whitespace"
+    },
+    {
+      "input": "Tab\there",
+      "expected": "Tabhere"
+    },
+    {
+      "input": "Mixed\u001ccontrol",
+      "expected": "Mixedcontrol"
+    },
+    {
+      "input": "C1\u0080ctrl",
+      "expected": "C1\u0080ctrl",
+      "note": "other C1 controls are kept by both"
+    },
+    {
+      "input": "Pictur\u0103\u00a0cu   acuarele",
+      "expected": "Pictur\u0103 cu acuarele"
+    },
+    {
+      "input": "En\u2013dash \u2014 em",
+      "expected": "En-dash - em"
+    },
+    {
+      "input": "It\u2019s \u2018quoted\u2019",
+      "expected": "It's 'quoted'"
+    },
+    {
+      "input": "Wait\u2026",
+      "expected": "Wait"
+    },
+    {
+      "input": "Zero\u200bWidth\ufeff",
+      "expected": "ZeroWidth"
+    },
+    {
+      "input": "  .hidden. . ",
+      "expected": "hidden"
+    },
+    {
+      "input": "Star \u2b50 day \u2728",
+      "expected": "Star day"
+    },
+    {
+      "input": "Emoji \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 family",
+      "expected": "Emoji family"
+    },
+    {
+      "input": "a__b___c",
+      "expected": "a_b_c"
+    },
+    {
+      "input": "x/y\\z:w*?",
+      "expected": "x_y_z_w_"
+    },
+    {
+      "input": "100% fun | \"day\"",
+      "expected": "100_ fun _ _day_"
+    },
+    {
+      "input": "Theo (2)",
+      "max_len": 30,
+      "expected": "Theo (2)"
+    }
+  ],
+  "parse_date_prefix": [
+    {
+      "input": "2025-06-12T10:00:00+0300",
+      "prefix": "2025-06-12",
+      "timestamp": 1749711600
+    },
+    {
+      "input": "2025-06-12T10:00:00+03:00",
+      "prefix": "2025-06-12",
+      "timestamp": 1749711600
+    },
+    {
+      "input": "2025-06-12T23:30:00-0500",
+      "prefix": "2025-06-12",
+      "timestamp": 1749789000,
+      "note": "prefix is never shifted by the offset"
+    },
+    {
+      "input": "2023-12-14T09:15:00Z",
+      "prefix": "2023-12-14",
+      "timestamp": 1702545300
+    },
+    {
+      "input": "2023-12-14T09:15:00.987Z",
+      "prefix": "2023-12-14",
+      "timestamp": 1702545300,
+      "note": "fractional seconds are ignored"
+    },
+    {
+      "input": "2023-12-14 09:15:00 +0200",
+      "prefix": "2023-12-14",
+      "timestamp": 1702538100
+    },
+    {
+      "input": "2025-11-06 14:30:00",
+      "prefix": "2025-11-06",
+      "timestamp": "local",
+      "local": [
+        2025,
+        11,
+        6,
+        14,
+        30,
+        0
+      ]
+    },
+    {
+      "input": "2025-11-06T14:30",
+      "prefix": "2025-11-06",
+      "timestamp": "local",
+      "local": [
+        2025,
+        11,
+        6,
+        14,
+        30,
+        0
+      ]
+    },
+    {
+      "input": "2025-11-06",
+      "prefix": "2025-11-06",
+      "timestamp": "local",
+      "local": [
+        2025,
+        11,
+        6,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "  2025-11-06  ",
+      "prefix": "2025-11-06",
+      "timestamp": "local",
+      "local": [
+        2025,
+        11,
+        6,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "2025-11-06 trailing text",
+      "prefix": "2025-11-06",
+      "timestamp": "local",
+      "local": [
+        2025,
+        11,
+        6,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "2024-02-29",
+      "prefix": "2024-02-29",
+      "timestamp": "local",
+      "local": [
+        2024,
+        2,
+        29,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "2025-02-29",
+      "prefix": "2025-02-29",
+      "timestamp": null,
+      "note": "invalid calendar date keeps the prefix"
+    },
+    {
+      "input": "2025-13-01",
+      "prefix": "2025-13-01",
+      "timestamp": null
+    },
+    {
+      "input": "2025-06-12T25:00:00",
+      "prefix": "2025-06-12",
+      "timestamp": null
+    },
+    {
+      "input": "Tuesday, 10 June 2025 14:30",
+      "prefix": "2025-06-10",
+      "timestamp": "local",
+      "local": [
+        2025,
+        6,
+        10,
+        14,
+        30,
+        0
+      ]
+    },
+    {
+      "input": "Tuesday, 10 June 2025, 14:30",
+      "prefix": "2025-06-10",
+      "timestamp": "local",
+      "local": [
+        2025,
+        6,
+        10,
+        14,
+        30,
+        0
+      ]
+    },
+    {
+      "input": "Tuesday, 10 Jun 2025",
+      "prefix": "2025-06-10",
+      "timestamp": "local",
+      "local": [
+        2025,
+        6,
+        10,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "Tue, 10 06 2025",
+      "prefix": "2025-06-10",
+      "timestamp": "local",
+      "local": [
+        2025,
+        6,
+        10,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "10 June 2025 , 09:05",
+      "prefix": "2025-06-10",
+      "timestamp": "local",
+      "local": [
+        2025,
+        6,
+        10,
+        9,
+        5,
+        0
+      ]
+    },
+    {
+      "input": "3 sept 2024",
+      "prefix": "2024-09-03",
+      "timestamp": "local",
+      "local": [
+        2024,
+        9,
+        3,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "input": "31 April 2025",
+      "prefix": "unknown_date",
+      "timestamp": null
+    },
+    {
+      "input": "Marti, 10 Iunie 2025",
+      "prefix": "unknown_date",
+      "timestamp": null,
+      "note": "only English month names are supported (locale independent)"
+    },
+    {
+      "input": "2025/06/12",
+      "prefix": "unknown_date",
+      "timestamp": null,
+      "note": "no engine-specific Date.parse fallback"
+    },
+    {
+      "input": "Tue, 10 Jun 2025 14:00:00 GMT",
+      "prefix": "unknown_date",
+      "timestamp": null
+    },
+    {
+      "input": "20250612",
+      "prefix": "unknown_date",
+      "timestamp": null,
+      "note": "no ISO basic format"
+    },
+    {
+      "input": "posted 2025-06-12 by staff",
+      "prefix": "2025-06-12",
+      "timestamp": null
+    },
+    {
+      "input": "",
+      "prefix": "unknown_date",
+      "timestamp": null
+    },
+    {
+      "input": "   ",
+      "prefix": "unknown_date",
+      "timestamp": null
+    },
+    {
+      "input": null,
+      "prefix": "unknown_date",
+      "timestamp": null
+    }
+  ],
+  "normalize_match_text": [
+    {
+      "input": "Pictur\u0103 cu Acuarele!",
+      "expected": "pictura cu acuarele"
+    },
+    {
+      "input": "Pi\u1dc4ctura",
+      "expected": "pictura",
+      "note": "U+1DC4 is Mn outside U+0300-036F; all Mn marks are stripped"
+    },
+    {
+      "input": "a\u20d7b",
+      "expected": "ab"
+    },
+    {
+      "input": "\u0130stanbul",
+      "expected": "istanbul"
+    },
+    {
+      "input": "\u00c6r\u00f8 trip",
+      "expected": "r trip"
+    },
+    {
+      "input": "  --Dance__Party--  ",
+      "expected": "dance party"
+    },
+    {
+      "input": "",
+      "expected": ""
+    }
+  ],
+  "stem_similarity": [
+    {
+      "video": "Pictura - prezentare",
+      "album": "Pictur\u0103 cu acuarele",
+      "expected": 1
+    },
+    {
+      "video": "Summer show",
+      "album": "Summer show",
+      "expected": 4
+    },
+    {
+      "video": "Pi\u1dc4ctura show",
+      "album": "Pictura",
+      "expected": 3
+    },
+    {
+      "video": "in de la",
+      "album": "in de la",
+      "expected": 2
+    },
+    {
+      "video": "abc",
+      "album": "",
+      "expected": 0
+    }
+  ],
+  "resolve_child_folder_names": [
+    {
+      "contexts": [
+        {
+          "child_id": 1,
+          "kindergarten_id": 10,
+          "name": "Alex Smith",
+          "first_name": "Alex",
+          "kindergarten_name": "Nursery"
+        },
+        {
+          "child_id": 2,
+          "kindergarten_id": 10,
+          "name": "Maya Smith",
+          "first_name": "Maya",
+          "kindergarten_name": "Nursery"
+        }
+      ],
+      "expected": {
+        "1_10": "Alex",
+        "2_10": "Maya"
+      }
+    },
+    {
+      "contexts": [
+        {
+          "child_id": 1,
+          "kindergarten_id": 10,
+          "name": "Alex Smith",
+          "first_name": "Alex",
+          "kindergarten_name": "Nursery"
+        },
+        {
+          "child_id": 1,
+          "kindergarten_id": 20,
+          "name": "Alex Smith",
+          "first_name": "Alex",
+          "kindergarten_name": "Primary"
+        }
+      ],
+      "expected": {
+        "1_10": "Alex (Nursery)",
+        "1_20": "Alex (Primary)"
+      }
+    },
+    {
+      "contexts": [
+        {
+          "child_id": 3,
+          "kindergarten_id": 10,
+          "name": "Leo Brown",
+          "first_name": "Leo",
+          "kindergarten_name": ""
+        },
+        {
+          "child_id": 4,
+          "kindergarten_id": 10,
+          "name": "Leo Green",
+          "first_name": "Leo",
+          "kindergarten_name": ""
+        }
+      ],
+      "expected": {
+        "3_10": "Leo Brown",
+        "4_10": "Leo Green"
+      }
+    },
+    {
+      "contexts": [
+        {
+          "child_id": 5,
+          "kindergarten_id": 30,
+          "name": "Nina Stone",
+          "first_name": "",
+          "kindergarten_name": ""
+        },
+        {
+          "child_id": 5,
+          "kindergarten_id": 31,
+          "name": "Nina Stone",
+          "first_name": "",
+          "kindergarten_name": ""
+        },
+        {
+          "child_id": 6,
+          "kindergarten_id": 30,
+          "name": "",
+          "first_name": "",
+          "kindergarten_name": ""
+        }
+      ],
+      "expected": {
+        "5_30": "Nina (KG_30)",
+        "5_31": "Nina (KG_31)",
+        "6_30": "child_6"
+      }
+    },
+    {
+      "contexts": [
+        {
+          "child_id": 7,
+          "kindergarten_id": 40,
+          "name": "Theo",
+          "first_name": "Theo",
+          "kindergarten_name": "Oak"
+        },
+        {
+          "child_id": 7,
+          "kindergarten_id": 41,
+          "name": "Theo",
+          "first_name": "Theo",
+          "kindergarten_name": "Oak"
+        }
+      ],
+      "expected": {
+        "7_40": "Theo (Oak)",
+        "7_41": "Theo (Oak) (2)"
+      }
+    }
+  ],
+  "assign_album_folder_names": [
+    {
+      "name": "same-day duplicate titles numbered chronologically (input in DESC order)",
+      "albums": [
+        {
+          "id": 200,
+          "name": "Outdoor play!",
+          "date": "2025-06-12T15:00:00+0300"
+        },
+        {
+          "id": 100,
+          "name": "Outdoor play!",
+          "date": "2025-06-12T09:00:00+0300"
+        },
+        {
+          "id": 300,
+          "name": "Painting workshop",
+          "date": "2025-06-12T11:00:00+0300"
+        }
+      ],
+      "existing": {},
+      "expected": {
+        "100": "2025/06/2025-06-12 Outdoor play!",
+        "200": "2025/06/2025-06-12 Outdoor play! (2)",
+        "300": "2025/06/2025-06-12 Painting workshop"
+      }
+    },
+    {
+      "name": "equal timestamps tie-break on id; unparseable dates sort last; undated and untitled albums",
+      "albums": [
+        {
+          "id": 12,
+          "name": "Trip",
+          "date": "2025-03-01T10:00:00Z"
+        },
+        {
+          "id": 11,
+          "name": "Trip",
+          "date": "2025-03-01T10:00:00Z"
+        },
+        {
+          "id": 13,
+          "name": "Trip",
+          "date": "posted 2025-03-01"
+        },
+        {
+          "id": 14,
+          "name": "Trip",
+          "date": "2025-03-01T08:00:00+0000"
+        },
+        {
+          "id": 20,
+          "name": "No date"
+        },
+        {
+          "id": 21,
+          "date": "2025-04-02T08:00:00Z"
+        },
+        {
+          "id": 22,
+          "name": "Fallback",
+          "updated_at": "2025-05-03T08:00:00Z"
+        },
+        {
+          "name": "missing id"
+        }
+      ],
+      "existing": {},
+      "expected": {
+        "14": "2025/03/2025-03-01 Trip",
+        "11": "2025/03/2025-03-01 Trip (2)",
+        "12": "2025/03/2025-03-01 Trip (3)",
+        "13": "2025/03/2025-03-01 Trip (4)",
+        "20": "Unknown/00/unknown_date No date",
+        "21": "2025/04/2025-04-02 album_21",
+        "22": "2025/05/2025-05-03 Fallback"
+      }
+    },
+    {
+      "name": "deleted sibling: persisted names stay, new sibling takes the next free suffix",
+      "albums": [
+        {
+          "id": 200,
+          "name": "Outdoor play",
+          "date": "2025-06-12T10:00:00Z"
+        },
+        {
+          "id": 300,
+          "name": "Outdoor play",
+          "date": "2025-06-12T11:00:00Z"
+        },
+        {
+          "id": 400,
+          "name": "Outdoor play",
+          "date": "2025-06-12T07:00:00Z"
+        }
+      ],
+      "existing": {
+        "100": "2025/06/2025-06-12 Outdoor play",
+        "200": "2025/06/2025-06-12 Outdoor play (2)",
+        "300": "2025/06/2025-06-12 Outdoor play (3)"
+      },
+      "expected": {
+        "200": "2025/06/2025-06-12 Outdoor play (2)",
+        "300": "2025/06/2025-06-12 Outdoor play (3)",
+        "400": "2025/06/2025-06-12 Outdoor play (4)"
+      }
+    },
+    {
+      "name": "renamed and re-dated album keeps its persisted folder; freed base is not reused by others",
+      "albums": [
+        {
+          "id": 500,
+          "name": "New title",
+          "date": "2025-07-01T10:00:00Z"
+        },
+        {
+          "id": 501,
+          "name": "Old title",
+          "date": "2025-06-12T12:00:00Z"
+        }
+      ],
+      "existing": {
+        "500": "2025/06/2025-06-12 Old title"
+      },
+      "expected": {
+        "500": "2025/06/2025-06-12 Old title",
+        "501": "2025/06/2025-06-12 Old title (2)"
+      }
+    },
+    {
+      "name": "case-insensitive reservation of persisted leaves",
+      "albums": [
+        {
+          "id": 2,
+          "name": "Party",
+          "date": "2025-01-05T10:00:00Z"
+        },
+        {
+          "id": 3,
+          "name": "PARTY",
+          "date": "2025-01-05T11:00:00Z"
+        }
+      ],
+      "existing": {
+        "1": "2025/01/2025-01-05 party"
+      },
+      "expected": {
+        "2": "2025/01/2025-01-05 Party (2)",
+        "3": "2025/01/2025-01-05 PARTY (3)"
+      }
+    },
+    {
+      "name": "duplicate listing entries keep the first assignment",
+      "albums": [
+        {
+          "id": 7,
+          "name": "Dup",
+          "date": "2025-02-02T10:00:00Z"
+        },
+        {
+          "id": 7,
+          "name": "Dup",
+          "date": "2025-02-02T10:00:00Z"
+        },
+        {
+          "id": 8,
+          "name": "Dup",
+          "date": "2025-02-02T11:00:00Z"
+        }
+      ],
+      "existing": {},
+      "expected": {
+        "7": "2025/02/2025-02-02 Dup",
+        "8": "2025/02/2025-02-02 Dup (2)"
+      }
+    }
+  ],
+  "plan_video_targets": [
+    {
+      "name": "single-album day, multi-album day stem match, standalone day, duplicate titles, undated",
+      "albums": [
+        {
+          "id": 10,
+          "name": "Summer show",
+          "date": "2025-06-12T10:00:00+0300",
+          "owner": {
+            "user_id": 5
+          }
+        },
+        {
+          "id": 20,
+          "name": "Math activity",
+          "date": "2025-06-13T09:30:00+0300",
+          "owner": {
+            "user_id": 5
+          }
+        },
+        {
+          "id": 21,
+          "name": "Pictur\u0103 cu acuarele",
+          "date": "2025-06-13T11:30:00+0300",
+          "owner": {
+            "user_id": 5
+          }
+        },
+        {
+          "id": 30,
+          "name": "Pictura",
+          "date": "2025-06-20T09:00:00+0300",
+          "owner": {
+            "user_id": 6
+          }
+        },
+        {
+          "id": 31,
+          "name": "Dance",
+          "date": "2025-06-20T12:00:00+0300",
+          "owner": {
+            "user_id": 6
+          }
+        }
+      ],
+      "existing_albums": {},
+      "videos": [
+        {
+          "id": 902,
+          "name": "Song",
+          "date": "2025-06-12T10:20:00+0300"
+        },
+        {
+          "id": 901,
+          "name": "Song",
+          "date": "2025-06-12T10:05:00+0300"
+        },
+        {
+          "id": 903,
+          "name": "Pictura - prezentare",
+          "date": "2025-06-13T11:35:00+0300",
+          "owner": {
+            "user_id": 5
+          }
+        },
+        {
+          "id": 904,
+          "name": "Dance in the yard",
+          "date": "2025-07-04T10:00:00+0300"
+        },
+        {
+          "id": 905,
+          "name": "Pi\u1dc4ctura show",
+          "date": "2025-06-20T12:05:00+0300",
+          "owner": {
+            "user_id": 6
+          }
+        },
+        {
+          "id": 906,
+          "description": "no title",
+          "date": "2025-06-13T09:40:00+0300",
+          "owner": {
+            "user_id": 5
+          }
+        },
+        {
+          "id": 907,
+          "name": "Clip"
+        }
+      ],
+      "existing_videos": {},
+      "expected": {
+        "901": [
+          "2025/06/2025-06-12 Summer show",
+          "Song.mp4"
+        ],
+        "902": [
+          "2025/06/2025-06-12 Summer show",
+          "Song (2).mp4"
+        ],
+        "903": [
+          "2025/06/2025-06-13 Pictur\u0103 cu acuarele",
+          "Pictura - prezentare.mp4"
+        ],
+        "904": [
+          "2025/07/2025-07-04 Dance in the yard",
+          "Dance in the yard.mp4"
+        ],
+        "905": [
+          "2025/06/2025-06-20 Pictura",
+          "Pi\u1dc4ctura show.mp4"
+        ],
+        "906": [
+          "2025/06/2025-06-13 Math activity",
+          "video.mp4"
+        ],
+        "907": [
+          "Unknown/00/unknown_date Clip",
+          "Clip.mp4"
+        ]
+      }
+    },
+    {
+      "name": "persisted videos stay put (standalone folder) and keep their file names reserved",
+      "albums": [
+        {
+          "id": 40,
+          "name": "Garden day",
+          "date": "2025-08-01T09:00:00Z"
+        }
+      ],
+      "existing_albums": {
+        "40": "2025/08/2025-08-01 Garden day"
+      },
+      "videos": [
+        {
+          "id": 950,
+          "name": "Watering",
+          "date": "2025-08-01T08:00:00Z"
+        },
+        {
+          "id": 951,
+          "name": "Watering",
+          "date": "2025-08-01T07:00:00Z"
+        },
+        {
+          "id": 952,
+          "name": "Song",
+          "date": "2025-08-01T07:30:00Z"
+        }
+      ],
+      "existing_videos": {
+        "950": [
+          "2025/08/2025-08-01 Watering",
+          "Watering.mp4"
+        ],
+        "960": [
+          "2025/08/2025-08-01 Garden day",
+          "Song.mp4"
+        ]
+      },
+      "expected": {
+        "950": [
+          "2025/08/2025-08-01 Watering",
+          "Watering.mp4"
+        ],
+        "951": [
+          "2025/08/2025-08-01 Garden day",
+          "Watering.mp4"
+        ],
+        "952": [
+          "2025/08/2025-08-01 Garden day",
+          "Song (2).mp4"
+        ]
+      }
+    }
+  ],
+  "album_folder_from_leaf": [
+    {
+      "input": "2025-06-12 Title (2)",
+      "expected": "2025/06/2025-06-12 Title (2)"
+    },
+    {
+      "input": "unknown_date Clip",
+      "expected": "Unknown/00/unknown_date Clip"
+    },
+    {
+      "input": "Loose folder",
+      "expected": "Unknown/00/Loose folder"
+    }
+  ]
+}
