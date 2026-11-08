@@ -11,7 +11,7 @@ from .models import DetectedFace
 
 
 class MissingFacesBackendError(RuntimeError):
-    """Raised when facial-recognition ML extras are not yet installed or configured."""
+    """Raised when facial-recognition ML extras are not installed or configured."""
 
 
 @runtime_checkable
@@ -38,17 +38,15 @@ def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def load_default_recognizer(backend: str = "auto") -> FaceRecognizer:
+def load_default_recognizer(backend: str = "auto", *, det_size: int = 640) -> FaceRecognizer:
     """
-    Resolve an installed local face-recognition backend.
-
-    Designed as the extension seam for upcoming InsightFace (ONNX) / dlib / Vision adapters
-    so core `sync` users never have to install heavy ML wheels.
+    Resolve an installed local SCRFD-10GF + ArcFace R50 ONNX recognizer (`onnxruntime` or `cv2.dnn`).
     """
-    raise MissingFacesBackendError(
-        f"Facial recognition backend ({backend!r}) is not yet installed/enabled. "
-        "The `faces` pipeline architecture (reference enrollment, incremental cache, "
-        "cosine matching, and zero-copy hardlink organization) is ready — plug a "
-        "`FaceRecognizer` adapter into `kinderpedia_backup.faces.recognizer` and install "
-        "optional ML extras via `pip install \"./python[faces]\"`."
-    )
+    try:
+        from .onnx_backend import ScrfdArcFaceRecognizer
+    except ImportError as exc:
+        raise MissingFacesBackendError(
+            f"Facial recognition dependencies missing ({exc}). "
+            'Install optional ML extras via: pip install "./python[faces]"'
+        ) from exc
+    return ScrfdArcFaceRecognizer(backend=backend, det_size=det_size)

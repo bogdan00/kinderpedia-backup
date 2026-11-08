@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="kp-csrf" content="__KP_CSRF_TOKEN__" />
+  <title>Kinderpedia Classroom Faces Studio</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="top-progress-bar" id="topProgressBar" hidden aria-hidden="true"></div>
+  <div class="studio-shell">
+    <!-- Left Rail: All Classroom Children -->
+    <aside class="rail" aria-label="Classroom Roster">
+      <div class="rail-header">
+        <div class="brand-kicker">LOCAL ARCHIVE INDEX</div>
+        <h1 class="brand-title">Classroom Faces</h1>
+        <div class="coverage-meter" id="coverageMeter">
+          <div class="coverage-label">
+            <span>Face Coverage <span class="rematch-sync-pill" id="rematchStatusPill" hidden title="Background archive matching in progress">↻ syncing</span></span>
+            <strong id="coverageText">0%</strong>
+          </div>
+          <div class="coverage-track">
+            <div class="coverage-fill" id="coverageFill" style="width: 0%"></div>
+          </div>
+          <div class="coverage-sub" id="coverageSub">Loading index…</div>
+        </div>
+      </div>
+
+      <div class="rail-actions">
+        <button type="button" class="btn btn-secondary btn-full" id="btnDiscoverClusters">
+          Discover Unnamed Kids <span class="pill-count" id="unassignedBadge">0</span>
+        </button>
+        <button type="button" class="btn btn-tonal btn-full" id="btnOpenClasses" title="Define classes (feed + date range) and which kids belong to each">
+          🏫 Classes <span class="pill-count" id="classesBadge">0</span>
+        </button>
+        <div class="new-person-inline">
+          <input type="text" id="newPersonInput" placeholder="Add child name…" autocomplete="off" />
+          <button type="button" class="btn btn-tonal" id="btnAddPerson">+ Add</button>
+        </div>
+      </div>
+
+      <div class="roster-scroll" id="rosterList" role="listbox" aria-label="Children in archive">
+        <!-- Populated by app.js -->
+      </div>
+
+      <div class="rail-footer">
+        <button type="button" class="btn btn-primary btn-full" id="btnMaterializeAll">
+          Sync All ByChild/ Folders
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Workspace -->
+    <main class="workspace">
+      <div class="backend-alert-banner" id="backendAlertBanner" role="alert" hidden>
+        <div class="backend-alert-copy">
+          <strong>⚠ Backend connection issue</strong>
+          <span id="backendAlertMsg">Cannot reach server on 127.0.0.1:8765 (it may be restarting). Your current selections are preserved.</span>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="btnRetryBackend">↻ Retry Now</button>
+      </div>
+      <header class="topbar">
+        <div class="mode-tabs" role="tablist">
+          <button type="button" class="tab-btn active" data-mode="batch" id="tabBatch">
+            Batch Trainer
+          </button>
+          <button type="button" class="tab-btn" data-mode="childclusters" id="tabChildClusters">
+            Child Clusters
+          </button>
+          <button type="button" class="tab-btn" data-mode="clusters" id="tabClusters">
+            Unnamed Kids &amp; Years
+          </button>
+          <button type="button" class="tab-btn" data-mode="gallery" id="tabGallery">
+            Confirmed Gallery &amp; Export
+          </button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnRecluster" title="Re-cluster &amp; re-match newly scanned photos">
+            ↻ Refresh Scan
+          </button>
+        </div>
+
+        <div class="bg-status-chip" id="bgStatusChip" data-state="idle" role="status" aria-live="polite" title="Background work on the backend">
+          <span class="bg-status-dot" aria-hidden="true"></span>
+          <span class="bg-status-text" id="bgStatusText">Connecting…</span>
+        </div>
+
+        <div class="person-toolbar" id="personToolbar" hidden>
+          <span class="active-person-chip" id="activePersonChip"></span>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnRenamePersonTop" title="Rename child or change role (family / classmate / educator / ignore)">
+            ✎ Rename / Role
+          </button>
+          <button type="button" class="btn btn-tonal btn-sm" id="btnSyncPersonFolder">
+            Sync Folder
+          </button>
+          <div class="export-group">
+            <button type="button" class="btn btn-tonal btn-sm" data-export="txt" title="Download plain list of Kinderpedia CDN URLs">
+              URLs (.txt)
+            </button>
+            <button type="button" class="btn btn-tonal btn-sm" data-export="csv" title="Download CSV with dates, albums, and URLs">
+              .csv
+            </button>
+            <button type="button" class="btn btn-tonal btn-sm" data-export="json" title="Download full provenance JSON">
+              .json
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- VIEW 1: Active-Learning Batch Trainer -->
+      <section class="view-panel" id="viewBatch">
+        <div class="batch-banner" id="batchBanner">
+          <div class="batch-copy">
+            <h2 id="batchHeading">Select a child or name a classroom cluster to begin</h2>
+            <p id="batchSubheading">
+              Each batch proposes our top matches for that child. Click any wrong guess to disprove (<kbd>✗</kbd>) or reassign it, then press <kbd>Enter</kbd> to approve the rest — wrong guesses shrink after every batch.
+            </p>
+          </div>
+          <div class="batch-controls" id="batchControls" hidden>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnToggleSelectAll">
+              Flip Selection
+            </button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnMarkAllUnsure" title="Mark all cards in this batch as I'm not sure (?)">
+              All Unsure (?)
+            </button>
+            <select id="batchModeSelect" class="input-select" aria-label="Batch order" title="Most impactful: photos whose answer settles the most other open photos of this child">
+              <option value="impact" selected>⚡ Most impactful</option>
+              <option value="confident">Most confident</option>
+            </select>
+            <select id="batchSizeSelect" class="input-select" aria-label="Batch size">
+              <option value="16">16 / batch</option>
+              <option value="24" selected>24 / batch</option>
+              <option value="36">36 / batch</option>
+              <option value="48">48 / batch</option>
+            </select>
+            <button type="button" class="btn btn-approve btn-lg" id="btnSubmitBatch">
+              Approve Batch
+            </button>
+          </div>
+        </div>
+
+        <div class="cards-grid" id="batchGrid"></div>
+      </section>
+
+      <!-- VIEW 1b: Per-Child Look-Alike Clusters (Exclude / Boost / Penalize) -->
+      <section class="view-panel" id="viewChildClusters" hidden>
+        <div class="filter-bar">
+          <div class="filter-title">
+            <h2 id="childClustersHeading">Child Clusters</h2>
+            <p id="childClustersSubheading">
+              Everything attributed to the selected child, grouped by look-alike faces per year.
+              <strong>⊘ Exclude</strong> removes faces (hard negatives) ·
+              <strong>▲ Boost</strong> nudges these faces &amp; look-alikes up (not confirmed) ·
+              <strong>▼ Penalize</strong> nudges them down (not rejected). Shift/⌘-click thumbs in an expanded card to act on a subset.
+            </p>
+          </div>
+          <div class="filter-controls">
+            <select id="childClustersThreshold" class="input-select" aria-label="Grouping tightness">
+              <option value="0.58">Tight grouping (0.58)</option>
+              <option value="0.50" selected>Normal grouping (0.50)</option>
+              <option value="0.42">Loose grouping (0.42)</option>
+            </select>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="childClustersHideConfirmed" checked />
+              Hide fully confirmed clusters
+            </label>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnReloadChildClusters" title="Reload clusters">↻ Reload</button>
+          </div>
+        </div>
+
+        <div class="child-clusters-list" id="childClustersList"></div>
+      </section>
+
+      <!-- VIEW 2: Unnamed Classroom Kids & Multi-Year Clusters -->
+      <section class="view-panel" id="viewClusters" hidden>
+        <div class="filter-bar">
+          <div class="filter-title">
+            <h2>Recurring Faces by Classroom &amp; Year</h2>
+            <p>Click any face photo to inspect the full classroom picture in context, or say <strong>“This IS …”</strong> to enroll a child and batch-confirm the rest.</p>
+          </div>
+          <div class="filter-controls">
+            <select id="clusterChildFilter" class="input-select" aria-label="Classroom archive">
+              <option value="">All Classrooms</option>
+            </select>
+            <select id="clusterYearFilter" class="input-select" aria-label="Year">
+              <option value="">All Years</option>
+            </select>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="clusterShowAssigned" />
+              Show already named
+            </label>
+          </div>
+        </div>
+
+        <div class="clusters-grid" id="clustersGrid"></div>
+      </section>
+
+      <!-- VIEW 3: Person Confirmed Gallery, Rename/Merge & Export -->
+      <section class="view-panel" id="viewGallery" hidden>
+        <div class="filter-bar">
+          <div class="filter-title">
+            <h2 id="galleryHeading">Person Gallery</h2>
+            <p id="gallerySubheading">Confirmed &amp; high-confidence matches stored in the provenance index.</p>
+          </div>
+          <div class="filter-controls">
+            <select id="galleryStatusFilter" class="input-select" aria-label="Status filter">
+              <option value="included" selected>Included (Confirmed + High)</option>
+              <option value="confirmed">Human Confirmed Only</option>
+              <option value="unsure">Unsure / Skipped (?)</option>
+              <option value="all">Include Unreviewed Candidates</option>
+            </select>
+            <select id="galleryYearFilter" class="input-select" aria-label="Year filter">
+              <option value="">All Years</option>
+            </select>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnRenamePerson">Rename / Role</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnMergePerson">Merge Into…</button>
+          </div>
+        </div>
+
+        <div class="cards-grid" id="galleryGrid"></div>
+        <div class="pagination-bar" id="galleryPagination"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Full Classroom Photo Lightbox & Multi-Child Face Box Tagger -->
+  <div class="modal-backdrop" id="photoModal" hidden>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modalAlbumTitle">
+      <div class="modal-header">
+        <div>
+          <div class="modal-kicker" id="modalMetaLine"></div>
+          <h3 id="modalAlbumTitle">Classroom Photo</h3>
+        </div>
+        <div class="modal-header-actions">
+          <div class="modal-cluster-nav" id="modalClusterNav" hidden>
+            <button type="button" class="btn btn-secondary btn-sm" id="btnClusterPrev" title="Previous photo (←)">← Prev</button>
+            <span class="modal-cluster-pos" id="modalClusterPos">1 / 1</span>
+            <button type="button" class="btn btn-secondary btn-sm" id="btnClusterNext" title="Next photo (→)">Next →</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnToggleSeenPhotos" hidden title="Photos you already reviewed in another cluster are skipped">Show seen</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnResetSeenPhotos" hidden title="Forget which photos you already reviewed">↺ Forget seen</button>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" id="btnDrawManualTag" title="Draw a box on the photo to tag an occluded or undetected child (Shortcut: T)">
+            + Tag Child <kbd>T</kbd>
+          </button>
+          <a id="modalCdnLink" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-tonal btn-sm">
+            Open Kinderpedia CDN URL ↗
+          </a>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnCloseModal">Close (Esc)</button>
+        </div>
+      </div>
+
+      <div class="modal-body">
+        <div class="photo-stage-wrap">
+          <div class="photo-stage" id="photoStage">
+            <img id="modalPhotoImg" alt="Classroom full photo" draggable="false" />
+            <div class="face-boxes-layer" id="faceBoxesLayer"></div>
+            <div class="photo-draw-banner" id="photoDrawBanner" hidden>
+              Drag a box around the child to tag · <kbd>Esc</kbd> to cancel
+            </div>
+            <div class="photo-stage-status" id="photoStageStatus" hidden></div>
+          </div>
+        </div>
+        <div class="modal-side">
+          <div class="modal-cluster-box" id="modalClusterBox" hidden>
+            <div class="modal-cluster-box-head">
+              <strong id="modalClusterTitle">Cluster Context</strong>
+              <button type="button" class="btn btn-ghost btn-xs" id="btnClusterExcludeFace" title="Remove this photo's face from the cluster so confirming the cluster leaves it uncategorized">
+                Exclude photo
+              </button>
+            </div>
+            <div class="modal-cluster-thumbs" id="modalClusterThumbs"></div>
+            <div class="modal-batch-quick-row" id="modalBatchQuickRow" hidden></div>
+            <form class="modal-cluster-assign" id="modalClusterAssignForm">
+              <input type="text" id="modalClusterNameInput" list="knownPeopleDatalist" placeholder="This cluster IS… (child name)" required />
+              <button type="submit" class="btn btn-approve btn-sm">Confirm Cluster</button>
+            </form>
+          </div>
+          <h4>Faces in Photo</h4>
+          <p class="modal-hint">Name any face below, click <strong>+ Tag Child (T)</strong> to box an occluded child, or click <strong>✗ Remove Tag</strong> to leave uncategorized.</p>
+          <div class="modal-faces-list" id="modalFacesList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick Child Picker Dialog for "Actually another child…" (↪) -->
+  <div class="modal-backdrop" id="reassignModal" hidden>
+    <div class="reassign-dialog" role="dialog" aria-modal="true" aria-labelledby="reassignTitle">
+      <div class="reassign-header">
+        <img id="reassignThumb" class="reassign-thumb" alt="" />
+        <div>
+          <h3 id="reassignTitle">Actually another child…</h3>
+          <p class="reassign-sub" id="reassignSub">Pick an existing label below or type a new child name:</p>
+        </div>
+      </div>
+      <div class="reassign-chips" id="reassignChips"></div>
+      <form class="reassign-form" id="reassignForm">
+        <input type="text" id="reassignInput" list="knownPeopleDatalist" placeholder="Or type new child / educator name…" autocomplete="off" />
+        <button type="submit" class="btn btn-primary btn-sm" id="btnSubmitReassign">Assign ↪</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnCancelReassign">Cancel</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Rename / Role / Merge Child Dialog -->
+  <div class="modal-backdrop" id="renamePersonModal" hidden>
+    <div class="reassign-dialog" role="dialog" aria-modal="true" aria-labelledby="renamePersonTitle">
+      <div>
+        <h3 id="renamePersonTitle" style="margin:0 0 4px;font-size:16px;">Edit Child Name / Role</h3>
+        <p class="reassign-sub" id="renamePersonSub">Fix a typo (or type an existing child's name to merge duplicates).</p>
+      </div>
+      <form class="rename-person-form" id="renamePersonForm">
+        <label class="form-field">
+          <span>Display Name</span>
+          <input type="text" id="renamePersonInput" list="knownPeopleDatalist" autocomplete="off" required />
+        </label>
+        <label class="form-field">
+          <span>Group / Role</span>
+          <select id="renamePersonRoleSelect" class="input-select">
+            <option value="classmate">Classroom Colleague</option>
+            <option value="family">Family Child</option>
+            <option value="educator">Educator</option>
+            <option value="ignore">Ignored / Muted</option>
+          </select>
+        </label>
+        <div class="form-field">
+          <label for="renamePersonBirthInput">Birthday (no tags before this date)</label>
+          <div class="birth-input-row">
+            <input type="date" id="renamePersonBirthInput" />
+            <button type="button" class="btn btn-ghost btn-xs" id="btnClearRenameBirth" title="Clear birthday">✕ Clear</button>
+          </div>
+        </div>
+        <div class="rename-person-actions">
+          <button type="button" class="btn btn-danger btn-sm" id="btnDeleteRenamePerson" title="Delete this person and remove all their tags">🗑 Delete</button>
+          <span class="rename-person-actions-spacer"></span>
+          <button type="submit" class="btn btn-primary btn-sm" id="btnSaveRenamePerson">Save Name ✓</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnCancelRenamePerson">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Classes & Membership Dialog -->
+  <div class="modal-backdrop" id="classesModal" hidden>
+    <div class="classes-dialog" role="dialog" aria-modal="true" aria-labelledby="classesTitle">
+      <div class="classes-header">
+        <div>
+          <h3 id="classesTitle">🏫 Classes</h3>
+          <p class="reassign-sub">Kids assigned to at least one class are only matched on photos from their classes. Kids with no class are unrestricted.</p>
+        </div>
+        <div class="classes-header-actions">
+          <button type="button" class="btn btn-tonal btn-sm" id="btnAutoCreateClasses" title="Create one class per feed and school year (Sep 1 – Aug 31) that has photos">✨ Auto-create by feed &amp; school year</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btnCloseClasses">Close (Esc)</button>
+        </div>
+      </div>
+
+      <div class="classes-body">
+        <section class="classes-section">
+          <h4>Class definitions</h4>
+          <div class="classes-table-wrap">
+            <table class="classes-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Feed</th>
+                  <th>Start</th>
+                  <th>End</th>
+                  <th>Members</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="classesListBody"></tbody>
+              <tfoot>
+                <tr class="classes-add-row">
+                  <td><input type="text" id="newClassName" placeholder="e.g. Butterflies 2024–25" autocomplete="off" /></td>
+                  <td><select id="newClassFeed" class="input-select"></select></td>
+                  <td><input type="date" id="newClassStart" /></td>
+                  <td><input type="date" id="newClassEnd" /></td>
+                  <td></td>
+                  <td><button type="button" class="btn btn-approve btn-xs" id="btnAddClass">+ Add class</button></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </section>
+
+        <section class="classes-section">
+          <div class="classes-matrix-head">
+            <h4>Membership</h4>
+            <span class="reassign-sub">Small grey numbers = photos in that class where the kid is already confirmed / auto-matched.</span>
+            <span class="classes-matrix-spacer"></span>
+            <span class="classes-dirty-note" id="classesDirtyNote" hidden></span>
+            <button type="button" class="btn btn-primary btn-sm" id="btnSaveMemberships" disabled>Save memberships</button>
+          </div>
+          <div class="classes-matrix-wrap" id="classesMatrixWrap">
+            <div class="empty-state">Loading…</div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Feedback -->
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

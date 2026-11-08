@@ -1,230 +1,169 @@
-# Local Facial Recognition & Per-Child Photo Organization — Design Doc
+# Local Facial Recognition, All-Classroom Index & Active-Learning Web UI — Design Doc
 
-**Status:** Proposed (Architecture scaffolded in `python/src/kinderpedia_backup/faces/`)  
-**Scope:** Offline ML inference, longitudinal child age-anchor matching, embedding cache, and zero-copy filesystem organization for Kinderpedia archives.
-
----
-
-## 1. Problem Statement & Real-World Archive Characteristics
-
-Kindergarten classroom albums typically contain **20–300+ group photos per activity** across 3–5 school years (10,000–60,000+ photos per family). Parents want a curated view containing **only the photos (and optionally videos) in which each of their children appears**, without duplicating gigabytes of media on disk or uploading children's biometrics to third-party cloud APIs.
-
-### Domain-Specific Challenges in Kindergarten Media
-1. **Rapid Longitudinal Age Progression (Ages 1.5 → 6):** Craniofacial geometry changes substantially between nursery and pre-school. A single reference photo taken at age 6 degrades recall on photos taken at age 2.
-2. **Dense Wide-Angle Classroom Shots:** Group activities feature 15–25 small faces (`28×28 px` to `80×80 px`), steep downward head pitch (painting, crafts, sensory play), partial occlusions, and indoor motion blur.
-3. **Classroom Background Distractors:** Kindergarten walls are covered with illustrated faces, dolls, posters, and children's book covers that trigger naive face detectors.
-4. **Sibling Disambiguation:** Siblings at the same kindergarten often look remarkably similar at the same age (e.g., Child A at age 3 vs. Child B at age 3) and may also appear together in school-wide festival albums.
-5. **Zero-Recompute Iteration:** Scanning 50,000+ high-resolution JPEGs takes ~25–45 minutes on a laptop; tweaking similarity thresholds or adding a better reference portrait must re-run in **under 1 second** rather than re-running ML inference.
+**Status:** Implemented (`python/src/kinderpedia_backup/faces/`)  
+**Scope:** Offline SCRFD + ArcFace ONNX inference (`onnxruntime` or OpenCV `cv2.dnn`), per-year classroom clustering, `<20ms` non-blocking active-learning Web UI with Server-Sent Events (SSE), unified lightbox navigation, manual occluded-child bounding-box tagging, year-windowed sibling guard, hard-negative lookalike suppression, same-album outfit cohesion, social peer co-occurrence, flat hardlink materialization, and provenance-rich Kinderpedia URL export. *(Photos only in v1.)*
 
 ---
 
-## 2. Goals & Non-Goals
+## 1. Core Workflow: "This IS `<Child>`" → Batch Approve / Disprove / Tag
 
-### Goals
-- **100% Local Privacy:** All face detection and embedding generation run strictly offline on the user's machine. Model weights are downloaded once from pinned, SHA-256-verified release URLs into `~/.cache/kinderpedia-backup/models/`.
-- **Zero-C++-Build Portability (Python 3.10–3.15+):** Run SCRFD + ArcFace ONNX models directly via `onnxruntime`, `numpy`, and `Pillow` — avoiding Cython/`opencv` C++ compilation issues on newer Python releases.
-- **Zero Extra Disk Usage:** Materialize matched media into `ByChild/<Child>/<Year>/<Month>/<YYYY-MM-DD Title>/` via POSIX/NTFS **hardlinks** (with automatic fallback to `copy` on cross-volume or FAT/exFAT drives, or optional relative `symlink`s).
-- **Decoupled Two-Stage Cache:** Cache raw per-photo face bounding boxes + 512-D embeddings (`float16`) in `Metadata/faces_embeddings.sqlite` so threshold tuning and reference-photo updates complete in `<1s` across 50,000+ photos.
-- **Cross-Tool Compatibility:** Operate identically on archives produced by either the Browser Bookmarklet or `kinderpedia-backup sync`.
+Rather than reviewing thousands of group photos one at a time, `kinderpedia-backup faces ui` centers on an **active-learning batch confirmation loop** designed to categorize **every child in the classroom** with sub-`5ms` click latency and steadily decreasing false guesses:
 
-### Non-Goals
-- Cloud-hosted face APIs (AWS Rekognition, Google Cloud Vision, Azure Face).
-- Automatic unsupervised clustering without user-supplied reference portraits (`References/<Child>/`) in v1 (may be added later as `--bootstrap-clusters` to help seed reference portraits).
-- Modifying or deleting original files inside `<Child>/Albums/`.
+1. **Seed Any Child in 1 Click:**
+   - Family children auto-seed from `<Child>/avatar.png` (plus optional `References/<Person>/`).
+   - Recurring classmates surface automatically in the **Unnamed Kids & Years** discovery grid (clustered per classroom & year, ranked by photo count, with outlier-photo exclusion before cluster confirmation), or by clicking/drawing a face bounding box inside any classroom photo.
+   - Any person can be renamed in place, assigned a role (`family`, `classmate`, `educator`, `ignore`), or merged into another profile via `PATCH /api/people/<id>`.
+2. **Batch Proposal ("Approve All Except 1–2 Mistakes"):**
+   - The local Python backend serves a diversified batch of **24 proposed matches** (`max_per_album = 2`) for the selected child, pre-selected as **Approved `✓`** when confidence is strong.
+   - Every card supports four quick decisions:
+     - **`✓` Approved** (`confirmed`): adds the photo to the child's gallery and contributes pose/year-diverse positive anchors.
+     - **`✗` Disproved** (`rejected`): records a **hard negative** for that child so lookalike classmates are suppressed across the archive.
+     - **`?` Not Sure** (`unsure`): safely skips ambiguous/blurry crops from the review queue without teaching positive or negative anchors.
+     - **`↪` Reassign ("Actually another child…")**: immediately re-tags the face box to another existing or new child (`replace_person_id`), records a **face-scoped hard negative** (`source = 'reassigned'`) so the displaced child can still match a *different* face in the same group photo, and refreshes `cover_face_id` if displaced.
+3. **Unified Full-Photo Lightbox & Manual Occluded-Child Tagging (`+ Tag Child` / `T`):**
+   - Opening any photo from **Batch Trainer**, **Unnamed Clusters**, or **Confirmed Gallery** reuses a single unified navigation context (`state.modalNavContext`) with `←` / `→` keyboard stepping, a scrollable thumbnail strip showing live `✓` / `✗` / `?` / `↪` badges, and inline quick-decision pills.
+   - Any auto-detected face tag can be cleared via **`✗ Remove Tag`** (`POST /api/faces/untag`), leaving the face uncategorized with `suppress_auto = 1` so background sweeps never slap a runner-up guess back onto it.
+   - When a child is turned away, wearing a costume hood, or missed by SCRFD, clicking **`+ Tag Child`** (or pressing `T`) lets the user drag a bounding box directly on the photo and pick a name chip. Manual boxes store a zero vector with `is_manual = 1, is_anchor = 0`, reusing all `/media/face/<id>.jpg` crop and `ByChild/` export logic while remaining 100% invisible to ArcFace biometric matching and clustering.
 
 ---
 
-## 3. System Architecture
+## 2. System Architecture & Real-Time Non-Blocking Pipeline
 
 ```mermaid
 flowchart TD
-    subgraph Inputs["Backup Root (~/kinderpedia_bk)"]
-        A["<Child>/Albums/<Year>/<Month>/<YYYY-MM-DD Title>/*.jpg"]
-        R["References/<Child>/*.jpg (Multi-Year Age Anchors)"]
+    subgraph Archive["Backup Root"]
+        IMG["Child/Albums/Year/Month/YYYY-MM-DD Title/001_id.jpg"]
+        META["Metadata/Child/Albums/YYYY-MM-DD Title.json"]
+        AV["Child/avatar.png + optional References/Person/*.jpg"]
     end
 
-    subgraph Stage1["Stage 1: Incremental Detection & Embedding"]
-        D["Photo Discovery (storage.py)"]
-        DB[("Metadata/faces_embeddings.sqlite\n(photo_relpath, size, mtime_ns,\nboxes, kps, float16[512] embeddings)")]
-        SCRFD["SCRFD-10GF ONNX Detector\n(640x640 / 1024x1024 + Quality Gate)"]
-        ALIGN["5-Point Umeyama Similarity Alignment\n(112x112 RGB Crop)"]
-        ARC["ArcFace ResNet-50 ONNX\n(512-D L2-Normalized Embedding)"]
+    subgraph Stage1["Stage 1: Batch Scan (kinderpedia-backup faces scan)"]
+        ONNX["SCRFD-10GF + 5-Pt Umeyama + ArcFace R50 ONNX\n(onnxruntime or OpenCV cv2.dnn backend, Python 3.10-3.15+)"]
+        THUMBS["Sharded Face Crop Cache (Metadata/face_thumbs/00..ff/*.jpg)"]
+        CLUST["Per-(Classroom, Year) Cosine Graph Clustering"]
     end
 
-    subgraph Stage2["Stage 2: Fast In-Memory Matching (<1s for 50k photos)"]
-        PROF["Reference Gallery Builder\n(Per-Child Anchor Matrix + Year Tags)"]
-        MATCH["Bipartite Face-to-Child Matcher\n(Max-Anchor Cosine + 1-Face-Per-Child Guard)"]
+    subgraph Store["Persistent Provenance & Categorization Index"]
+        DB[("Metadata/faces_index.sqlite (WAL)\nphotos | faces (float16[512], suppress_auto, is_manual)\npeople | clusters | assignments | person_assignment_counts")]
+        RAM["In-Memory Face Matrix Cache\nfloat32[N, 512] (is_manual = 0) + Album/Photo Lookup Maps"]
+        JSON["Metadata/categorization_index.json\n(Throttled background portable provenance snapshot)"]
     end
 
-    subgraph Outputs["Materialized Views (Zero-Copy Hardlinks)"]
-        OUT1["ByChild/<Child>/<Year>/<Month>/<YYYY-MM-DD Title>/001_<id>.jpg"]
-        OUT2["ByChild/_Review/<Child>/... (Optional Borderline Queue)"]
+    subgraph WebApp["Stage 2: Local Web App (kinderpedia-backup faces ui)"]
+        API["ThreadingHTTPServer (127.0.0.1:8765)\n<5ms Mutation Endpoints + Lazy PIL Crop Server"]
+        BG["Debounced Background Worker (1.6s)\nBatched BLAS SGEMM Matcher + Diff SQLite Upsert"]
+        SSE["SSE Event Stream (GET /api/events)\nrematch_scheduled / rematch_complete / overview_updated"]
+        UI["Interactive Browser Studio (Vanilla HTML/CSS/JS)\nBatch Trainer + Clusters + Gallery + Unified Lightbox + Draw Box (T)"]
     end
 
-    A --> D
-    D -->|Cache Miss| SCRFD --> ALIGN --> ARC --> DB
-    D -->|Cache Hit| DB
-    R --> SCRFD
-    DB --> MATCH
-    PROF --> MATCH
-    R -.-> PROF
-    MATCH -->|"score >= threshold (0.45)"| OUT1
-    MATCH -->|"review_min <= score < threshold"| OUT2
+    subgraph Exports["Outputs & Sharing"]
+        FLAT["ByChild/Person/YYYY-MM-DD Title_001_id.jpg\n(Flat zero-space hardlinks for Photos / Cloud Drive)"]
+        URLS["Person_urls.txt / .csv / .json\n(Provenance-rich Kinderpedia CDN URL manifests)"]
+    end
+
+    IMG --> ONNX
+    META --> DB
+    AV --> ONNX
+    ONNX --> DB
+    ONNX --> THUMBS
+    DB --> CLUST --> DB
+    DB <--> API
+    DB <--> RAM
+    RAM --> BG --> DB
+    BG --> JSON
+    BG --> SSE --> UI
+    THUMBS --> API
+    API <-->|"<5ms JSON POST/PATCH/GET"| UI
+    API --> FLAT
+    API --> URLS
 ```
 
----
+### `<20ms` Click Responsiveness & Background Sync Design
 
-## 4. ML Model & Pure-ONNX Inference Pipeline
-
-### 4.1 Why Direct `onnxruntime` Instead of `dlib` / `face_recognition` / `insightface` Wrapper
-| Candidate | Small/Angled Kid Faces | Python 3.13–3.15 Install | Apple Silicon Acceleration | Verdict |
-| :--- | :--- | :--- | :--- | :--- |
-| `face_recognition` (`dlib` ResNet-34) | Weak on profile/downward pitch & `<50px` faces | Requires `cmake` + C++ toolchain | CPU only | Reject |
-| `insightface` Python package | Excellent (`buffalo_l`) | Compiles Cython C++ extensions (`mesh_core_cython`) — breaks on new Python versions | Via `onnxruntime` | Use models, skip wrapper |
-| **Direct `onnxruntime` + `buffalo_l` ONNX** (`det_10g.onnx` + `w600k_r50.onnx`) | **State-of-the-art** (SCRFD-10GF + WebFace600K ArcFace R50) | **Pure wheel install** (`onnxruntime`, `numpy`, `Pillow`) | **`CoreMLExecutionProvider`** + CPU/CUDA | **Selected** |
-
-### 4.2 Inference Steps Per Photo
-1. **EXIF Orientation Normalization:** Apply `PIL.ImageOps.exif_transpose(img)` before resizing (critical for portrait smartphone uploads from educators).
-2. **SCRFD-10GF Face + 5-Keypoint Detection (`det_10g.onnx`):**
-   - Letterbox resize longest edge to `det_size = 640` (configurable `--det-size 1024` for wide outdoor group shots).
-   - Decode stride `{8, 16, 32}` anchor-free bounding boxes, confidence scores, and 5 facial landmarks (left eye, right eye, nose tip, left mouth corner, right mouth corner), followed by NMS (`iou_threshold = 0.40`).
-   - **Classroom Quality Gate:** Discard detections with `det_score < 0.55` or `min(width, height) < 28 px` in original image coordinates (eliminates wall posters, tiny blurred background silhouettes, and cartoon drawings).
-3. **5-Point Similarity Alignment (Pure `numpy`):**
-   - Compute the closed-form 2D similarity transform (`Umeyama` SVD, 25 lines of `numpy`) mapping the 5 detected landmarks onto standard ArcFace `112×112` canonical coordinates, and warp via `PIL.Image.transform(..., Image.Transform.AFFINE, resample=Image.Resampling.BILINEAR)`.
-4. **ArcFace Embedding (`w600k_r50.onnx`):**
-   - Normalize `112×112` RGB crop to `(pixel - 127.5) / 127.5`, run `w600k_r50.onnx` (batched across all faces in the photo), and L2-normalize each 512-D vector ($\|\mathbf{e}\|_2 = 1$).
-
-### 4.3 Hardware Execution Providers (`--backend`)
-- `auto` (default): Probes `onnxruntime.get_available_providers()` in priority order:
-  1. `CUDAExecutionProvider` (Linux/Windows NVIDIA GPU)
-  2. `CoreMLExecutionProvider` (macOS Apple Silicon Neural Engine / GPU — note: pin fixed input tensor shapes `1×3×640×640` and `1×3×112×112` so CoreML compiles the graph once without dynamic-shape fallback!)
-  3. `CPUExecutionProvider` (ARM64 NEON / x86 AVX2)
+1. **Immediate HTTP Mutations (`~2ms`):**
+   - `POST /api/faces/tag`, `POST /api/faces/untag`, `POST /api/faces/manual`, `POST /api/batch/submit`, `POST /api/clusters/<id>/assign`, and `PATCH /api/people/<id>` commit only the point SQLite change, read the 24-row trigger-maintained `person_assignment_counts` summary table, call `schedule_rematch()`, and return immediately.
+2. **In-Memory Embedding Matrix & Batched BLAS `SGEMM`:**
+   - `FacesIndexDB.load_all_faces_matrix()` caches the unpacked read-only `float32[N, 512]` auto-detected face matrix (`WHERE is_manual = 0`) plus pre-indexed `rows_by_album`, `fc_by_photo`, and `rows_by_photo` maps in RAM (`~0.3ms` warm vs `~870ms` SQLite BLOB unpack), reading live `suppress_auto` flags on each sweep.
+   - `recompute_active_matching()` stacks positive and hard-negative anchor matrices across all active people into `<=512`-column single-pass BLAS `SGEMM` batches (`embs @ stacked_pos.T`) and writes only changed model rows via an in-memory diff against `assignments`.
+3. **Debounced Worker + Server-Sent Events (`GET /api/events`):**
+   - Rapid clicks within `1.6s` coalesce into a single background rematch sweep; portable `Metadata/categorization_index.json` writes are throttled separately (`20s` debounce + flush on shutdown/materialize).
+   - When a background sweep completes, the server broadcasts `event: rematch_complete` over `GET /api/events` (`EventSource`), allowing `app.js` to refresh sidebar counters, open photo modals (preserving any in-progress input focus), and candidate queues without page reloads or cursor jumps.
 
 ---
 
-## 5. Reference Enrollment & Longitudinal Age-Anchor Matching
+## 3. Child-Matching Intelligence Layers
 
-### 5.1 Reference Directory Convention (`References/`)
-Parents place **3–8 clear portraits per child** spanning the school years present in their archive:
+1. **Dual-Runtime SCRFD-10GF + ArcFace ResNet-50 ONNX (`Python 3.10–3.15+`):**
+   - Runs `det_10g.onnx` + 5-point Umeyama similarity alignment + `w600k_r50.onnx` via `onnxruntime` (`CUDA` / `CoreML` / `CPU`) with automatic fallback to OpenCV's C++ SIMD engine (`cv2.dnn.readNetFromONNX` from `opencv-python-headless`).
+   - Quality gate (`det_score >= 0.55` and `min(width, height) >= 28 px`) filters out classroom wall posters, cartoons, and dolls.
+2. **Multi-Epoch Diverse Pose Anchors:**
+   - Selects up to `max_anchors_per_year = 14` pose-diverse confirmed exemplars per `(person, year)` (`cos_sim < 0.88` diversity preference) rather than averaging toddler and preschool faces into a single blurry centroid.
+3. **Year-Windowed Sibling Guard (`[Y-1, Y+1]`):**
+   - Siblings at the same biological age (e.g., Older Sibling at age 2 in `2022` vs. Younger Sibling at age 2 in `2026`) look very similar to ArcFace. Scoring a photo from year $Y$ prioritizes anchors within $[Y-1, Y+1]$, applying a cross-era penalty (`0.06`) to distant-year anchors whenever nearby-year anchors exist.
+4. **Hard-Negative Lookalike Suppression (Photo-Level & Face-Scoped):**
+   - Disproved or removed faces (`status = 'rejected'`) form a per-person negative bank (the most recent `512`). Unreviewed faces strongly matching it (`neg >= 0.58` and closer to the negative than to the child's anchors) are penalized so a lookalike classmate only needs to be rejected once or twice.
+   - **Soft negative tier:** faces with `neg >= 0.45` that are about as close to a removed/rejected face as to the child's own anchors (`neg >= pos - 0.02`) get a graded push-down of up to `-0.10`, so removing a tag also nudges the wider ring of similar-looking faces.
+   - Reassigned or untagged boxes record `source = 'reassigned'`, locking out only `(face_id, person_id)` rather than `(photo_id, person_id)` so the displaced child can immediately match their actual face box elsewhere in the same group photo.
+5. **Same-Album Outfit / Burst Cohesion & Album-Diversified Batches:**
+   - Confirming even a single photo of child $P$ inside album $A$ scores all other faces in $A$ directly against that local outfit/lighting anchor (never diluted by global per-year anchor caps) and auto-absorbs clear burst matches (`source = 'album_cohesion'`) into $P$'s gallery without cluttering the manual review queue.
+5b. **Temporal Cohesion (±3 days):**
+   - Confirmed faces from the same few days (same haircut, outfit, season, lighting) act as extra local anchors that are never diluted by per-year anchor caps. A face's score is lifted to its best near-day match (discounted `0.02 + 0.02 × |Δdays|`) plus up to `+0.04` when that match is `>= 0.50` (raised from 0.40: at 0.40 same-day photos of *other* children were pulled into a child's queue after every batch, making the queue grow after submitting mostly rejections). Applied before hard negatives so rejections still win.
+   - Holdout check on the real archive (15% of confirmed tags hidden, then re-matched): correct auto-tags 95.9% → 97.6%, wrong auto-tags 123 → 63.
+6. **Social Peer Co-Occurrence & Small-Photo Cross-Circle Suppression:**
+   - Learns a weighted social graph from confirmed appearances across intimate classroom photos (`2–8` faces). When classmate $Q$ (who regularly co-occurs with $R$) appears in a small group photo, $R$ receives up to `+0.030` peer boost while siblings/children from disjoint classroom circles receive up to `-0.045` suppression — tapering smoothly to `0` on larger events (`>= 9` faces) where classes and siblings mingle.
+7. **Global Photo-Level Bipartite Exclusivity & `ignore` Role Isolation:**
+   - Enforces at most 1 face box per active person and 1 active person per face box in every photo. Profiles with `role = 'ignore'` (e.g., `_Ignored_Background`) never pollute cluster name suggestions, peer graphs, or coverage percentages.
+8. **Zero-Vector Manual Box Biometric Isolation (`is_manual = 1`):**
+   - User-drawn boxes for occluded/costumed children store `is_manual = 1, suppress_auto = 1` with a zero `float16[512]` vector and `is_anchor = 0`. Both `load_all_faces_matrix()` (`WHERE is_manual = 0`) and `load_anchors_and_negatives()` (`LEFT JOIN faces ... AND is_manual = 0`) exclude them from biometric scoring while keeping their `(photo_id, person_id)` confirmation active for exports, thumbnails, and social peer co-occurrence.
 
-```text
-<Backup Root>/References/
-├── Alex/
-│   ├── 2022_nursery.jpg       # Optional year prefix acts as an age anchor
-│   ├── 2024_preschool.jpg
-│   └── 2026_portrait.jpg
-└── Maya/
-    ├── 2025_autumn.jpg
-    └── 2026_spring.jpg
+8b. **Learned Label Vote (k-nearest labelled faces) — Trust & Veto:**
+   - Every human-confirmed face of every profile (including `ignore` background profiles) is a voter. For each still-open face, the 15 most similar labelled faces vote (weight `(sim - 0.20)^2`).
+   - **Veto:** if ≥ 80% of the vote (and a neighbour with `sim >= 0.45`) says *someone else*, or the closest labelled neighbour is a background face (`sim >= 0.55`), the face is removed from the other children's queues.
+   - **Trust:** if ≥ 90% of the vote agrees with the matcher's `auto_high` pick (and the face is not closer to one of that child's rejected faces), the match is stored as `source = 'model_trusted'` and skips manual review (counted with album-cohesion autos). Candidates with ≥ 95% agreement are promoted.
+   - Neighbour lists are cached across rematches and updated incrementally (new labels merged with one small SGEMM), so the warm rematch costs ~3 s; the cold build (~25 s) runs once in the background at `faces ui` start.
+   - Holdout on the real archive (20% of labels hidden): wrong auto-tags on hidden confirmed faces 138 → 33, background faces auto-tagged to a child 276 → 111, review queue 40.4k → 27.5k while trusted matches rose 9.1k → 15.8k (≈ 0.3% wrong among trusted).
+8c. **Weak-Match Gate & Same-Album Absence:**
+   - Borderline matches (below `auto_high + 0.05`) for a child with ≥ 25 labelled faces are dropped when that child gets < 30% of the labelled-neighbour vote while another identity tops it, so faces of non-eligible or unenrolled kids stop piling into the "least bad" child's queue.
+   - In albums where a child is already confirmed, borderline faces whose best similarity to her confirmed faces *from that same album* is < 0.40 are dropped (genuine same-day matches score ~0.7–0.9; measured: 7% of individually confirmed matches fall below 0.40 vs. ~85% of the leftover queue).
+   - Holdout: review queue 20.3k → 16.8k for a loss of ~0.3% of correct matches.
+9. **Hard Eligibility: Birthdays & Class Memberships:**
+   - Each photo gets a *latest possible capture date* (`photo_date_ord`): the earlier of `album_date` / `image_dateadd`, falling back to the last day of the `<Year>/<Month>` folder. It is cached per face as `date_ords` in the RAM matrix.
+   - `people.birth_date`: a person is never matched, suggested, batch-approved, cluster-confirmed or manually tagged on a photo dated before it. Setting a birthday immediately deletes that person's existing non-rejected tags on earlier photos.
+   - `school_classes` (`archive_child` feed + optional `[start_date, end_date]`) and `class_members`: a person with ≥ 1 membership is only auto-matched, suggested and cluster-confirmed on photos inside one of their classes, so children of unrelated classrooms (e.g. siblings' feeds) are never auto-tagged together. People without memberships stay unrestricted. Explicit single manual tags remain allowed. `POST /api/classes/auto` seeds one class per feed × school year (Sep 1 – Aug 31).
+   - Applied as a final `-1.0` mask on the score matrix just before bipartite exclusivity.
+10. **Per-Child Visual Clusters & Soft Pressure:**
+    - `get_person_face_clusters()` groups everything attributed to a child (confirmed + auto + candidate + pressured faces) per year with density-leader grouping (`threshold` 0.42 / 0.50 / 0.58) followed by centroid merging (`threshold + 0.12`); undersized groups fall into a per-year loose bucket (~0.2 s for an 11k-face child).
+    - Actions: **Exclude** (face-scoped `rejected` / `reassigned` hard negatives), **Boost** (`person_face_pressure.weight = +1`: up to `+0.06` on faces with `sim ≥ 0.40` to the boosted set, without confirming), **Penalize** (`weight = -1`: up to `-0.12` on faces with `sim ≥ 0.42`, without rejecting), **Clear**.
+
+---
+
+## 4. Persistent Provenance & Categorization Schema (`Metadata/faces_index.sqlite`)
+
+- **`photos`**: `photo_id`, `rel_path`, `archive_child`, `year`, `month`, `album_leaf`, `kinderpedia_album_id`, `album_title`, `album_date`, `classroom_groups`, `kinderpedia_image_id`, `seq_in_album`, `image_dateadd`, `best_live_url`, `download_url`, `fullsize_url`, `thumb_url`, `width`, `height`, `file_size`, `mtime_ns`, `detector_id`, `face_count`, `scanned_at`.
+  - *Smart URL selection (`best_live_url`):* Compares local JPEG `(width, height)` against any `/<W>x<H>/` prefix in `fullsize_url` so pre-2024 albums where `download_url` returns `404` automatically export the working `fullsize_url`, while 2024+ albums export full-resolution `download_url`.
+- **`faces`**: `face_id`, `photo_id`, `face_idx`, `det_score`, `bbox_top`, `bbox_right`, `bbox_bottom`, `bbox_left`, `embedding_f16` (`1,024 B` IEEE-754 `float16[512]`), `cluster_id`, `suppress_auto` (`0`/`1`), `is_manual` (`0`/`1`).
+- **`people`**: `person_id`, `display_name` (`COLLATE NOCASE`), `role` (`family` | `classmate` | `educator` | `ignore`), `archive_hint`, `cover_face_id`, `birth_date` (`YYYY-MM-DD` or `''`), `created_at`.
+- **`school_classes`**: `class_id`, `name` (unique, `COLLATE NOCASE`), `archive_child` (feed or `''` = any), `start_date`, `end_date`, `created_at`. **`class_members`**: `(class_id, person_id)` PK.
+- **`person_face_pressure`**: `(person_id, face_id)` PK, `weight` (`+1` boost / `-1` penalize), `updated_at`.
+- **`reference_seeds`**: `seed_id`, `person_id`, `source_key`, `anchor_year`, `embedding_f16`, `created_at`.
+- **`clusters`**: `cluster_id`, `archive_child`, `year`, `person_id`, `medoid_face_id`, `sample_face_ids_json`, `face_count`, `photo_count`, `suggested_person_id`, `suggested_similarity`.
+- **`assignments`**: `(photo_id, person_id)` PK, `face_id`, `status` (`confirmed` | `auto_high` | `candidate` | `unsure` | `rejected`), `source` (`avatar_seed` | `reference_file` | `cluster_confirm` | `batch_approve` | `manual_tag` | `model_match` | `album_cohesion` | `reassigned`), `similarity`, `is_anchor`, `updated_at`.
+- **`person_assignment_counts`**: Trigger-maintained per-person summary table (`confirmed_count`, `auto_high_count`, `album_cohesion_count`, `candidate_count`, `unsure_count`, `rejected_count`, `categorized_face_count`) kept atomically in sync via `AFTER INSERT / UPDATE / DELETE` SQLite triggers on `assignments`.
+
+---
+
+## 5. CLI Subcommands
+
+```bash
+# 1. Incremental ONNX face scan + Metadata provenance/URL join + per-year clustering
+kinderpedia-backup faces scan --input ~/KinderpediaBackup
+
+# 2. Launch local HTTP backend + interactive active-learning Web UI on http://127.0.0.1:8765
+kinderpedia-backup faces ui --input ~/KinderpediaBackup --port 8765
+
+# 3. Materialize flat zero-space hardlinks: ByChild/<Person>/<YYYY-MM-DD Title>_001_<id>.jpg
+kinderpedia-backup faces materialize --input ~/KinderpediaBackup [--person "Alex"] [--include-candidates]
+
+# 4. Export provenance-rich Kinderpedia CDN URL listing for any single child or classmate
+kinderpedia-backup faces export-urls --input ~/KinderpediaBackup --person "Leo" --format txt -o leo_urls.txt
 ```
-
-**Enrollment Validation Rules:**
-- If a reference image contains **0 faces** → log an actionable warning (`[WARN] No clear face detected in References/Alex/foo.jpg; skipping`) rather than crashing.
-- If a reference image contains **multiple faces** → pick the largest prominent face (`area * confidence`) ONLY if its bounding-box area is $\ge 2.5\times$ the second-largest face; otherwise warn the user to crop the reference image so a classmate isn't accidentally enrolled!
-- Compute pairwise intra-child anchor similarities and warn if an outlier reference portrait has `< 0.25` similarity to all other portraits of the same child (catches accidentally dropping a photo of the wrong sibling into `References/<Child>/`).
-
-### 5.2 Multi-Anchor Scoring & Bipartite Sibling Assignment
-Given a photo containing $M$ detected faces $\{\mathbf{f}_1, \dots, \mathbf{f}_M\}$ and $K$ enrolled children $\{C_1, \dots, C_K\}$, where child $C_k$ has reference anchor embeddings $\{\mathbf{r}_{k,1}, \dots, \mathbf{r}_{k,n_k}\}$:
-
-1. **Per-(Face, Child) Score:**
-   $$S(m, k) = \max_{j \in \{1..n_k\}} \left( \mathbf{f}_m \cdot \mathbf{r}_{k,j} \right)$$
-   *(Using `max` over age anchors rather than a single centroid vector is essential for ages 2–6: a 2022 photo matches the 2022 anchor at `0.62` even if its similarity to the 2026 anchor is `0.38`, whereas averaging 2022+2026 into one centroid dilutes both ends.)*
-2. **One-Box-Per-Child Exclusivity (Greedy Bipartite Matching):**
-   - Sort all candidate pairs $(m, k)$ with $S(m, k) \ge \tau_{\text{min}}$ in descending order of $S(m, k)$.
-   - Once face box $m$ is assigned to child $k$, face box $m$ cannot ALSO be assigned to sibling $k'$, and child $k$ is already matched for this photo.
-   - If two siblings **both** appear in the same group photo, face $m_1$ assigns to Child 1 and face $m_2$ assigns to Child 2 — both children receive the photo!
-3. **Threshold Calibration Defaults:**
-   - `--threshold 0.45` (High-precision default for ArcFace R50 on children: `<1%` false-positive rate in group classrooms).
-   - `--review-threshold 0.36` (Optional `--include-review`: routes `[0.36, 0.45)` matches into `ByChild/_Review/<Child>/` for quick visual inspection).
-
----
-
-## 6. Two-Stage SQLite Embedding Cache (`Metadata/faces_embeddings.sqlite`)
-
-Replacing the prototype JSON match cache (`Metadata/face_scan_cache.json`) with a single-file SQLite WAL database (`Metadata/faces_embeddings.sqlite`, using Python's built-in `sqlite3`) gives atomic crash-safe writes during multi-worker scanning and decouples expensive inference from cheap vector math:
-
-```sql
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS photos (
-    rel_path TEXT PRIMARY KEY,          -- e.g. "Alex/Albums/2026/11/2026-11-06 Outdoor Play/001_50753201.jpg"
-    file_size INTEGER NOT NULL,
-    mtime_ns INTEGER NOT NULL,
-    detector_id TEXT NOT NULL,          -- e.g. "scrfd_10g_640_arcface_r50_v1"
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    face_count INTEGER NOT NULL,
-    scanned_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS faces (
-    photo_rel_path TEXT NOT NULL REFERENCES photos(rel_path) ON DELETE CASCADE,
-    face_idx INTEGER NOT NULL,
-    det_score REAL NOT NULL,
-    bbox_json TEXT NOT NULL,            -- [top, right, bottom, left]
-    embedding_f16 BLOB NOT NULL,        -- 512 * 2 = 1024 bytes raw IEEE-754 float16
-    PRIMARY KEY (photo_rel_path, face_idx)
-);
-```
-
-### Storage & Speed Profile (for a 55,000-Photo Archive)
-- Assuming an average of ~4 quality-gated faces per photo: `55,000 × 4 × 1,024 B` $\approx$ **225 MB** total SQLite database in `Metadata/faces_embeddings.sqlite`.
-- Loading all 220,000 `float16` embeddings into a contiguous `numpy` matrix `(220000, 512)` and multiplying against 10 reference anchors `(512, 10)` takes **~180 ms** on Apple Silicon!
-- Re-running `kinderpedia-backup faces --threshold 0.42` or adding new reference portraits reconciles all hardlinks in **under 1 second**.
-
----
-
-## 7. Output Layout & Incremental Reconciliation
-
-### 7.1 Output Hierarchy (`--layout nested` default)
-Mirrors the exact `<Year>/<Month>/<YYYY>-<MM>-<DD> <Title>` structure adopted by `sync` and the Bookmarklet:
-
-```text
-<Backup Root>/
-├── Alex/Albums/...                    # Full classroom archive (untouched source of truth)
-├── Maya/Albums/...
-├── References/
-│   ├── Alex/
-│   └── Maya/
-├── ByChild/                           # Curated per-child hardlinked views (0 extra GiB)
-│   ├── Alex/
-│   │   └── 2026/
-│   │       └── 11/
-│   │           └── 2026-11-06 Outdoor Play/
-│   │               └── 004_50753204.jpg
-│   └── Maya/
-│       └── 2026/
-│           └── 08/
-│               └── 2026-08-10 Summer Sensory Play/
-│                   └── 002_47270370.jpg
-└── Metadata/
-    └── faces_embeddings.sqlite
-```
-
-*(An optional `--layout flat` flag preserves the single-folder `ByChild/<Child>/<YYYY-MM-DD Title>_004_50753204.jpg` layout for digital photo frames that do not recurse subdirectories.)*
-
-### 7.2 Clean Pruning (`--prune`)
-When a user raises `--threshold` (e.g., `0.42` → `0.48`), previously created hardlinks in `ByChild/` that no longer meet the threshold can be cleanly unlinked (removing only files inside `ByChild/`, never touching `<Child>/Albums/`) and empty `<Month>`/`<Year>` directories pruned.
-
----
-
-## 8. Module Map & Implementation Plan
-
-All changes slot cleanly into the existing `python/src/kinderpedia_backup/faces/` subpackage without breaking existing CLI flags:
-
-| File | Responsibility |
-| :--- | :--- |
-| `faces/weights.py` *(new)* | Downloads `det_10g.onnx` (~16 MB) & `w600k_r50.onnx` (~166 MB) once to `~/.cache/kinderpedia-backup/models/` with **pinned SHA-256 checksum verification** and atomic `.part` rename. |
-| `faces/alignment.py` *(new)* | Pure-`numpy` + `Pillow` SCRFD anchor decoding, NMS, and 5-point Umeyama similarity alignment (`112×112`). |
-| `faces/onnx_backend.py` *(new)* | Concrete `OnnxScrfdArcFaceRecognizer` implementing `FaceRecognizer` (`recognizer.py`), wired into `load_default_recognizer("auto")`. |
-| `faces/cache_db.py` *(new)* | SQLite WAL `EmbeddingStore` (`Metadata/faces_embeddings.sqlite`) storing `float16` vectors + stale-entry invalidation on `(size, mtime_ns)`. |
-| `faces/pipeline.py` *(update)* | Multi-anchor max scoring, bipartite 1-box-per-child assignment, reference outlier warnings, `--layout {nested,flat}`, `--review-threshold`, and `--prune`. |
-| `pyproject.toml` *(update)* | Define `[project.optional-dependencies] faces = ["numpy>=1.24", "onnxruntime>=1.17", "Pillow>=10.0"]`. |
-
-### Phased Rollout
-1. **Milestone 1 (Core Photo Pipeline):** `weights.py` + `alignment.py` + `onnx_backend.py` + `cache_db.py` + nested `ByChild/<Child>/<Year>/<Month>/...` output + offline unit tests with synthetic/tiny fixture tensors.
-2. **Milestone 2 (UX & Calibration):** `kinderpedia-backup faces --check-refs` diagnostic command (prints enrolled reference quality & cross-sibling similarity matrix before scanning) + `--review-threshold` borderline folder + live terminal progress bar (`LiveProgress`) with photos/sec & ETA.
-3. **Milestone 3 (Video Keyframe Matching, Optional):** `--include-videos` flag extracting 1 keyframe every 2s via `ffmpeg` into memory pipes, matching faces against the same anchor profiles, and hardlinking matching `.mp4` videos into `ByChild/<Child>/<Year>/<Month>/<Album>/`.

@@ -51,7 +51,7 @@ kinderpedia-backup sync --output ~/kinderpedia_bk
 kinderpedia-backup sync --refresh-index
 ```
 
-👉 Full CLI, security, and facial-recognition docs: **[`python/README.md`](./python/README.md)**
+👉 Full CLI, security, and facial-recognition docs: **[`python/README.md`](./python/README.md)** · **[`docs/facial-recognition-design.md`](./docs/facial-recognition-design.md)** · **[`docs/faces-handover.md`](./docs/faces-handover.md)**
 
 ---
 
@@ -109,8 +109,12 @@ kinderpedia-backup/
 │   │   ├── cli.py               # Unified CLI (`sync` and `faces` subcommands)
 │   │   ├── security.py          # Secret redaction, 0700/0600 private state dir, path guards
 │   │   ├── sync/                # Cloud API client, AIMD rate limiter, resumable downloader
-│   │   └── faces/               # Extensible local facial-recognition & hardlink organizer
+│   │   └── faces/               # Offline facial-recognition studio & hardlink organizer
 │   └── tests/                   # Unit test suite (`pytest` / `unittest`)
+│
+├── docs/                        # 📐 Architecture & Engineering Handover Docs
+│   ├── facial-recognition-design.md
+│   └── faces-handover.md
 │
 ├── wrangler.toml                # Cloudflare Worker deployment config (`bookmarklet/worker.js`)
 └── .github/workflows/

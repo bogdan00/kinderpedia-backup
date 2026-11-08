@@ -63,3 +63,15 @@ _site/
 Thumbs.db
 .idea/
 .vscode/
+
+# Face-recognition decision databases & derived indexes (personal data — keep OUT of git;
+# back them up to private storage instead, e.g. a private cloud-drive folder)
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+categorization_index*.json
+face_thumbs/

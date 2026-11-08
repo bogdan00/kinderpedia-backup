@@ -70,6 +70,18 @@ class LiveProgress:
             self.clear_unlocked()
             self._last_line = ""
 
+    def render_line(self, line: str, *, force: bool = False) -> None:
+        """Render an arbitrary single-line status message onto the TTY bar."""
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_render) < 0.35:
+            return
+        self._last_render = now
+        with CONSOLE_LOCK:
+            self._last_line = line
+            self.redraw_unlocked()
+
     def update(self, tracker: SnapshotProvider, force: bool = False) -> None:
         if not self.enabled:
             return

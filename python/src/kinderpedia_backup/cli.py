@@ -19,9 +19,9 @@ from .console import (
     set_active_progress,
 )
 from .faces import (
-    FaceOrganizationPipeline,
     MissingFacesBackendError,
     discover_backup_photos,
+    discover_child_avatars,
     discover_reference_photos,
     load_default_recognizer,
 )
@@ -118,8 +118,22 @@ def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_faces_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("scan", "ui", "materialize", "export-urls"),
+        default="scan",
+        help=(
+            "Action to run: `scan` (incremental ONNX face scan + per-year clustering), "
+            "`ui` (launch local active-learning Web UI on 127.0.0.1), "
+            "`materialize` (sync flat ByChild/<Person>/ hardlinks), or "
+            "`export-urls` (export Kinderpedia CDN URLs for a single child). Default: scan."
+        ),
+    )
+    parser.add_argument(
         "-i",
         "--input",
+        "--backup-dir",
+        dest="input",
         default=None,
         help="Backup directory containing downloaded albums (default: ~/kinderpedia_bk or $KINDERPEDIA_OUTPUT)",
     )
@@ -127,35 +141,92 @@ def _add_faces_arguments(parser: argparse.ArgumentParser) -> None:
         "-r",
         "--refs",
         default=None,
-        help="Directory of reference portraits organized as <refs>/<Child Name>/*.jpg (default: <input>/References)",
+        help="Optional directory of manual reference portraits <refs>/<Person>/*.jpg (default: <input>/References)",
     )
     parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="Destination folder for per-child matched photos (default: <input>/ByChild)",
+        help="Output folder for `materialize` (default: <input>/ByChild) or output file path for `export-urls`",
+    )
+    parser.add_argument(
+        "--person",
+        default=None,
+        help="Filter `materialize` or target `export-urls` for a single named child/classmate",
+    )
+    parser.add_argument(
+        "--format",
+        dest="export_format",
+        choices=("txt", "csv", "json"),
+        default="txt",
+        help="Output format for `faces export-urls` (default: txt — one URL per line)",
+    )
+    parser.add_argument(
+        "--include-candidates",
+        action="store_true",
+        help="Also include unreviewed inclusive candidate matches (`0.33 <= sim < 0.45`) in materialize / export-urls",
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=0.45,
-        help="Cosine similarity threshold in (0.0, 1.0] for positive face matches (default: 0.45)",
+        help="High-confidence cosine similarity threshold in (0.0, 1.0] (default: 0.45)",
+    )
+    parser.add_argument(
+        "--candidate-threshold",
+        type=float,
+        default=0.33,
+        help="Inclusive candidate similarity threshold for active-learning review (default: 0.33)",
+    )
+    parser.add_argument(
+        "--det-size",
+        type=int,
+        choices=(640, 1024),
+        default=640,
+        help="SCRFD detector input resolution (default: 640; use 1024 for ultra-wide outdoor group shots)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Concurrent photo inference threads during `faces scan` (default: up to 6 CPU cores)",
     )
     parser.add_argument(
         "--mode",
         choices=("hardlink", "symlink", "copy"),
         default="hardlink",
-        help="How matched photos are materialized into --output (default: hardlink — zero extra disk space)",
+        help="How matched photos are materialized into ByChild/<Person>/ (default: hardlink — zero extra disk space)",
     )
     parser.add_argument(
         "--backend",
         default="auto",
-        help="Local face recognizer backend identifier (default: auto)",
+        help="Local ONNX execution backend: auto, onnxruntime, or opencv (default: auto)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address for `faces ui` (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Local HTTP port for `faces ui` (default: 8765)",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not automatically open a browser tab when launching `faces ui`",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable interactive terminal progress bar during `faces scan`",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Inspect discovered album photos and reference portraits without running ML inference",
+        help="Inspect discovered album photos, avatars, and reference portraits without running ML inference",
     )
 
 
@@ -386,48 +457,136 @@ def run_faces(args: argparse.Namespace) -> int:
     raw_in = args.input or os.environ.get("KINDERPEDIA_OUTPUT") or dotenv.get("KINDERPEDIA_OUTPUT")
     backup_dir = Path(raw_in).expanduser().resolve() if raw_in else (Path.home() / "kinderpedia_bk").resolve()
     refs_dir = Path(args.refs).expanduser().resolve() if args.refs else (backup_dir / "References").resolve()
-    output_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
 
     if not backup_dir.exists():
         log(f"ERROR: Backup directory does not exist: {backup_dir}")
         return 2
 
-    photos = discover_backup_photos(backup_dir, exclude_dir=output_dir)
-    refs = discover_reference_photos(refs_dir)
-    log(f"[Faces] Backup directory: {backup_dir} ({len(photos):,} album photo(s) discovered)")
-    log(f"[Faces] Reference directory: {refs_dir} ({len(refs)} child profile(s) found)")
-    for person, ref_files in refs.items():
-        log(f"  - {person}: {len(ref_files)} reference portrait(s)")
+    action = str(getattr(args, "action", "scan") or "scan")
 
     if args.dry_run:
+        out_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
+        photos = discover_backup_photos(backup_dir, exclude_dir=out_dir)
+        avatars = discover_child_avatars(backup_dir)
+        refs = discover_reference_photos(refs_dir)
+        log(f"[Faces] Backup directory: {backup_dir} ({len(photos):,} album photo(s) discovered)")
+        log(f"[Faces] Auto-seed avatars: {len(avatars)} ({', '.join(avatars) or 'none'})")
+        log(f"[Faces] Reference directory: {refs_dir} ({len(refs)} manual profile(s))")
+        for person, ref_files in refs.items():
+            log(f"  - {person}: {len(ref_files)} reference portrait(s)")
         return 0
 
-    if not refs:
-        log(
-            f"ERROR: No reference portraits found in {refs_dir}. "
-            f"Create one subfolder per child (e.g. `{refs_dir}/<Child Name>/1.jpg`) with 3-5 clear portraits."
-        )
-        return 2
+    db_path = ensure_within_directory(backup_dir, backup_dir / "Metadata" / "faces_index.sqlite")
 
     try:
-        recognizer = load_default_recognizer(args.backend)
+        from .faces import FacesIndexDB, run_archive_face_scan, serve_faces_ui
     except MissingFacesBackendError as exc:
         log(f"[Faces] {exc}")
         return 2
 
-    cache_file = ensure_within_directory(backup_dir, backup_dir / "Metadata" / "face_scan_cache.json")
-    pipeline = FaceOrganizationPipeline(
-        recognizer,
-        threshold=args.threshold,
-        link_mode=args.mode,
-        cache_file=cache_file,
-    )
-    stats = pipeline.run(backup_dir=backup_dir, refs_dir=refs_dir, output_dir=output_dir)
+    if action == "ui":
+        out_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
+        try:
+            serve_faces_ui(
+                backup_dir=backup_dir,
+                output_dir=out_dir,
+                host=args.host,
+                port=args.port,
+                open_browser=not args.no_open,
+                auto_high_threshold=args.threshold,
+                candidate_threshold=args.candidate_threshold,
+                link_mode=args.mode,
+            )
+        except FileNotFoundError as exc:
+            log(f"ERROR: {exc}")
+            return 2
+        return 0
+
+    if action == "materialize":
+        if not db_path.is_file():
+            log(f"ERROR: No face index at {db_path}. Run `kinderpedia-backup faces scan` first.")
+            return 2
+        out_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
+        with FacesIndexDB(db_path) as db:
+            stats = db.materialize_flat_folders(
+                backup_dir=backup_dir,
+                output_dir=out_dir,
+                link_mode=args.mode,
+                person_filter=args.person,
+                include_candidates=args.include_candidates,
+                prune=True,
+            )
+        log(
+            f"[Faces] Materialized {stats.reference_profiles} person folder(s) in {out_dir}: "
+            f"photos={stats.photos_matched:,}, created={stats.links_created:,}, "
+            f"existing={stats.links_skipped_existing:,}, pruned={stats.links_pruned:,}"
+        )
+        return 0
+
+    if action == "export-urls":
+        if not args.person:
+            log("ERROR: `faces export-urls` requires `--person <Child Name>`.")
+            return 2
+        if not db_path.is_file():
+            log(f"ERROR: No face index at {db_path}. Run `kinderpedia-backup faces scan` first.")
+            return 2
+        with FacesIndexDB(db_path) as db:
+            try:
+                disp_name, content, count = db.format_person_urls(
+                    args.person,
+                    fmt=args.export_format,
+                    include_candidates=args.include_candidates,
+                )
+            except KeyError as exc:
+                log(f"ERROR: {exc}")
+                return 2
+        if args.output:
+            out_file = Path(args.output).expanduser().resolve()
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(content, encoding="utf-8")
+            log(f"[Faces] Exported {count:,} URL(s) for {disp_name} -> {out_file}")
+        else:
+            sys.stdout.write(content)
+        return 0
+
+    # Default action == "scan":
+    out_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
+    try:
+        recognizer = load_default_recognizer(args.backend, det_size=args.det_size)
+    except MissingFacesBackendError as exc:
+        log(f"[Faces] {exc}")
+        return 2
+
+    progress = LiveProgress(enabled=not args.no_progress)
+    set_active_progress(progress)
+    try:
+        with keep_system_awake(enabled=True):
+            summary = run_archive_face_scan(
+                backup_dir=backup_dir,
+                recognizer=recognizer,
+                refs_dir=refs_dir,
+                output_dir=out_dir,
+                workers=args.workers,
+                auto_high_threshold=args.threshold,
+                candidate_threshold=args.candidate_threshold,
+                progress=progress,
+            )
+    except KeyboardInterrupt:
+        progress.close()
+        set_active_progress(None)
+        log("\n[Faces] Scan interrupted (Ctrl+C). Progress is saved in SQLite — re-run anytime to resume.")
+        return 130
+    finally:
+        progress.close()
+        set_active_progress(None)
+
     log(
-        f"[Faces] Complete: scanned={stats.photos_scanned:,}, cached={stats.photos_cached:,}, "
-        f"matched={stats.photos_matched:,}, created={stats.links_created:,}, "
-        f"existing={stats.links_skipped_existing:,} -> {output_dir}"
+        f"[Faces] Scan complete: total={summary.photos_total:,} (new={summary.photos_scanned:,}, "
+        f"cached={summary.photos_cached:,}), faces={summary.faces_total:,}, "
+        f"clusters={summary.clusters_created:,}, seeded_people={summary.people_seeded}, "
+        f"auto_matches={summary.auto_high_matches:,}, review_candidates={summary.candidate_matches:,}"
     )
+    log("[Faces] Next step: run `kinderpedia-backup faces ui` to batch-confirm children & classmates!")
     return 0
 
 

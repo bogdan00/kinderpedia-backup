@@ -29,8 +29,9 @@ dependencies = [
 [project.optional-dependencies]
 # Optional local ML stack for `kinderpedia-backup faces` (kept separate so `sync` stays lightweight):
 faces = [
+    "numpy>=1.24",
     "pillow>=10.0",
-    "onnxruntime>=1.17",
+    "opencv-python-headless>=4.8",
 ]
 dev = [
     "mypy>=1.10",
@@ -46,7 +47,7 @@ kinderpedia-backup = "kinderpedia_backup.cli:cli"
 where = ["src"]
 
 [tool.setuptools.package-data]
-kinderpedia_backup = ["py.typed"]
+kinderpedia_backup = ["py.typed", "faces/web/*"]
 
 [tool.ruff]
 target-version = "py310"
@@ -70,6 +71,10 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["cv2", "cv2.*", "onnxruntime", "PIL", "PIL.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

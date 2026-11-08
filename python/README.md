@@ -63,26 +63,37 @@ kinderpedia-backup sync --logout
 
 ## 2. Facial Recognition & Per-Child Organization (`faces`)
 
-Kindergarten albums often contain 50–100 classroom group photos where your child appears in only a subset. The `faces` subpackage (`src/kinderpedia_backup/faces/`) is architected to scan backups created by **either** the Browser Bookmarklet or `kinderpedia-backup sync` and organize matching photos per child using **zero-extra-space hardlinks**:
+Kindergarten albums often contain 50–100 classroom group photos where your child appears in only a subset. The `faces` subpackage (`src/kinderpedia_backup/faces/`) scans backups created by **either** the Browser Bookmarklet or `kinderpedia-backup sync` entirely offline (`SCRFD-10GF` + `ArcFace ResNet-50` ONNX via `onnxruntime` or `opencv-python-headless` `cv2.dnn`) and organizes matching photos per child using **zero-extra-space hardlinks**:
 
-1. Create a `References/` folder with 3–5 clear portraits per child:
+1. Install facial-recognition extras:
+   ```bash
+   pip install -e "./python[faces]"
+   ```
+2. *(Optional)* Add extra reference portraits per child or classmate in `References/<Person>/` (`<Child>/avatar.png` is enrolled automatically):
    ```text
    ~/kinderpedia_bk/References/
    ├── Alex/
-   │   ├── portrait_1.jpg
-   │   └── portrait_2.jpg
+   │   ├── 2024_portrait.jpg
+   │   └── 2026_portrait.jpg
    └── Maya/
-       ├── portrait_1.jpg
-       └── portrait_2.jpg
+       └── 2026_portrait.jpg
    ```
-2. Preview discovered albums and reference profiles:
+3. Run the incremental face scan, launch the local active-learning Web UI, and materialize flat `ByChild/<Person>/` folders or Kinderpedia CDN URL manifests:
    ```bash
-   kinderpedia-backup faces --input ~/kinderpedia_bk --dry-run
+   # Scan photos, join Metadata/ provenance & CDN URLs, and build per-year clusters:
+   kinderpedia-backup faces scan --input ~/kinderpedia_bk
+
+   # Launch the interactive batch-trainer & classroom studio at http://127.0.0.1:8765/:
+   kinderpedia-backup faces ui --input ~/kinderpedia_bk --port 8765
+
+   # Materialize zero-copy hardlinks into ~/kinderpedia_bk/ByChild/<Person>/:
+   kinderpedia-backup faces materialize --input ~/kinderpedia_bk
+
+   # Export Kinderpedia CDN URLs (.txt / .csv / .json) for a single child:
+   kinderpedia-backup faces export-urls --input ~/kinderpedia_bk --person "Alex" --format txt -o alex_urls.txt
    ```
-3. **Extending with an ML Recognizer**:
-   - `kinderpedia_backup.faces` already implements reference enrollment (`enroll_references`), incremental scan caching (`face_scan_cache.json` keyed by `model_id`, file size, and `mtime_ns`), cosine similarity matching, and `hardlink`/`symlink`/`copy` materialization into `<input>/ByChild/<Child Name>/`.
-   - To add a concrete local ML backend (e.g. InsightFace ONNX or Apple Vision), implement the `FaceRecognizer` protocol in `src/kinderpedia_backup/faces/recognizer.py` and install optional ML extras with `pip install "./python[faces]"`.
-   - 👉 Full architecture & ML backend design: **[`../docs/facial-recognition-design.md`](../docs/facial-recognition-design.md)**
+   - 👉 Full architecture & design doc: **[`../docs/facial-recognition-design.md`](../docs/facial-recognition-design.md)**
+   - 👉 Engineering & operations handover guide: **[`../docs/faces-handover.md`](../docs/faces-handover.md)**
 
 ---
 
