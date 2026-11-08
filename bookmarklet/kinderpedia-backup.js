@@ -16,7 +16,7 @@
   // ---------------------------------------------------------------------------
   // Layout contract (pure functions, no DOM): shared byte-for-byte with the Python CLI
   // (python/src/kinderpedia_backup/sync/naming.py + folder_map.py) and pinned by the golden fixture
-  // python/tests/fixtures/layout_contract.json (run: node --test bookmarklet/tests/).
+  // python/tests/fixtures/layout_contract.json (run: node --test bookmarklet/tests/layout_contract.test.mjs).
   // Defined before any browser checks so Node can load this file and test them headlessly.
   // ---------------------------------------------------------------------------
   const STOPWORDS = new Set([

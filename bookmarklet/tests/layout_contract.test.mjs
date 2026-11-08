@@ -1,5 +1,5 @@
 // Golden layout-contract conformance for the Bookmarklet (mirrors python/tests/test_layout_contract.py).
-// Run from the repo root: `node --test bookmarklet/tests/`
+// Run from the repo root: `node --test bookmarklet/tests/layout_contract.test.mjs`
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

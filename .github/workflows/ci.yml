@@ -35,6 +35,25 @@ jobs:
       - run: ruff check src tests kinderpedia.py
       - run: mypy src tests kinderpedia.py
 
+  bookmarklet:
+    name: Bookmarklet (node --check & layout contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax check
+        run: |
+          node --check bookmarklet/kinderpedia-backup.js
+          node --check bookmarklet/kinderpedia-backup.min.js
+          node --check bookmarklet/serve.js
+          node --check bookmarklet/worker.js
+      - name: kinderpedia-backup.min.js must be an exact copy of kinderpedia-backup.js
+        run: cmp bookmarklet/kinderpedia-backup.js bookmarklet/kinderpedia-backup.min.js
+      - name: Shared layout contract (python/tests/fixtures/layout_contract.json)
+        run: node --test bookmarklet/tests/layout_contract.test.mjs
+
   test:
     name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
     strategy:
