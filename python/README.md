@@ -6,7 +6,9 @@ Modular, resumable Python CLI for backing up full-resolution Kinderpedia media (
 
 ## Requirements
 
-- **Python 3.10+**
+- **Python 3.10 – 3.14** (`python/.python-version` pins 3.14). The `faces` engine is
+  [`onnxruntime`](https://onnxruntime.ai/) (CoreML on macOS, CUDA when available, else CPU), which has
+  no Python 3.15 wheels yet, so the package declares `requires-python = ">=3.10,<3.15"`.
 - **`ffmpeg`** *(optional, needed only for HLS-streamed Vimeo videos during `sync`)*:
   - **macOS**: `brew install ffmpeg`
   - **Windows**: `winget install Gyan.FFmpeg`
@@ -19,16 +21,20 @@ Modular, resumable Python CLI for backing up full-resolution Kinderpedia media (
 ### Option A: Zero-setup run with [`uv`](https://docs.astral.sh/uv/)
 
 ```bash
-# From repository root:
-uv run python/kinderpedia.py sync
+# From repository root (uv fetches Python 3.14 and the sync + faces dependencies on first run):
+uv run --python 3.14 python/kinderpedia.py sync
+uv run --python 3.14 python/kinderpedia.py faces scan --input ~/kinderpedia_bk
+
+# From python/ the `.python-version` pin already selects 3.14:
+cd python && uv run kinderpedia.py faces ui --input ~/kinderpedia_bk
 ```
 
 ### Option B: Install into a virtual environment or `pipx`
 
 ```bash
-python3 -m venv .venv
+python3.14 -m venv .venv
+.venv/bin/pip install "./python[faces]"   # or "./python" for `sync` only
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install ./python
 
 kinderpedia-backup sync
 ```
@@ -71,11 +77,11 @@ kinderpedia-backup sync --logout
 
 ## 2. Facial Recognition & Per-Child Organization (`faces`)
 
-Kindergarten albums often contain 50–100 classroom group photos where your child appears in only a subset. The `faces` subpackage (`src/kinderpedia_backup/faces/`) scans backups created by **either** the Browser Bookmarklet or `kinderpedia-backup sync` entirely offline (`SCRFD-10GF` + `ArcFace ResNet-50` ONNX via `onnxruntime` or `opencv-python-headless` `cv2.dnn`) and organizes matching photos per child using **zero-extra-space hardlinks**:
+Kindergarten albums often contain 50–100 classroom group photos where your child appears in only a subset. The `faces` subpackage (`src/kinderpedia_backup/faces/`) scans backups created by **either** the Browser Bookmarklet or `kinderpedia-backup sync` entirely offline (`SCRFD-10GF` + `ArcFace ResNet-50` ONNX on `onnxruntime`; the startup log line shows the engine version, active execution providers and model id) and organizes matching photos per child using **zero-extra-space hardlinks**:
 
-1. Install facial-recognition extras:
+1. Install facial-recognition extras (Python 3.10 – 3.14):
    ```bash
-   pip install -e "./python[faces]"
+   python3.14 -m venv .venv && .venv/bin/pip install "./python[faces]"
    ```
 2. *(Optional)* Add extra reference portraits per child or classmate in `References/<Person>/` (`<Child>/avatar.png` is enrolled automatically):
    ```text
