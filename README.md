@@ -8,7 +8,7 @@ Download and preserve all of your children's full-resolution Kinderpedia photo a
 
 | Feature | 🌐 [1-Click Browser Bookmarklet](./bookmarklet/) | 🐍 [Python CLI & Organizer](./python/) |
 | :--- | :--- | :--- |
-| **Setup** | **Zero install** — drag a bookmark in Chrome / Edge / Brave | Python 3.10+ (`uv run python/kinderpedia.py` or `pip install ./python`) |
+| **Setup** | **Zero install** — drag a bookmark in Chrome / Edge / Brave | Python 3.10 – 3.14 (`uv run --python 3.14 python/kinderpedia.py` or `pip install "./python[faces]"`) |
 | **Best for** | Parents wanting an interactive 1-click backup in the browser | Large archives (20–50+ GiB), scheduled/headless syncs, Safari/Firefox users |
 | **Auth** | Reuses your active `app.kinderpedia.co` browser tab | Interactive prompt, `--password-stdin` (1Password/Keychain), or `0600` `.env` |
 | **Videos** | Pure-JS HLS-to-MP4 transmuxing (`mux.js`) | Progressive MP4 + lossless `ffmpeg` HLS remuxing |
@@ -31,18 +31,19 @@ Download and preserve all of your children's full-resolution Kinderpedia photo a
 
 ### Option 2: Python CLI Backend (Unattended Sync & Post-Processing)
 
+**Requirements:** Python 3.10 – 3.14 (`python/.python-version` pins 3.14). Facial recognition (`faces`) runs on `onnxruntime` (CoreML on macOS, CUDA when available, else CPU), which has no Python 3.15 wheels yet.
+
 Run directly with [`uv`](https://docs.astral.sh/uv/) (zero manual virtualenv setup):
 
 ```bash
-uv run python/kinderpedia.py sync
+uv run --python 3.14 python/kinderpedia.py sync
 ```
 
 Or install into a virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3.14 -m venv .venv && .venv/bin/pip install "./python[faces]"
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install ./python
 
 # Full backup (prompts securely for email, password, and 2FA if enabled):
 kinderpedia-backup sync --output ~/kinderpedia_bk

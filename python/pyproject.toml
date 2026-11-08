@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Resumable cloud media backup & local face-organization CLI for Kinderpedia parent accounts."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"  # onnxruntime (the faces engine) has no Python 3.15 wheels yet
 keywords = ["kinderpedia", "backup", "photos", "videos", "face-recognition", "cli"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -28,17 +29,15 @@ dependencies = [
 
 [project.optional-dependencies]
 # Optional local ML stack for `kinderpedia-backup faces` (kept separate so `sync` stays lightweight).
-# onnxruntime is the fast engine (CoreML / CUDA / CPU, ~10x faster than OpenCV DNN on Apple silicon);
-# it is skipped on interpreters it does not publish wheels for yet (so installs never break), in which
-# case `faces scan` falls back to OpenCV DNN automatically and says so at startup.
+# onnxruntime is the inference engine (CoreML on macOS, CUDA when available, else CPU).
 faces = [
     "numpy>=1.24",
     "pillow>=10.0",
-    "opencv-python-headless>=4.8",
-    "onnxruntime>=1.17; python_version < \"3.15\"",
+    "onnxruntime>=1.17",
 ]
 dev = [
     "mypy>=1.10",
+    "opencv-python-headless>=4.8",  # golden reference for the Pillow face-alignment warp in tests only
     "pytest>=8.0",
     "ruff>=0.6",
     "types-requests>=2.31",

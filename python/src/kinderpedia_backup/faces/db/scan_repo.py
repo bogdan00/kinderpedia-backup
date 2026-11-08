@@ -26,29 +26,13 @@ from .relink import StoredFace, match_faces
 class ScanRepoMixin(MatrixCacheMixin):
     """Scan persistence: change detection state, label-preserving re-link, re-key and photo deletion."""
 
-    def get_cached_photo_states(self) -> dict[str, tuple[int, int, int, str]]:
-        """Return `{rel_path: (photo_id, file_size, mtime_ns, detector_id)}` for fast incremental diffs."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT photo_id, rel_path, file_size, mtime_ns, detector_id FROM photos"
-            ).fetchall()
-        return {
-            str(r["rel_path"]): (
-                int(r["photo_id"]),
-                int(r["file_size"]),
-                int(r["mtime_ns"]),
-                str(r["detector_id"]),
-            )
-            for r in rows
-        }
-
     def get_photo_scan_states(self) -> dict[str, PhotoScanState]:
-        """Return `{rel_path: PhotoScanState}` (size, mtime, detector, content hash, Kinderpedia id)."""
+        """Return `{rel_path: PhotoScanState}` (size, mtime, detector, hash, Kinderpedia id, pixel size)."""
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT photo_id, rel_path, file_size, mtime_ns, detector_id, content_hash,
-                       kinderpedia_image_id, filename
+                       kinderpedia_image_id, filename, width, height
                 FROM photos
                 """
             ).fetchall()
@@ -63,6 +47,8 @@ class ScanRepoMixin(MatrixCacheMixin):
                     int(r["kinderpedia_image_id"]) if r["kinderpedia_image_id"] is not None else None
                 ),
                 filename=str(r["filename"]),
+                width=int(r["width"] or 0),
+                height=int(r["height"] or 0),
             )
             for r in rows
         }

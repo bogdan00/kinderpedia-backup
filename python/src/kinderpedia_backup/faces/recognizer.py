@@ -38,15 +38,13 @@ def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def load_default_recognizer(backend: str = "auto", *, det_size: int = 640) -> FaceRecognizer:
-    """
-    Resolve an installed local SCRFD-10GF + ArcFace R50 ONNX recognizer (`onnxruntime` or `cv2.dnn`).
-    """
+def load_default_recognizer(*, det_size: int = 640) -> FaceRecognizer:
+    """Load the local SCRFD-10GF + ArcFace R50 recognizer running on `onnxruntime`."""
     try:
         from .onnx_backend import ScrfdArcFaceRecognizer
     except ImportError as exc:
         raise MissingFacesBackendError(
-            f"Facial recognition dependencies missing ({exc}). "
-            'Install optional ML extras via: pip install "./python[faces]"'
+            f"Facial recognition dependencies missing ({exc}). The faces engine (onnxruntime) "
+            'needs Python 3.10-3.14; install it with: pip install "./python[faces]"'
         ) from exc
-    return ScrfdArcFaceRecognizer(backend=backend, det_size=det_size)
+    return ScrfdArcFaceRecognizer(det_size=det_size)

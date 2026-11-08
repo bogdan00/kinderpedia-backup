@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - run: python -m pip install --upgrade pip && pip install -e ".[faces,dev]"
       - run: ruff check src tests kinderpedia.py
       - run: mypy src tests kinderpedia.py
@@ -54,14 +54,22 @@ jobs:
       - name: Shared layout contract (python/tests/fixtures/layout_contract.json)
         run: node --test bookmarklet/tests/layout_contract.test.mjs
 
+  # --------------------------------------------------------------------------------------------
+  # Python test matrix: 3.10-3.14 (onnxruntime, the faces inference engine, has no 3.15 wheels yet).
+  # The 3.14 legs fetch the pinned SCRFD / ArcFace weights (cached by their SHA-256) and run the
+  # ONNX Runtime parity tests with KP_REQUIRE_ORT_PARITY=1, so they fail instead of skipping.
+  # --------------------------------------------------------------------------------------------
   test:
     name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
+    env:
+      KINDERPEDIA_MODELS_DIR: ${{ github.workspace }}/.kp-models
+      KP_REQUIRE_ORT_PARITY: ${{ matrix.python-version == '3.14' && '1' || '0' }}
     defaults:
       run:
         working-directory: python
@@ -70,5 +78,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Cache ONNX model weights (keyed by pinned SHA-256)
+        if: matrix.python-version == '3.14'
+        uses: actions/cache@v4
+        with:
+          path: .kp-models
+          key: buffalo_l-${{ runner.os }}-det5838f7fe053675b1-rec4c06341c33c2ca1f
       - run: python -m pip install --upgrade pip && pip install -e ".[faces,dev]"
+      - name: Fetch + verify model weights
+        if: matrix.python-version == '3.14'
+        run: python -c "from kinderpedia_backup.faces.weights import ensure_buffalo_l_weights as f; print(f())"
       - run: pytest -v

@@ -36,8 +36,8 @@ def resolve_best_live_url(
     download_url: str,
     fullsize_url: str,
     thumb_url: str,
-    width: int = 0,
-    height: int = 0,
+    width: int,
+    height: int,
 ) -> str:
     """
     Pick the known-working Kinderpedia CDN URL without making network requests.
@@ -113,8 +113,11 @@ class ProvenanceResolver:
         self._album_cache[key] = parsed
         return parsed
 
-    def resolve(self, photo_path: Path, *, width: int = 0, height: int = 0) -> PhotoProvenance:
-        """Build `PhotoProvenance` for `photo_path` inside `backup_root`."""
+    def resolve(self, photo_path: Path, *, width: int, height: int) -> PhotoProvenance:
+        """
+        Build `PhotoProvenance` for `photo_path` inside `backup_root`. `width` / `height` are the
+        EXIF-normalized pixel size of the local file; they decide `best_live_url` (pre-2024 photos).
+        """
         resolved = photo_path.resolve()
         rel_parts = resolved.relative_to(self.backup_root).parts
         rel_path = "/".join(rel_parts)

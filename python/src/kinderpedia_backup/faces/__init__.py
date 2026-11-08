@@ -84,6 +84,6 @@ def __getattr__(name: str) -> Any:
     except ImportError as exc:
         raise MissingFacesBackendError(
             f"Optional `faces` dependencies are not installed ({exc}). "
-            'Install them via: pip install "./python[faces]"'
+            'Install them (Python 3.10-3.14) via: pip install "./python[faces]"'
         ) from exc
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
