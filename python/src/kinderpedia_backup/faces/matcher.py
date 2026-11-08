@@ -10,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .index_db import FacesIndexDB
+from .label_guard import LABEL_OUTLIER_MIN_FACES, LABEL_OUTLIER_MIN_SIM, label_outlier_mask
 from .models import AssignmentSource, AssignmentStatus
 
 
@@ -244,7 +245,7 @@ def rebuild_yearly_clusters(
     archive_children: list[str] = mat["archive_children"]
     years: list[str] = mat["years"]
     embs: NDArray[np.float32] = mat["embeddings"]
-    cluster_date_ords: NDArray[np.int32] | None = mat.get("date_ords")
+    cluster_date_ords: NDArray[np.int32] = mat["date_ords"]
 
     if face_ids.shape[0] == 0:
         return db.save_clusters([])
@@ -429,11 +430,7 @@ def rebuild_yearly_clusters(
             if assigned_pid is None and person_centroids:
                 best_p_sim = -1.0
                 best_p_id: int | None = None
-                c_ord = (
-                    int(np.median(cluster_date_ords[member_global]))
-                    if cluster_date_ords is not None
-                    else 0
-                )
+                c_ord = int(np.median(cluster_date_ords[member_global]))
                 for pid, anchor_mat in person_centroids:
                     if pid in elig_rules and c_ord > 0:
                         b_ord, wins = elig_rules[pid]
@@ -486,18 +483,35 @@ def rebuild_yearly_clusters(
     return db.save_clusters(cluster_specs)
 
 
-def _max_sim_to_others(embs: NDArray[np.float32], chunk_size: int = 2048) -> NDArray[np.float32]:
-    """For each row, the highest cosine similarity to any OTHER row (chunked, -1 for a single row)."""
-    n = int(embs.shape[0])
-    out = np.full((n,), -1.0, dtype=np.float32)
-    if n < 2:
-        return out
-    for start in range(0, n, chunk_size):
-        end = min(n, start + chunk_size)
-        sims = embs[start:end] @ embs.T
-        sims[np.arange(end - start), np.arange(start, end)] = -1.0
-        out[start:end] = np.max(sims, axis=1)
-    return out
+def find_label_outliers(
+    state: dict[str, Any],
+    person_ids: set[int],
+    *,
+    min_sim: float = LABEL_OUTLIER_MIN_SIM,
+    min_faces: int = LABEL_OUTLIER_MIN_FACES,
+) -> set[tuple[int, int]]:
+    """
+    `(face_id, person_id)` of suspicious confirmed labels (see `label_guard`) among `person_ids`,
+    from a `load_anchors_and_negatives()` state. Every confirmed face with an embedding counts as a
+    same-person reference (including kept ones); labels in `state["label_keeps"]` are never flagged.
+    """
+    groups: dict[tuple[int, int], list[tuple[int, NDArray[np.float32]]]] = defaultdict(list)
+    for h in state["human"]:
+        pid = int(h["person_id"])
+        if h["status"] == "confirmed" and h["emb"] is not None and h["face_id"] is not None and pid in person_ids:
+            groups[(pid, int(h["year"]))].append((int(h["face_id"]), h["emb"]))
+    keeps: set[tuple[int, int]] = state["label_keeps"]
+    flagged: set[tuple[int, int]] = set()
+    for (pid, _yr), items in groups.items():
+        if len(items) < max(2, min_faces):
+            continue
+        mask, _best, _nearest = label_outlier_mask(
+            np.stack([e for _, e in items], axis=0), min_sim=min_sim, min_faces=min_faces
+        )
+        for (fid, _), is_out in zip(items, mask.tolist(), strict=True):
+            if is_out and (fid, pid) not in keeps:
+                flagged.add((fid, pid))
+    return flagged
 
 
 def _robust_anchor_score(
@@ -509,12 +523,17 @@ def _robust_anchor_score(
     person has fewer than `min_anchors` anchors (e.g. only an avatar per age): there the second
     anchor is usually a different age, not a second opinion.
     """
-    if top2_weight <= 0.0 or sims.shape[1] < max(2, min_anchors):
+    if sims.shape[1] < max(2, min_anchors):
         return np.asarray(np.max(sims, axis=1), dtype=np.float32)
     top2 = -np.partition(-sims, 1, axis=1)[:, :2]
     best = np.max(top2, axis=1)
     second = np.min(top2, axis=1)
     return np.asarray((1.0 - top2_weight) * best + top2_weight * second, dtype=np.float32)
+
+
+#: Extra neighbours kept per cached row so voters removed from the bank (untag, guard flag) are
+#: replaced exactly by the next-best ones without a recompute.
+_KNN_SPARE = 8
 
 
 def _cached_label_neighbors(
@@ -531,8 +550,11 @@ def _cached_label_neighbors(
     newly labelled faces are merged in with one small SGEMM, unlabelled ones are dropped, and only
     rows never seen before are computed from scratch. Labels change a handful at a time while the
     user clicks, so a warm rematch costs milliseconds instead of a full 50k x 30k neighbour search.
+    Each row caches `k + _KNN_SPARE` neighbours; a row that loses more than `_KNN_SPARE` of them is
+    recomputed, so the returned top-`k` lists are always exact.
     """
     n_faces = int(face_ids.shape[0])
+    kc = k + _KNN_SPARE
     cache = db._knn_neighbor_cache
     bank_set = set(bank_rows.tolist())
     if (
@@ -545,8 +567,8 @@ def _cached_label_neighbors(
             "n_faces": n_faces,
             "k": k,
             "face_ids": face_ids,
-            "nn_rows": np.full((n_faces, k), -1, dtype=np.int64),
-            "nn_sims": np.full((n_faces, k), -1.0, dtype=np.float32),
+            "nn_rows": np.full((n_faces, kc), -1, dtype=np.int64),
+            "nn_sims": np.full((n_faces, kc), -1.0, dtype=np.float32),
             "has": np.zeros((n_faces,), dtype=bool),
             "bank": set(),
         }
@@ -562,12 +584,15 @@ def _cached_label_neighbors(
         # 30k bank); partitioning `s_q` directly avoids a second negated copy of the block.
         bank_e = embs[bank_rows]
         n_bank = int(bank_rows.size)
+        kw = min(kc, n_bank)
         for c0 in range(0, int(rows_sub.size), 1024):
             q = rows_sub[c0 : c0 + 1024]
             s_q = embs[q] @ bank_e.T
-            idx = np.argpartition(s_q, n_bank - k, axis=1)[:, n_bank - k :]
-            nn_rows_c[q] = bank_rows[idx]
-            nn_sims_c[q] = np.take_along_axis(s_q, idx, axis=1)
+            idx = np.argpartition(s_q, n_bank - kw, axis=1)[:, n_bank - kw :]
+            nn_rows_c[q] = -1
+            nn_sims_c[q] = -1.0
+            nn_rows_c[q, :kw] = bank_rows[idx]
+            nn_sims_c[q, :kw] = np.take_along_axis(s_q, idx, axis=1)
             has[q] = True
 
     # A bulk confirm adds thousands of voters at once; merging them is still far cheaper than a cold
@@ -588,19 +613,19 @@ def _cached_label_neighbors(
                     nn_rows_c[cached_rows] = sub_r
                     nn_sims_c[cached_rows] = sub_s
                     # Rows that lost too many neighbours get recomputed from scratch below:
-                    lost = hit.sum(axis=1) > (k // 3)
+                    lost = hit.sum(axis=1) > _KNN_SPARE
                     has[cached_rows[lost]] = False
         if added.size:
             upd = open_rows[has[open_rows]]
             if upd.size:
                 add_e = embs[added]
-                step = max(256, min(16384, (1 << 25) // max(1, int(added.size) + k)))
+                step = max(256, min(16384, (1 << 25) // max(1, int(added.size) + kc)))
                 for c0 in range(0, int(upd.size), step):
                     q = upd[c0 : c0 + step]
                     s_new = embs[q] @ add_e.T
                     cand_r = np.concatenate([nn_rows_c[q], np.broadcast_to(added, s_new.shape)], axis=1)
                     cand_s = np.concatenate([nn_sims_c[q], s_new.astype(np.float32)], axis=1)
-                    idx = np.argpartition(-cand_s, k - 1, axis=1)[:, :k]
+                    idx = np.argpartition(-cand_s, kc - 1, axis=1)[:, :kc]
                     nn_rows_c[q] = np.take_along_axis(cand_r, idx, axis=1)
                     nn_sims_c[q] = np.take_along_axis(cand_s, idx, axis=1)
             # Rows cached earlier but not open now are stale for the added faces:
@@ -614,7 +639,9 @@ def _cached_label_neighbors(
         _full(missing)
     cache["bank"] = bank_set
     db._knn_neighbor_cache = cache
-    return nn_rows_c[open_rows], nn_sims_c[open_rows]
+    sims_o = nn_sims_c[open_rows]
+    top = np.argpartition(-sims_o, k - 1, axis=1)[:, :k]
+    return np.take_along_axis(nn_rows_c[open_rows], top, axis=1), np.take_along_axis(sims_o, top, axis=1)
 
 
 def recompute_active_matching(
@@ -642,7 +669,6 @@ def recompute_active_matching(
     temporal_min_sim: float = 0.50,
     temporal_boost: float = 0.04,
     temporal_day_decay: float = 0.02,
-    knn_enabled: bool = True,
     knn_k: int = 15,
     knn_veto_frac: float = 0.80,
     knn_trust_frac: float = 0.90,
@@ -655,12 +681,8 @@ def recompute_active_matching(
     album_absent_strong_margin: float = 0.05,
     auto_band_knn_upper: float = 0.60,
     auto_band_knn_min_sim: float = 0.52,
-    knn_promote_min_score: float | None = None,
-    album_cohesion_require_knn: bool = False,
-    anchor_outlier_min_sim: float = 0.0,
-    anchor_outlier_min_faces: int = 8,
-    anchor_det_penalty: float = 0.0,
-    knn_bank_cap_per_person: int = 0,
+    label_outlier_min_sim: float = LABEL_OUTLIER_MIN_SIM,
+    label_outlier_min_faces: int = LABEL_OUTLIER_MIN_FACES,
     diagnostics: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """
@@ -680,15 +702,19 @@ def recompute_active_matching(
       the same child (`auto_band_knn_min_sim`; a closed-set vote alone cannot spot an un-enrolled
       look-alike); otherwise the face goes to the review queue.
     - `album_cohesion` absorbs same-album faces only at local similarity >= `album_cohesion_absorb_sim`.
-    - kNN promotion of a candidate needs score >= `knn_promote_min_score`
-      (default `auto_high_threshold - 0.05`).
+    - kNN promotion of a candidate needs score >= `auto_high_threshold - 0.05`.
     - Anchor scores blend the best and second-best anchor (`anchor_top2_weight`) so one atypical or
       mislabelled anchor cannot pull in its whole neighbourhood.
-    The anchor outlier guard, det-score anchor discount and kNN voter cap are available but off: they
-    did not improve hidden-label accuracy on a real archive.
+    - Label-consistency guard (`faces/label_guard.py`, always on): a confirmed label whose best
+      similarity to the person's other confirmed faces that year is < `label_outlier_min_sim`
+      (person-years with >= `label_outlier_min_faces` faces) keeps its tag but is never used as
+      positive evidence (anchor, album/temporal anchor, kNN voter) unless the user kept it
+      (`label_keeps`). It is label hygiene, not an accuracy gain: on the hidden-label replay every
+      setting ties with the guard off (docs/faces-handover.md §10); the flagged faces are surfaced
+      for review via `get_suspicious_labels()`.
 
-    `diagnostics`, when given, is filled with per-section timings and the final score matrix
-    (offline evaluation / calibration only; it does not change any result).
+    `diagnostics`, when given, is filled with per-section timings, the final score matrix, the kNN
+    vote and the flagged labels (offline evaluation / calibration only; it does not change any result).
     """
     timings: dict[str, float] = {}
     t_mark = [time.perf_counter()]
@@ -702,12 +728,7 @@ def recompute_active_matching(
     face_ids: NDArray[np.int64] = mat["face_ids"]
     photo_ids: NDArray[np.int64] = mat["photo_ids"]
     year_ints: NDArray[np.int32] = mat["year_ints"]
-    suppressed_auto: NDArray[np.bool_] = (
-        mat["suppressed_auto"]
-        if "suppressed_auto" in mat
-        else np.zeros((int(face_ids.shape[0]),), dtype=bool)
-    )
-    album_keys: list[str] = mat.get("album_keys") or [""] * int(face_ids.shape[0])
+    suppressed_auto: NDArray[np.bool_] = mat["suppressed_auto"]
     embs: NDArray[np.float32] = mat["embeddings"]
 
     n_faces = int(face_ids.shape[0])
@@ -736,27 +757,34 @@ def recompute_active_matching(
     album_neg_by_pid: dict[int, dict[str, list[NDArray[np.float32]]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    touched_album_keys: set[str] = set()
     temporal_pos_by_pid: dict[int, list[tuple[int, NDArray[np.float32]]]] = defaultdict(list)
     locked_photo_people: set[tuple[int, int]] = set()
     locked_faces: set[int] = set()
     rejected_photo_people: set[tuple[int, int]] = set()
     rejected_face_people: set[tuple[int, int]] = set()
 
+    # 1a. Label-consistency guard: a confirmed face that looks like none of the person's other
+    # confirmed faces that year is more likely a mislabel than a pose. It keeps its tag (and stays
+    # locked) but is never used as positive evidence: not an anchor, album/temporal anchor or kNN
+    # voter. Labels the user reviewed and kept (`label_keeps`) are trusted like any other.
+    flagged_labels = find_label_outliers(
+        state, set(active_people), min_sim=label_outlier_min_sim, min_faces=label_outlier_min_faces
+    )
+
     for h in state["human"]:
         p_id = int(h["photo_id"])
         per_id = int(h["person_id"])
         f_id: int | None = h["face_id"]
         st: str = h["status"]
-        src: str = str(h.get("source") or "")
-        akey: str = str(h.get("album_key") or "")
+        src: str = str(h["source"])
+        akey: str = str(h["album_key"])
         emb: NDArray[np.float32] | None = h["emb"]
 
         if st == "confirmed":
             locked_photo_people.add((p_id, per_id))
             if f_id is not None:
                 locked_faces.add(f_id)
-            if emb is not None and f_id is not None:
+            if emb is not None and f_id is not None and (f_id, per_id) not in flagged_labels:
                 det_sc = float(h["det_score"])
                 if det_sc >= 0.56:
                     confirmed_by_pid_year[(per_id, int(h["year"]))].append((f_id, det_sc, emb))
@@ -768,7 +796,6 @@ def recompute_active_matching(
                     album_pos_by_pid[per_id][akey].append(emb)
                 if det_sc >= 0.35:
                     temporal_pos_by_pid[per_id].append((f_id, emb))
-                    touched_album_keys.add(akey)
         elif st == "rejected":
             if f_id is not None and src in ("reassigned", "manual_tag"):
                 # Reassigning a specific face box teaches a hard-negative on that box while still
@@ -780,7 +807,6 @@ def recompute_active_matching(
                 neg_by_pid[per_id].append(emb)
                 if akey and akey != "/":
                     album_neg_by_pid[per_id][akey].append(emb)
-                    touched_album_keys.add(akey)
         elif st == "unsure":
             # "I'm not sure": skip from `per_id`'s batch queue WITHOUT adding positive or negative anchors,
             # while still letting other children claim `f_id` if they match strongly.
@@ -788,16 +814,13 @@ def recompute_active_matching(
 
     chosen_anchor_face_ids: set[int] = set()
     anchors_by_pid: dict[int, tuple[NDArray[np.float32], NDArray[np.int32]]] = {}
-    anchor_det_pen_by_pid: dict[int, NDArray[np.float32]] = {}
 
     for pid in active_people:
         vecs: list[NDArray[np.float32]] = []
         yrs: list[int] = []
-        dets: list[float] = []
         for s_emb, s_yr in seeds_by_pid.get(pid, []):
             vecs.append(s_emb)
             yrs.append(s_yr)
-            dets.append(1.0)  # curated reference photos
 
         # Select up to `max_anchors_per_year` pose-diverse confirmed faces per year:
         person_years = sorted({yr for (p, yr) in confirmed_by_pid_year if p == pid})
@@ -810,56 +833,30 @@ def recompute_active_matching(
             items = source_map[(pid, yr)]
             sub_embs = np.stack([it[2] for it in items], axis=0)
             sub_sc = np.asarray([it[1] for it in items], dtype=np.float32)
-            cand_rel = np.arange(len(items))
-            if anchor_outlier_min_sim > 0.0 and len(items) >= anchor_outlier_min_faces:
-                # Label-consistency guard: a face that looks like none of the person's other
-                # confirmed faces that year is more likely a mislabel than a pose; never anchor on it.
-                consistent = _max_sim_to_others(sub_embs) >= anchor_outlier_min_sim
-                if np.any(consistent):
-                    cand_rel = np.where(consistent)[0]
             keep_rel = _select_diverse_indices(
-                sub_embs[cand_rel],
-                sub_sc[cand_rel],
+                sub_embs,
+                sub_sc,
                 max_items=max_anchors_per_year,
                 max_pair_sim=0.86,
             )
             for rel_k in keep_rel:
-                f_id, det_v, f_emb = items[int(cand_rel[rel_k])]
+                f_id, _det, f_emb = items[int(rel_k)]
                 chosen_anchor_face_ids.add(f_id)
                 vecs.append(f_emb)
                 yrs.append(yr)
-                dets.append(det_v)
 
         if vecs:
             anchors_by_pid[pid] = (
                 np.stack(vecs, axis=0).astype(np.float32),
                 np.asarray(yrs, dtype=np.int32),
             )
-            if anchor_det_penalty > 0.0:
-                # Blurry / small anchors are noisier: discount their similarities slightly.
-                det_arr = np.asarray(dets, dtype=np.float32)
-                anchor_det_pen_by_pid[pid] = (
-                    anchor_det_penalty * np.clip((0.80 - det_arr) / 0.25, 0.0, 1.0)
-                ).astype(np.float32)
 
     enrolled_pids = [pid for pid in active_people if pid in anchors_by_pid]
     _tick("anchor_select")
     if not enrolled_pids:
         return db.replace_model_assignments([], chosen_anchor_face_ids)
 
-    # Pre-group face row indices ONLY for albums that have human decisions:
-    cached_rows_by_album: dict[str, NDArray[np.int64]] | None = mat.get("rows_by_album")
-    rows_by_album: dict[str, NDArray[np.int64]] = {}
-    if touched_album_keys:
-        if cached_rows_by_album is not None:
-            rows_by_album = cached_rows_by_album
-        else:
-            tmp_alb_rows: dict[str, list[int]] = defaultdict(list)
-            for r_i, akey in enumerate(album_keys):
-                if akey in touched_album_keys:
-                    tmp_alb_rows[akey].append(r_i)
-            for akey, r_list in tmp_alb_rows.items():
-                rows_by_album[akey] = np.asarray(r_list, dtype=np.int64)
+    rows_by_album: dict[str, NDArray[np.int64]] = mat["rows_by_album"]
 
     cohesion_candidates: set[tuple[int, int]] = set()
 
@@ -895,9 +892,6 @@ def recompute_active_matching(
         for col_idx, pid, c_start, c_end in pbatch:
             _, a_years = anchors_by_pid[pid]
             raw_sims = batch_raw_sims[:, c_start:c_end]
-            det_pen = anchor_det_pen_by_pid.get(pid)
-            if det_pen is not None and np.any(det_pen > 0.0):
-                raw_sims = raw_sims - det_pen[np.newaxis, :]
 
             # Apply Year-Windowed Sibling Guard when dated anchors exist:
             dated_mask = a_years > 0
@@ -926,13 +920,8 @@ def recompute_active_matching(
     # 2b. Temporal Cohesion: confirmed faces from the same few days (same haircut, outfit, season,
     # lighting) act as extra local anchors that are never diluted by per-year anchor caps, with a
     # time-decayed bonus. Applied before hard negatives so rejections still win.
-    day_nums: NDArray[np.int32] | None = mat.get("day_nums")
-    if (
-        temporal_window_days > 0
-        and day_nums is not None
-        and int(day_nums.shape[0]) == n_faces
-        and temporal_pos_by_pid
-    ):
+    day_nums: NDArray[np.int32] = mat["day_nums"]
+    if temporal_window_days > 0 and temporal_pos_by_pid:
         dated_rows = np.where(day_nums >= 0)[0]
         dated_days = day_nums[dated_rows]
         order_d = np.argsort(dated_days, kind="stable")
@@ -1056,12 +1045,11 @@ def recompute_active_matching(
             if pid_alb_pos and akey in pid_alb_pos:
                 loc_pmat = np.stack(pid_alb_pos[akey], axis=0).astype(np.float32)
                 loc_pos_sims = np.max(alb_embs @ loc_pmat.T, axis=1)
-                if album_absent_sim > 0.0:
-                    # Same album = same day / outfit / lighting: real matches score ~0.7-0.9 against the
-                    # child's confirmed faces from this album. A face far below that is someone else.
-                    absent_rows = alb_rows[loc_pos_sims < album_absent_sim]
-                    if absent_rows.size:
-                        album_absent_by_col[col_idx].append(absent_rows)
+                # Same album = same day / outfit / lighting: real matches score ~0.7-0.9 against the
+                # child's confirmed faces from this album. A face far below that is someone else.
+                absent_rows = alb_rows[loc_pos_sims < album_absent_sim]
+                if absent_rows.size:
+                    album_absent_by_col[col_idx].append(absent_rows)
                 not_loc_rej = (
                     loc_neg_sims < 0.45
                     if loc_neg_sims is not None
@@ -1098,13 +1086,8 @@ def recompute_active_matching(
     if (social_peer_boost > 0.0 or social_cross_circle_penalty > 0.0) and (
         bool(np.any(peer_bond > 0.0)) or bool(np.any(outsider_mat > 0.0))
     ):
-        cached_fc: dict[int, int] | None = mat.get("fc_by_photo")
-        cached_rows_by_photo: dict[int, list[int]] | None = mat.get("rows_by_photo")
-        if cached_fc is not None:
-            fc_by_photo = cached_fc
-        else:
-            uniq_p, p_counts = np.unique(photo_ids, return_counts=True)
-            fc_by_photo = dict(zip(uniq_p.tolist(), p_counts.tolist(), strict=True))
+        fc_by_photo: dict[int, int] = mat["fc_by_photo"]
+        rows_by_photo: dict[int, list[int]] = mat["rows_by_photo"]
 
         vis_witness_by_row: dict[int, int] = {}
         n_enr = len(enrolled_pids)
@@ -1132,18 +1115,10 @@ def recompute_active_matching(
 
         if candidate_social_photos:
             rows_by_social_photo: dict[int, list[int]] = {}
-            if cached_rows_by_photo is not None:
-                for p_id in candidate_social_photos:
-                    pr_list = cached_rows_by_photo.get(p_id)
-                    if pr_list:
-                        rows_by_social_photo[p_id] = pr_list
-            else:
-                tmp_soc: dict[int, list[int]] = defaultdict(list)
-                for r_idx in range(n_faces):
-                    p_id = int(photo_ids[r_idx])
-                    if p_id in candidate_social_photos:
-                        tmp_soc[p_id].append(r_idx)
-                rows_by_social_photo = tmp_soc
+            for p_id in candidate_social_photos:
+                pr_list = rows_by_photo.get(p_id)
+                if pr_list:
+                    rows_by_social_photo[p_id] = pr_list
 
             # Gather (target row -> witnesses) once in Python, then score every (row, enrolled person)
             # pair with numpy: per pair, the strongest peer-bond witness and the strongest outsider
@@ -1218,7 +1193,7 @@ def recompute_active_matching(
 
     # 4b. Soft per-child pressure from the Child Clusters view (boost / penalize look-alikes):
     pressure_by_pid: dict[int, tuple[list[int], list[int]]] = defaultdict(lambda: ([], []))
-    for pr in state.get("pressure", []):
+    for pr in state["pressure"]:
         bucket = pressure_by_pid[int(pr["person_id"])]
         (bucket[0] if float(pr["weight"]) > 0 else bucket[1]).append(int(pr["face_id"]))
     if pressure_by_pid:
@@ -1258,30 +1233,29 @@ def recompute_active_matching(
     # 4c. Hard eligibility: birthdays (never before birth) and class memberships (only own classes):
     rules = db.load_eligibility_rules()
     if rules:
-        date_ords: NDArray[np.int32] | None = mat.get("date_ords")
-        arch_list: list[str] = mat.get("archive_children") or [""] * n_faces
-        if date_ords is not None and int(date_ords.shape[0]) == n_faces:
-            feed_names, feed_codes = np.unique(np.asarray(arch_list, dtype=object), return_inverse=True)
-            feed_index = {str(nm): i for i, nm in enumerate(feed_names.tolist())}
-            for col_idx, pid in enumerate(enrolled_pids):
-                if pid not in rules:
-                    continue
-                birth_ord, windows = rules[pid]
-                allowed = np.ones((n_faces,), dtype=bool)
-                if birth_ord > 0:
-                    allowed &= date_ords >= birth_ord
-                if windows:
-                    in_cls = np.zeros((n_faces,), dtype=bool)
-                    for w_feed, w_start, w_end in windows:
-                        w_mask = (date_ords >= w_start) & (date_ords <= w_end)
-                        if w_feed:
-                            code = feed_index.get(w_feed)
-                            if code is None:
-                                continue
-                            w_mask &= feed_codes == code
-                        in_cls |= w_mask
-                    allowed &= in_cls
-                eff_scores_by_col[~allowed, col_idx] = -1.0
+        date_ords: NDArray[np.int32] = mat["date_ords"]
+        arch_list: list[str] = mat["archive_children"]
+        feed_names, feed_codes = np.unique(np.asarray(arch_list, dtype=object), return_inverse=True)
+        feed_index = {str(nm): i for i, nm in enumerate(feed_names.tolist())}
+        for col_idx, pid in enumerate(enrolled_pids):
+            if pid not in rules:
+                continue
+            birth_ord, windows = rules[pid]
+            allowed = np.ones((n_faces,), dtype=bool)
+            if birth_ord > 0:
+                allowed &= date_ords >= birth_ord
+            if windows:
+                in_cls = np.zeros((n_faces,), dtype=bool)
+                for w_feed, w_start, w_end in windows:
+                    w_mask = (date_ords >= w_start) & (date_ords <= w_end)
+                    if w_feed:
+                        code = feed_index.get(w_feed)
+                        if code is None:
+                            continue
+                        w_mask &= feed_codes == code
+                    in_cls |= w_mask
+                allowed &= in_cls
+            eff_scores_by_col[~allowed, col_idx] = -1.0
 
     # 4e. Same-album absence: in albums where a child is already confirmed, borderline matches that look
     # nothing like her confirmed faces from that very album are dropped from her queue.
@@ -1304,113 +1278,107 @@ def recompute_active_matching(
     knn_top = np.full((n_faces,), -1, dtype=np.int64)
     knn_frac = np.zeros((n_faces,), dtype=np.float32)
     knn_sim = np.full((n_faces,), -1.0, dtype=np.float32)
-    if knn_enabled:
-        pid_by_row = np.full((n_faces,), -1, dtype=np.int64)
-        for h in state["human"]:
-            if h["status"] == "confirmed" and h["emb"] is not None and h["face_id"] is not None:
-                b_pos = int(np.searchsorted(face_ids, int(h["face_id"])))
-                if b_pos < n_faces and int(face_ids[b_pos]) == int(h["face_id"]):
-                    pid_by_row[b_pos] = int(h["person_id"])
-        labelled_row = pid_by_row >= 0
-        if knn_bank_cap_per_person > 0:
-            # Thin out very large label sets (one child can hold a quarter of all labels) with a
-            # face-id hash so the bank stays stable while labels are added one at a time.
-            lab_counts = Counter(int(x) for x in pid_by_row[pid_by_row >= 0].tolist())
-            keep_frac = np.zeros((max(lab_counts, default=0) + 2,), dtype=np.float64)
-            for pid_c, cnt in lab_counts.items():
-                keep_frac[pid_c] = min(1.0, knn_bank_cap_per_person / float(cnt))
-            hashed = ((face_ids.astype(np.uint64) * np.uint64(2654435761)) % np.uint64(1 << 32)).astype(np.float64)
-            thin = (pid_by_row >= 0) & (hashed >= keep_frac[np.maximum(pid_by_row, 0)] * float(1 << 32))
-            pid_by_row = np.where(thin, -1, pid_by_row)  # thinned faces stay locked, they just don't vote
-        bank_rows = np.where(pid_by_row >= 0)[0]
-        open_mask = np.max(eff_scores_by_col, axis=1) >= candidate_threshold
-        open_mask &= ~labelled_row  # labelled faces are locked / are the voters themselves
-        if locked_faces:
-            open_mask &= ~np.isin(face_ids, np.fromiter(locked_faces, dtype=np.int64, count=len(locked_faces)))
-        open_rows = np.where(open_mask & ~suppressed_auto)[0]
-        if bank_rows.size >= 2 and open_rows.size:
-            nn_rows_all, nn_sim_all = _cached_label_neighbors(
-                db, embs, face_ids, open_rows, bank_rows, min(knn_k, int(bank_rows.size) - 1)
-            )
-            cls_ids = sorted({int(x) for x in pid_by_row[bank_rows].tolist()})
-            cls_index_arr = np.full((max(cls_ids) + 2,), -1, dtype=np.int64)
-            for i_c, pid_c in enumerate(cls_ids):
-                cls_index_arr[pid_c] = i_c
-            n_cls = len(cls_ids)
-            cls_pid_arr = np.asarray(cls_ids, dtype=np.int64)
-            ignore_pids = set(state.get("ignore_person_ids", []))
-            cls_is_bg = np.asarray([pid_c in ignore_pids for pid_c in cls_ids], dtype=bool)
-            col_of_pid = {pid_c: ci for ci, pid_c in enumerate(enrolled_pids)}
-            cls_to_col = np.asarray([col_of_pid.get(pid_c, -1) for pid_c in cls_ids], dtype=np.int64)
-            n_cols = len(enrolled_pids)
-            veto_cap = np.float32(candidate_threshold - 0.01)
-            k_eff = int(nn_rows_all.shape[1])
-            bank_counts = Counter(int(x) for x in pid_by_row[bank_rows].tolist())
-            gate_pairs = [
-                (ci, int(cls_index_arr[pid_c]))
-                for ci, pid_c in enumerate(enrolled_pids)
-                if bank_counts.get(pid_c, 0) >= knn_gate_min_labels
-            ]
-            gate_cols = np.asarray([g[0] for g in gate_pairs], dtype=np.int64)
-            gate_cls = np.asarray([g[1] for g in gate_pairs], dtype=np.int64)
-            for c0 in range(0, int(open_rows.size), 8192):
-                q_rows = open_rows[c0 : c0 + 8192]
-                nn_r = nn_rows_all[c0 : c0 + 8192]
-                nn_sim = nn_sim_all[c0 : c0 + 8192]
-                valid_nn = nn_r >= 0
-                nn_pid = np.where(valid_nn, pid_by_row[np.maximum(nn_r, 0)], -1)
-                valid_nn &= nn_pid >= 0
-                nn_cls = np.where(valid_nn, cls_index_arr[np.maximum(nn_pid, 0)], 0)
-                w_nn = np.where(valid_nn, np.clip(nn_sim - 0.20, 0.0, None) ** 2, 0.0)
-                m_q = int(q_rows.shape[0])
-                flat = np.repeat(np.arange(m_q), k_eff) * n_cls + nn_cls.ravel()
-                cls_w = np.bincount(flat, weights=w_nn.ravel(), minlength=m_q * n_cls).reshape(m_q, n_cls)
-                cls_s_flat = np.full((m_q * n_cls,), -1.0, dtype=np.float32)
-                np.maximum.at(cls_s_flat, flat, np.where(valid_nn, nn_sim, -1.0).ravel().astype(np.float32))
-                cls_s = cls_s_flat.reshape(m_q, n_cls)
-                top_c = np.argmax(cls_w, axis=1)
-                ar = np.arange(m_q)
-                frac_q = (cls_w[ar, top_c] / (cls_w.sum(axis=1) + 1e-6)).astype(np.float32)
-                sim_q = cls_s[ar, top_c]
-                knn_top[q_rows] = cls_pid_arr[top_c]
-                knn_frac[q_rows] = frac_q
-                knn_sim[q_rows] = sim_q
+    pid_by_row = np.full((n_faces,), -1, dtype=np.int64)
+    for h in state["human"]:
+        if h["status"] == "confirmed" and h["emb"] is not None and h["face_id"] is not None:
+            b_pos = int(np.searchsorted(face_ids, int(h["face_id"])))
+            if b_pos < n_faces and int(face_ids[b_pos]) == int(h["face_id"]):
+                pid_by_row[b_pos] = int(h["person_id"])
+    labelled_row = pid_by_row >= 0
+    # Suspicious labels (label-consistency guard) stay locked but never vote:
+    for f_flag, p_flag in flagged_labels:
+        b_pos = int(np.searchsorted(face_ids, f_flag))
+        if b_pos < n_faces and int(face_ids[b_pos]) == f_flag and int(pid_by_row[b_pos]) == p_flag:
+            pid_by_row[b_pos] = -1
+    bank_rows = np.where(pid_by_row >= 0)[0]
+    open_mask = np.max(eff_scores_by_col, axis=1) >= candidate_threshold
+    open_mask &= ~labelled_row  # labelled faces are locked / are the voters themselves
+    if locked_faces:
+        open_mask &= ~np.isin(face_ids, np.fromiter(locked_faces, dtype=np.int64, count=len(locked_faces)))
+    open_rows = np.where(open_mask & ~suppressed_auto)[0]
+    if bank_rows.size >= 2 and open_rows.size:
+        nn_rows_all, nn_sim_all = _cached_label_neighbors(
+            db, embs, face_ids, open_rows, bank_rows, min(knn_k, int(bank_rows.size) - 1)
+        )
+        cls_ids = sorted({int(x) for x in pid_by_row[bank_rows].tolist()})
+        cls_index_arr = np.full((max(cls_ids) + 2,), -1, dtype=np.int64)
+        for i_c, pid_c in enumerate(cls_ids):
+            cls_index_arr[pid_c] = i_c
+        n_cls = len(cls_ids)
+        cls_pid_arr = np.asarray(cls_ids, dtype=np.int64)
+        ignore_pids = set(state["ignore_person_ids"])
+        cls_is_bg = np.asarray([pid_c in ignore_pids for pid_c in cls_ids], dtype=bool)
+        col_of_pid = {pid_c: ci for ci, pid_c in enumerate(enrolled_pids)}
+        cls_to_col = np.asarray([col_of_pid.get(pid_c, -1) for pid_c in cls_ids], dtype=np.int64)
+        n_cols = len(enrolled_pids)
+        veto_cap = np.float32(candidate_threshold - 0.01)
+        k_eff = int(nn_rows_all.shape[1])
+        bank_counts = Counter(int(x) for x in pid_by_row[bank_rows].tolist())
+        gate_pairs = [
+            (ci, int(cls_index_arr[pid_c]))
+            for ci, pid_c in enumerate(enrolled_pids)
+            if bank_counts.get(pid_c, 0) >= knn_gate_min_labels
+        ]
+        gate_cols = np.asarray([g[0] for g in gate_pairs], dtype=np.int64)
+        gate_cls = np.asarray([g[1] for g in gate_pairs], dtype=np.int64)
+        for c0 in range(0, int(open_rows.size), 8192):
+            q_rows = open_rows[c0 : c0 + 8192]
+            nn_r = nn_rows_all[c0 : c0 + 8192]
+            nn_sim = nn_sim_all[c0 : c0 + 8192]
+            valid_nn = nn_r >= 0
+            nn_pid = np.where(valid_nn, pid_by_row[np.maximum(nn_r, 0)], -1)
+            valid_nn &= nn_pid >= 0
+            nn_cls = np.where(valid_nn, cls_index_arr[np.maximum(nn_pid, 0)], 0)
+            w_nn = np.where(valid_nn, np.clip(nn_sim - 0.20, 0.0, None) ** 2, 0.0)
+            m_q = int(q_rows.shape[0])
+            flat = np.repeat(np.arange(m_q), k_eff) * n_cls + nn_cls.ravel()
+            cls_w = np.bincount(flat, weights=w_nn.ravel(), minlength=m_q * n_cls).reshape(m_q, n_cls)
+            cls_s_flat = np.full((m_q * n_cls,), -1.0, dtype=np.float32)
+            np.maximum.at(cls_s_flat, flat, np.where(valid_nn, nn_sim, -1.0).ravel().astype(np.float32))
+            cls_s = cls_s_flat.reshape(m_q, n_cls)
+            top_c = np.argmax(cls_w, axis=1)
+            ar = np.arange(m_q)
+            frac_q = (cls_w[ar, top_c] / (cls_w.sum(axis=1) + 1e-6)).astype(np.float32)
+            sim_q = cls_s[ar, top_c]
+            knn_top[q_rows] = cls_pid_arr[top_c]
+            knn_frac[q_rows] = frac_q
+            knn_sim[q_rows] = sim_q
 
-                # Identity veto: the labelled neighbourhood clearly says "someone else".
-                veto = (frac_q >= knn_veto_frac) & (sim_q >= knn_min_sim)
-                keep_col = cls_to_col[top_c]
-                # Background veto: closest labelled neighbour is an `ignore` (background) face.
-                if np.any(cls_is_bg):
-                    bg_s = np.max(np.where(cls_is_bg[np.newaxis, :], cls_s, -1.0), axis=1)
-                    kid_s = np.max(np.where(cls_is_bg[np.newaxis, :], -1.0, cls_s), axis=1)
-                    bg_veto = (bg_s >= knn_bg_min_sim) & (bg_s >= kid_s + 0.02)
-                    keep_col = np.where(bg_veto & ~veto, -1, keep_col)
-                    veto |= bg_veto
-                if np.any(veto):
-                    v_rows = q_rows[veto]
-                    sub = eff_scores_by_col[v_rows]
-                    capped = np.minimum(sub, veto_cap)
-                    keep_mask = np.arange(n_cols)[np.newaxis, :] == keep_col[veto][:, np.newaxis]
-                    eff_scores_by_col[v_rows] = np.where(keep_mask, sub, capped)
+            # Identity veto: the labelled neighbourhood clearly says "someone else".
+            veto = (frac_q >= knn_veto_frac) & (sim_q >= knn_min_sim)
+            keep_col = cls_to_col[top_c]
+            # Background veto: closest labelled neighbour is an `ignore` (background) face.
+            if np.any(cls_is_bg):
+                bg_s = np.max(np.where(cls_is_bg[np.newaxis, :], cls_s, -1.0), axis=1)
+                kid_s = np.max(np.where(cls_is_bg[np.newaxis, :], -1.0, cls_s), axis=1)
+                bg_veto = (bg_s >= knn_bg_min_sim) & (bg_s >= kid_s + 0.02)
+                keep_col = np.where(bg_veto & ~veto, -1, keep_col)
+                veto |= bg_veto
+            if np.any(veto):
+                v_rows = q_rows[veto]
+                sub = eff_scores_by_col[v_rows]
+                capped = np.minimum(sub, veto_cap)
+                keep_mask = np.arange(n_cols)[np.newaxis, :] == keep_col[veto][:, np.newaxis]
+                eff_scores_by_col[v_rows] = np.where(keep_mask, sub, capped)
 
-                # Weak-match gate: a borderline match (below `auto_high + 0.05`) for a well-labelled child
-                # is dropped when that child gets < `knn_gate_frac` of the labelled-neighbour vote while
-                # the vote clearly points at someone else. This stops faces of other (or not-yet-eligible)
-                # kids from piling into one child's queue just because she is the "least bad" option.
-                if gate_cols.size:
-                    other_top = sim_q >= knn_min_sim
-                    frac_cols = (cls_w[:, gate_cls] / (cls_w.sum(axis=1, keepdims=True) + 1e-6)).astype(np.float32)
-                    sub_g = eff_scores_by_col[np.ix_(q_rows, gate_cols)]
-                    top_is_col = top_c[:, np.newaxis] == gate_cls[np.newaxis, :]
-                    gate_hit = (
-                        other_top[:, np.newaxis]
-                        & ~top_is_col
-                        & (frac_cols < knn_gate_frac)
-                        & (sub_g >= candidate_threshold)
-                        & (sub_g < np.float32(auto_high_threshold + 0.05))
-                    )
-                    if np.any(gate_hit):
-                        eff_scores_by_col[np.ix_(q_rows, gate_cols)] = np.where(gate_hit, veto_cap, sub_g)
+            # Weak-match gate: a borderline match (below `auto_high + 0.05`) for a well-labelled child
+            # is dropped when that child gets < `knn_gate_frac` of the labelled-neighbour vote while
+            # the vote clearly points at someone else. This stops faces of other (or not-yet-eligible)
+            # kids from piling into one child's queue just because she is the "least bad" option.
+            if gate_cols.size:
+                other_top = sim_q >= knn_min_sim
+                frac_cols = (cls_w[:, gate_cls] / (cls_w.sum(axis=1, keepdims=True) + 1e-6)).astype(np.float32)
+                sub_g = eff_scores_by_col[np.ix_(q_rows, gate_cols)]
+                top_is_col = top_c[:, np.newaxis] == gate_cls[np.newaxis, :]
+                gate_hit = (
+                    other_top[:, np.newaxis]
+                    & ~top_is_col
+                    & (frac_cols < knn_gate_frac)
+                    & (sub_g >= candidate_threshold)
+                    & (sub_g < np.float32(auto_high_threshold + 0.05))
+                )
+                if np.any(gate_hit):
+                    eff_scores_by_col[np.ix_(q_rows, gate_cols)] = np.where(gate_hit, veto_cap, sub_g)
 
     _tick("knn")
     neg_mat_cache: dict[int, NDArray[np.float32] | None] = {}
@@ -1458,7 +1426,7 @@ def recompute_active_matching(
         by_photo[p_id].append((score, fid, pid, r_idx, c_idx))
 
     n_enr_cols = len(enrolled_pids)
-    promote_min = auto_high_threshold - 0.05 if knn_promote_min_score is None else float(knn_promote_min_score)
+    promote_min = auto_high_threshold - 0.05
     auto_assignments: list[tuple[int, int, int, AssignmentStatus, float, AssignmentSource]] = []
     for p_id, candidates in by_photo.items():
         if len(candidates) > 1:
@@ -1482,33 +1450,30 @@ def recompute_active_matching(
                     )
                     if (score - runner_up) >= 0.06:
                         src_kind = "album_cohesion"
-            if knn_enabled:
-                trusts = status == "auto_high" and _knn_trusts(r_idx, pid, False)
-                band_trusts = trusts and (
-                    score >= auto_band_knn_upper or float(knn_sim[r_idx]) >= auto_band_knn_min_sim
-                )
-                if status == "auto_high" and not band_trusts and (
-                    score < auto_band_knn_upper
-                    or (src_kind == "album_cohesion" and album_cohesion_require_knn)
-                ):
-                    # Calibration band: human decisions at these scores are wrong ~1 in 5 times,
-                    # so only auto-accept when the labelled neighbourhood agrees; else ask.
-                    status = "candidate"
-                    src_kind = "model_match"
-                elif trusts and src_kind != "album_cohesion":
-                    src_kind = "model_trusted"
-                elif (
-                    status == "candidate"
-                    and score >= promote_min
-                    and float(knn_sim[r_idx]) >= auto_band_knn_min_sim
-                    and _knn_trusts(r_idx, pid, True)
-                ):
-                    status = "auto_high"
-                    src_kind = "model_trusted"
+            trusts = status == "auto_high" and _knn_trusts(r_idx, pid, False)
+            band_trusts = trusts and (
+                score >= auto_band_knn_upper or float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+            )
+            if status == "auto_high" and not band_trusts and score < auto_band_knn_upper:
+                # Calibration band: human decisions at these scores are wrong ~1 in 5 times,
+                # so only auto-accept when the labelled neighbourhood agrees; else ask.
+                status = "candidate"
+                src_kind = "model_match"
+            elif trusts and src_kind != "album_cohesion":
+                src_kind = "model_trusted"
+            elif (
+                status == "candidate"
+                and score >= promote_min
+                and float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+                and _knn_trusts(r_idx, pid, True)
+            ):
+                status = "auto_high"
+                src_kind = "model_trusted"
             auto_assignments.append((p_id, pid, fid, status, score, src_kind))
     _tick("assign")
 
     result = db.replace_model_assignments(auto_assignments, chosen_anchor_face_ids)
+    db.set_label_outliers(flagged_labels)
     _tick("write")
     if diagnostics is not None:
         diagnostics.update(
@@ -1520,5 +1485,6 @@ def recompute_active_matching(
             knn_frac=knn_frac,
             knn_sim=knn_sim,
             assignments=auto_assignments,
+            flagged_labels=flagged_labels,
         )
     return result

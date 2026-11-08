@@ -420,6 +420,22 @@ def _m5_enum_validation(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
+def _m6_label_keeps(conn: sqlite3.Connection) -> None:
+    """`label_keeps`: confirmed labels the user reviewed and kept although the label-consistency
+    guard flagged them as suspicious (see `faces/label_guard.py`); they count as normal anchors /
+    kNN voters again."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS label_keeps (
+            face_id INTEGER NOT NULL REFERENCES faces(face_id) ON DELETE CASCADE,
+            person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
+            kept_at TEXT NOT NULL,
+            PRIMARY KEY (face_id, person_id)
+        )
+        """
+    )
+
+
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -428,6 +444,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (3, "ignore_role_repair", _m3_ignore_role_repair),
     (4, "content_hash_and_face_refs", _m4_content_hash_and_face_refs),
     (5, "enum_validation_triggers", _m5_enum_validation),
+    (6, "label_keeps", _m6_label_keeps),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

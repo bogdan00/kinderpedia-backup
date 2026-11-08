@@ -1144,6 +1144,16 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self.ctx.truncated_person_clusters(entry, max(0, faces_limit)))
             return
 
+        # --- Suspicious labels (label-consistency guard, faces/label_guard.py) ---------------------
+        if path.startswith("/api/people/") and path.endswith("/suspicious"):
+            pid_str = path[len("/api/people/") : -len("/suspicious")]
+            if not pid_str.isdigit():
+                self._send_json({"error": "Invalid person id."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(self.ctx.db.get_suspicious_labels(int(pid_str)))
+            return
+        # --- end suspicious labels ----------------------------------------------------------------
+
         if path == "/api/jobs":
             self._send_json({"jobs": self.ctx.list_jobs()})
             return
@@ -1498,6 +1508,19 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+
+        # --- Suspicious labels: keep (reviewed-OK) -------------------------------------------------
+        if path.startswith("/api/people/") and "/suspicious/" in path and path.endswith("/keep"):
+            pid_str, _, fid_str = path[len("/api/people/") : -len("/keep")].partition("/suspicious/")
+            if not (pid_str.isdigit() and fid_str.isdigit()):
+                self._send_json({"error": "Invalid person or face id."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            kept = self.ctx.db.keep_label(person_id=int(pid_str), face_id=int(fid_str))
+            ov = self.ctx.db.get_archive_overview()
+            self.ctx.schedule_rematch()
+            self._send_json({**kept, "overview": ov, "rematch_scheduled": True})
+            return
+        # --- end suspicious labels ----------------------------------------------------------------
 
         if path.startswith("/api/people/") and path.endswith("/cluster-action"):
             pid = int(path[len("/api/people/") : -len("/cluster-action")])

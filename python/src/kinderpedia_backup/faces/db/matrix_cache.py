@@ -229,7 +229,8 @@ class MatrixCacheMixin(PeopleMixin):
             }
 
     def load_anchors_and_negatives(self, *, dim: int = 512) -> dict[str, Any]:
-        """Load active people, reference seeds, human-confirmed faces, and hard-negative rejected faces."""
+        """Load active people, reference seeds, human decisions (confirmed / rejected / unsure faces),
+        background (`ignore`) person ids, cluster pressure and reviewed-OK labels (`label_keeps`)."""
         with self._faces_matrix_lock:
             cached_mat = (
                 self._faces_matrix_cache
@@ -255,6 +256,10 @@ class MatrixCacheMixin(PeopleMixin):
                 int(r["person_id"])
                 for r in self._conn.execute("SELECT person_id FROM people WHERE role = 'ignore'").fetchall()
             ]
+            label_keeps = {
+                (int(r["face_id"]), int(r["person_id"]))
+                for r in self._conn.execute("SELECT face_id, person_id FROM label_keeps").fetchall()
+            }
             if cached_mat is not None:
                 human_rows = self._conn.execute(
                     """
@@ -374,6 +379,7 @@ class MatrixCacheMixin(PeopleMixin):
             ],
             "human": human_items,
             "ignore_person_ids": ignore_ids,
+            "label_keeps": label_keeps,
             "pressure": [
                 {
                     "person_id": int(r["person_id"]),

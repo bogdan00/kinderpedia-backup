@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ..label_guard import LABEL_OUTLIER_MIN_FACES, LABEL_OUTLIER_MIN_SIM, label_outlier_mask
 from ..models import (
     BoundingBox,
 )
@@ -309,6 +310,11 @@ class QueriesUIMixin(ClustersMixin):
             ).fetchone()
             people_list = self.list_people()
             classes_list = self.list_classes()
+            suspicious_by_pid: dict[int, int] = {}
+            for _fid, s_pid in self._label_outliers:
+                suspicious_by_pid[s_pid] = suspicious_by_pid.get(s_pid, 0) + 1
+            for person in people_list:
+                person["suspicious_count"] = suspicious_by_pid.get(int(person["person_id"]), 0)
 
         photos_total = int(photo_summary["photos_total"])
         faces_total = int(photo_summary["faces_total"])
@@ -324,6 +330,92 @@ class QueriesUIMixin(ClustersMixin):
             "people": people_list,
             "classes": classes_list,
         }
+
+    def set_label_outliers(self, flagged: set[tuple[int, int]]) -> None:
+        """Remember the `(face_id, person_id)` labels the last rematch flagged as suspicious
+        (feeds `people[].suspicious_count` in the overview without recomputing the guard)."""
+        self._label_outliers = set(flagged)
+
+    def get_suspicious_labels(
+        self,
+        person_id: int,
+        *,
+        min_sim: float = LABEL_OUTLIER_MIN_SIM,
+        min_faces: int = LABEL_OUTLIER_MIN_FACES,
+    ) -> dict[str, Any]:
+        """
+        Confirmed labels of `person_id` the label-consistency guard flags (see `faces/label_guard.py`):
+        per year with >= `min_faces` confirmed faces, those whose best similarity to the person's
+        other confirmed faces that year is < `min_sim`, excluding labels kept via `keep_label()`.
+        Sorted by `max_same_person_sim` ascending (most suspicious first). Background (`ignore`)
+        profiles are never checked. Computed fresh from the current labels.
+        """
+        with self._lock:
+            p_row = self._conn.execute(
+                "SELECT role FROM people WHERE person_id = ?", (person_id,)
+            ).fetchone()
+            if p_row is None:
+                raise KeyError(f"Person {person_id} not found.")
+            rows = (
+                self._conn.execute(
+                    """
+                    SELECT
+                        a.face_id, a.photo_id, a.source,
+                        p.year, p.archive_child, p.album_leaf, p.album_title, p.album_date, p.filename,
+                        (k.face_id IS NOT NULL) AS kept
+                    FROM assignments a
+                    JOIN faces f ON f.face_id = a.face_id AND f.is_manual = 0
+                    JOIN photos p ON p.photo_id = a.photo_id
+                    LEFT JOIN label_keeps k ON k.face_id = a.face_id AND k.person_id = a.person_id
+                    WHERE a.person_id = ? AND a.status = 'confirmed'
+                    ORDER BY a.face_id
+                    """,
+                    (person_id,),
+                ).fetchall()
+                if str(p_row["role"]) != "ignore"
+                else []
+            )
+        items: list[dict[str, Any]] = []
+        if rows:
+            mat = self.load_all_faces_matrix()
+            m_fids: NDArray[np.int64] = mat["face_ids"]
+            m_embs: NDArray[np.float32] = mat["embeddings"]
+            q_fids = np.asarray([int(r["face_id"]) for r in rows], dtype=np.int64)
+            pos = np.searchsorted(m_fids, q_fids)
+            ok = (pos < m_fids.shape[0]) & (m_fids[np.minimum(pos, max(0, m_fids.shape[0] - 1))] == q_fids)
+            by_year: dict[int, list[int]] = {}
+            for i, r in enumerate(rows):
+                if bool(ok[i]):
+                    y_str = str(r["year"])
+                    by_year.setdefault(int(y_str) if y_str.isdigit() and len(y_str) == 4 else 0, []).append(i)
+            for _yr, idxs in sorted(by_year.items()):
+                if len(idxs) < max(2, min_faces):
+                    continue
+                mask, best, nearest = label_outlier_mask(
+                    m_embs[pos[np.asarray(idxs, dtype=np.int64)]], min_sim=min_sim, min_faces=min_faces
+                )
+                for loc, i in enumerate(idxs):
+                    r = rows[i]
+                    if not bool(mask[loc]) or bool(r["kept"]):
+                        continue
+                    items.append(
+                        {
+                            "face_id": int(r["face_id"]),
+                            "photo_id": int(r["photo_id"]),
+                            "year": str(r["year"]),
+                            "source": str(r["source"]),
+                            "max_same_person_sim": round(float(best[loc]), 4),
+                            "nearest_face_id": int(rows[idxs[int(nearest[loc])]]["face_id"]),
+                            "year_confirmed_count": len(idxs),
+                            "archive_child": str(r["archive_child"]),
+                            "album_leaf": str(r["album_leaf"]),
+                            "album_title": str(r["album_title"] or r["album_leaf"]),
+                            "album_date": str(r["album_date"] or ""),
+                            "filename": str(r["filename"]),
+                        }
+                    )
+        items.sort(key=lambda it: (float(it["max_same_person_sim"]), int(it["face_id"])))
+        return {"person_id": person_id, "min_sim": min_sim, "min_faces": min_faces, "items": items}
 
     def get_person_peers(self, person_id: int, *, limit: int = 5) -> list[dict[str, Any]]:
         """Return the top co-occurring named peers for `person_id` across small/medium confirmed photos."""

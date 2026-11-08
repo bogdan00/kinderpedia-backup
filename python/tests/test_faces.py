@@ -1775,11 +1775,6 @@ class FacesPipelineTests(unittest.TestCase):
                     (saved[idx][0], leo),
                 ).fetchone()
 
-            recompute_active_matching(db, knn_enabled=False)
-            off_bg = row_of(41)
-            self.assertIsNotNone(off_bg)
-            self.assertEqual(str(off_bg["status"]), "auto_high")  # heuristic alone mis-tags background
-
             recompute_active_matching(db)
             on_leo = row_of(40)
             self.assertEqual((str(on_leo["status"]), str(on_leo["source"])), ("auto_high", "model_trusted"))

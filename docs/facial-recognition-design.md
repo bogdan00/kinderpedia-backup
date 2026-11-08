@@ -1,7 +1,7 @@
 # Local Facial Recognition, All-Classroom Index & Active-Learning Web UI — Design Doc
 
 **Status:** Implemented (`python/src/kinderpedia_backup/faces/`)  
-**Scope:** Offline SCRFD + ArcFace ONNX inference (`onnxruntime` or OpenCV `cv2.dnn`), per-year classroom clustering, `<20ms` non-blocking active-learning Web UI with Server-Sent Events (SSE), unified lightbox navigation, manual occluded-child bounding-box tagging, year-windowed sibling guard, hard-negative lookalike suppression, same-album outfit cohesion, social peer co-occurrence, flat hardlink materialization, and provenance-rich Kinderpedia URL export. *(Photos only in v1.)*
+**Scope:** Offline SCRFD + ArcFace ONNX inference (`onnxruntime`), per-year classroom clustering, `<20ms` non-blocking active-learning Web UI with Server-Sent Events (SSE), unified lightbox navigation, manual occluded-child bounding-box tagging, year-windowed sibling guard, hard-negative lookalike suppression, same-album outfit cohesion, social peer co-occurrence, flat hardlink materialization, and provenance-rich Kinderpedia URL export. *(Photos only in v1.)*
 
 ---
 
@@ -38,7 +38,7 @@ flowchart TD
     end
 
     subgraph Stage1["Stage 1: Batch Scan (kinderpedia-backup faces scan)"]
-        ONNX["SCRFD-10GF + 5-Pt Umeyama + ArcFace R50 ONNX\n(onnxruntime or OpenCV cv2.dnn backend, Python 3.10-3.15+)"]
+        ONNX["SCRFD-10GF + 5-Pt Umeyama + ArcFace R50 ONNX\n(onnxruntime: CoreML / CUDA / CPU, Python 3.10-3.14)"]
         THUMBS["Sharded Face Crop Cache (Metadata/face_thumbs/00..ff/*.jpg)"]
         CLUST["Per-(Classroom, Year) Cosine Graph Clustering"]
     end
@@ -93,8 +93,8 @@ flowchart TD
 
 ## 3. Child-Matching Intelligence Layers
 
-1. **Dual-Runtime SCRFD-10GF + ArcFace ResNet-50 ONNX (`Python 3.10–3.15+`):**
-   - Runs `det_10g.onnx` + 5-point Umeyama similarity alignment + `w600k_r50.onnx` via `onnxruntime` (`CUDA` / `CoreML` / `CPU`) with automatic fallback to OpenCV's C++ SIMD engine (`cv2.dnn.readNetFromONNX` from `opencv-python-headless`).
+1. **SCRFD-10GF + ArcFace R50 on ONNX Runtime (Python 3.10–3.14):**
+   - Runs `det_10g.onnx` + 5-point Umeyama similarity alignment + `w600k_r50.onnx` via `onnxruntime` (`CUDA` / `CoreML` / `CPU`).
    - Quality gate (`det_score >= 0.55` and `min(width, height) >= 28 px`) filters out classroom wall posters, cartoons, and dolls.
 2. **Multi-Epoch Diverse Pose Anchors:**
    - Selects up to `max_anchors_per_year = 8` pose-diverse confirmed exemplars per `(person, year)` (`cos_sim < 0.88` diversity preference) rather than averaging toddler and preschool faces into a single blurry centroid.
@@ -122,6 +122,12 @@ flowchart TD
    - **Trust:** if ≥ 90% of the vote agrees with the matcher's `auto_high` pick (and the face is not closer to one of that child's rejected faces), the match is stored as `source = 'model_trusted'` and skips manual review (counted with album-cohesion autos). Candidates with ≥ 95% agreement are promoted.
    - Neighbour lists are cached across rematches and updated incrementally (new labels merged with one small SGEMM), so the warm rematch costs ~3 s; the cold build (~25 s) runs once in the background at `faces ui` start.
    - Holdout on the real archive (20% of labels hidden): wrong auto-tags on hidden confirmed faces 138 → 33, background faces auto-tagged to a child 276 → 111, review queue 40.4k → 27.5k while trusted matches rose 9.1k → 15.8k (≈ 0.3% wrong among trusted).
+8b2. **Label-Consistency Guard (suspicious confirmed labels) — always on:**
+    - Per `(person, year)` with `>= 8` confirmed faces, a confirmed label whose best cosine similarity to any *other* confirmed face of that person-year is `< 0.40` is *suspicious* (`faces/label_guard.py`; background `ignore` profiles are never checked).
+    - A suspicious label keeps its tag and stays locked (the user decides), but is **never positive evidence**: not a per-year anchor, not an album-cohesion or temporal (±3 days) anchor, and **not a kNN voter** (it is removed from the voter bank). One wrong bulk confirm therefore cannot pull its look-alikes into a child's gallery or vote for them.
+    - Review: `GET /api/people/<pid>/suspicious` lists them (most suspicious first); **Keep** (`POST /api/people/<pid>/suspicious/<face_id>/keep`, stored in `label_keeps`, schema v6) marks a label reviewed-OK so it counts as a normal anchor / voter again; **Untag** uses the existing `POST /api/faces/untag` (face-scoped negative).
+    - Why it is on: label hygiene, **not** a measured accuracy gain. On the stratified 5-fold hidden-label replay (2 seeds) every guard setting ties with the guard off (precision 96.36 ± 0.11 %, recall 67.65 ± 0.12 %; the chosen setting costs 7 of ~38k correct auto-accepts). On this archive it flags 17 of ~28k labels; a spot check found them to be mostly unusable biometric references (back of head, masks, hats + sunglasses, blur, a rotated group selfie) and 5 plausible hard poses — exactly the faces one does not want as anchors or voters. Replay table, spot check and the exact command: `docs/faces-handover.md` §10.
+    - The kNN neighbour cache keeps 8 spare neighbours per row, so removing voters (untag, guard) stays exact without a cold rebuild.
 8c. **Weak-Match Gate & Same-Album Absence:**
    - Borderline matches (below `auto_high + 0.05`) for a child with ≥ 25 labelled faces are dropped when that child gets < 30% of the labelled-neighbour vote while another identity tops it, so faces of non-eligible or unenrolled kids stop piling into the "least bad" child's queue.
    - In albums where a child is already confirmed, borderline faces whose best similarity to her confirmed faces *from that same album* is < 0.40 are dropped (genuine same-day matches score ~0.7–0.9; measured: 7% of individually confirmed matches fall below 0.40 vs. ~85% of the leftover queue).
@@ -137,6 +143,62 @@ flowchart TD
 
 ---
 
+### Calibration: hidden-label replay (`python -m kinderpedia_backup.faces.evaluate`)
+
+Matcher thresholds and the guard are calibrated offline on a **copy** of the index (the tool copies the DB with the SQLite backup API first and refuses a `Metadata/faces_index.sqlite` path unless `--i-know-this-is-a-copy`). Protocol (also in `--help`):
+
+1. Decision units are faces carrying human decisions (confirms of every source, batch rejects, untag / reassign negatives, unsure). Truth = confirmed person; rejected persons are known negatives.
+2. Faces are stratified by `(kind, person, year)` with kind = `cluster` (cluster_confirm, ~88 % of faces) or `batch`, shuffled with a fixed seed and dealt into k = 5 folds, so each fold hides a matching share of batch decisions **and** of bulk cluster confirms of every person-year.
+3. Per fold, all human decisions on the fold's faces are removed (plus pressure / keep marks, `suppress_auto` cleared), the matcher re-scores, and only hidden faces are scored: auto-accept precision (wrong = other person, background face or hidden rejection), recall, per score band / channel, background faces auto-tagged, hidden rejections re-accepted, flagged-label count, and the human reject rate per score band (threshold check).
+4. Mean over folds × seeds ± SE; deltas vs the guard-off baseline are paired per replicate. Selection: a cell is non-losing if its paired precision delta is within one SE **or** its 95 % Wilson interval overlaps the baseline's; among non-losing cells the highest recall wins, ties go to the simpler cell (lower `min_faces`, then lower `min_sim`). When everything ties (as for the guard), the shipped values are picked by flagged-set quality (spot check).
+
+The full grid (25 cells × 10 replicates) runs in ~15 min on the 122k-face archive (score matrix and kNN neighbour lists are reused across grid cells of a fold); the default run (current policy + baseline, 5 folds) takes ~3.5 min (200 s measured).
+
+**Guard grid replay** (stratified 5-fold × seeds 1, 2 = 10 replicates, ≈ 6,313 hidden faces per replicate out of 31,568 decision faces; ± = SE over replicates; Δ paired vs guard-off; `det_penalty` 0 / 0.05 / 0.10 gave **bit-identical** results in every cell, so that knob was removed and is not shown):
+
+| cell | precision % (mean ± SE) | recall % (mean ± SE) | Δprecision pp (paired) | Δrecall pp (paired) | P / R % seed 1; seed 2 | auto ok / wrong | flagged labels / fold | verdict |
+|---|---|---|---|---|---|---|---|---|
+| guard-off (baseline) | 96.36 ± 0.11 | 67.65 ± 0.12 | - | - | 96.30 / 67.67; 96.42 / 67.63 | 37959 / 1435 | 0.0 | baseline |
+| sim=0.25 faces=4 | 96.36 ± 0.11 | 67.65 ± 0.12 | +0.000 ± 0.000 | +0.000 ± 0.000 | 96.30 / 67.67; 96.42 / 67.63 | 37959 / 1435 | 2.4 | tie |
+| sim=0.25 faces=8 | 96.36 ± 0.11 | 67.65 ± 0.12 | +0.000 ± 0.000 | +0.000 ± 0.000 | 96.30 / 67.67; 96.42 / 67.63 | 37959 / 1435 | 1.8 | tie |
+| sim=0.30 faces=4 | 96.36 ± 0.11 | 67.65 ± 0.12 | +0.000 ± 0.000 | +0.000 ± 0.000 | 96.30 / 67.67; 96.42 / 67.63 | 37959 / 1435 | 5.4 | tie |
+| sim=0.30 faces=8 | 96.36 ± 0.11 | 67.65 ± 0.12 | +0.000 ± 0.000 | +0.000 ± 0.000 | 96.30 / 67.67; 96.42 / 67.63 | 37959 / 1435 | 2.7 | tie |
+| sim=0.35 faces=4 | 96.36 ± 0.11 | 67.65 ± 0.12 | -0.000 ± 0.000 | -0.004 ± 0.002 | 96.30 / 67.67; 96.42 / 67.62 | 37957 / 1435 | 9.6 | tie |
+| sim=0.35 faces=8 | 96.36 ± 0.11 | 67.65 ± 0.12 | -0.000 ± 0.000 | -0.002 ± 0.002 | 96.30 / 67.67; 96.42 / 67.63 | 37958 / 1435 | 5.3 | tie |
+| sim=0.40 faces=4 | 96.36 ± 0.11 | 67.64 ± 0.12 | -0.001 ± 0.000 | -0.014 ± 0.006 | 96.30 / 67.66; 96.42 / 67.61 | 37951 / 1435 | 19.8 | tie |
+| sim=0.40 faces=8 | 96.36 ± 0.11 | 67.64 ± 0.12 | -0.001 ± 0.000 | -0.012 ± 0.007 | 96.30 / 67.66; 96.42 / 67.61 | 37952 / 1435 | 13.3 | tie |
+
+All cells tie with the guard off (the 95 % Wilson intervals overlap; the largest effect is −7 correct auto-accepts out of ~38k at `min_sim = 0.40`). The guard is enabled for **label hygiene** (keeping unusable or wrong labels out of the anchors and the kNN voter bank, and surfacing them for review), **not** for a measured accuracy gain.
+
+**Choice of `min_sim` = 0.40, `min_faces` = 8 (flagged-set quality).** Flagged labels on the full archive copy (person-years with ≥ 4 / ≥ 8 confirmed faces): `min_sim` 0.25 → 3 / 2, 0.30 → 7 / 5, 0.35 → 11 / 9, 0.40 → 19 / 17. Spot check of every face flagged at 0.40 (thumbnail vs its nearest same-person face; ids only):
+
+| face_id | person_id | year | person-year faces | max sim to same person | verdict |
+|---|---|---|---|---|---|
+| 79145 | 21 | 2025 | 4 | 0.082 | top of head, no face — unusable (only flagged with `min_faces` 4) |
+| 99010 | 4 | 2026 | 153 | 0.210 | back of head — unusable |
+| 99166 | 3 | 2026 | 40 | 0.224 | head down, face hidden — unusable |
+| 97443 | 21 | 2026 | 8 | 0.257 | upside-down group selfie, several faces in the box — unusable |
+| 504 | 3 | 2026 | 40 | 0.260 | profile with another child filling the crop — unusable |
+| 37105 | 28 | 2023 | 6 | 0.268 | looking down — plausible pose, false flag (only with `min_faces` 4) |
+| 96179 | 21 | 2026 | 8 | 0.292 | sun hat, squinting — plausible pose, false flag |
+| 96183 | 3 | 2026 | 40 | 0.310 | looking down / away — plausible pose, false flag |
+| 98929 | 4 | 2026 | 153 | 0.313 | face behind a mask — occluded |
+| 36309 | 9 | 2023 | 8 | 0.339 | frontal, plausible — false flag |
+| 96187 | 1 | 2026 | 190 | 0.350 | cap brim hides the face — unusable |
+| 96181 | 22 | 2026 | 118 | 0.382 | hat + sunglasses — occluded |
+| 96907 | 1 | 2026 | 190 | 0.383 | heavy blur — unusable |
+| 66874 | 33 | 2024 | 26 | 0.390 | leaf covering the face — occluded |
+| 98019 | 1 | 2026 | 190 | 0.391 | small rotated face unlike the nearest one — unusable / possible mislabel |
+| 98927 | 1 | 2026 | 190 | 0.392 | face behind a mask — occluded |
+| 98537 | 21 | 2026 | 8 | 0.395 | looking down — plausible pose, false flag |
+| 96502 | 21 | 2026 | 8 | 0.396 | blurred — unusable |
+| 65510 | 1 | 2024 | 2773 | 0.398 | crying, low resolution — plausible, false flag |
+
+At `min_faces` 8 / `min_sim` 0.40: 12 of 17 flags are unusable or occluded references (one possible mislabel), 5 are plausible hard poses (a false flag costs one "Keep" click); every lower `min_sim` is a subset with the same character, so the largest value whose set is still predominantly unusable/wrong (0.40) was taken. No clear "different child" mislabel was found — this archive's labels are clean; the guard mostly catches faces that should never be biometric references. `min_faces` 8 over 4: the two extra flags at 4 come from person-years with 4 and 6 faces (one right, one wrong) — too few references to judge "looks like none of the others" (8 person-years have 4–7 faces; 19 have fewer than 4 and are never checked). Note person 21 / 2026 has exactly 8 faces and 4 flags (2 unusable, 2 poses): small person-years remain the noisiest.
+
+
+---
+
 ## 4. Persistent Provenance & Categorization Schema (`Metadata/faces_index.sqlite`)
 
 - **`photos`**: `photo_id`, `rel_path`, `archive_child`, `year`, `month`, `album_leaf`, `kinderpedia_album_id`, `album_title`, `album_date`, `classroom_groups`, `kinderpedia_image_id`, `seq_in_album`, `image_dateadd`, `best_live_url`, `download_url`, `fullsize_url`, `thumb_url`, `width`, `height`, `file_size`, `mtime_ns`, `detector_id`, `face_count`, `scanned_at`.
@@ -148,6 +210,7 @@ flowchart TD
 - **`reference_seeds`**: `seed_id`, `person_id`, `source_key`, `anchor_year`, `embedding_f16`, `created_at`.
 - **`clusters`**: `cluster_id`, `archive_child`, `year`, `person_id`, `medoid_face_id`, `sample_face_ids_json`, `face_count`, `photo_count`, `suggested_person_id`, `suggested_similarity`.
 - **`assignments`**: `(photo_id, person_id)` PK, `face_id`, `status` (`confirmed` | `auto_high` | `candidate` | `unsure` | `rejected`), `source` (`avatar_seed` | `reference_file` | `cluster_confirm` | `batch_approve` | `manual_tag` | `model_match` | `album_cohesion` | `reassigned`), `similarity`, `is_anchor`, `updated_at`.
+- **`label_keeps`** (schema v6): `(face_id, person_id)` PK (both `ON DELETE CASCADE`), `kept_at` — confirmed labels reviewed and kept although the label-consistency guard flagged them.
 - **`person_assignment_counts`**: Trigger-maintained per-person summary table (`confirmed_count`, `auto_high_count`, `album_cohesion_count`, `candidate_count`, `unsure_count`, `rejected_count`, `categorized_face_count`) kept atomically in sync via `AFTER INSERT / UPDATE / DELETE` SQLite triggers on `assignments`.
 
 ---
