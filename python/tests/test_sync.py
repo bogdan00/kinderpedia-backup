@@ -158,7 +158,7 @@ class SyncHelpersTests(unittest.TestCase):
             client.rate_ctrl = AdaptiveRateController(state_dir / "rate.json")
 
             def fake_list_albums(
-                kg_id: int, child_id: int, *, partial_file: Path | None = None
+                kg_id: int, child_id: int, *, partial_file: Path | None = None, known: Any = None
             ) -> list[dict[str, Any]]:
                 items = [{"id": 555, "name": "Summer Fest", "date": "2025-06-12", "count_images": 2}]
                 if partial_file is not None:
@@ -167,12 +167,12 @@ class SyncHelpersTests(unittest.TestCase):
                 return items
 
             def fake_list_videos(
-                kg_id: int, child_id: int, *, partial_file: Path | None = None
+                kg_id: int, child_id: int, *, partial_file: Path | None = None, known_ids: Any = None
             ) -> list[dict[str, Any]]:
                 return [{"id": 777, "name": "Song", "date": "2025-06-12", "url": "https://cdn.kinderpedia.co/v.mp4"}]
 
             def fake_list_docs(
-                kg_id: int, child_id: int, *, partial_file: Path | None = None
+                kg_id: int, child_id: int, *, partial_file: Path | None = None, known_ids: Any = None
             ) -> list[dict[str, Any]]:
                 return [{"id": 888, "name": "Weekly Menu.pdf", "extension": ".pdf", "url": "https://cdn.kinderpedia.co/m.pdf", "size": 120}]
 
@@ -248,7 +248,8 @@ class SyncHelpersTests(unittest.TestCase):
             self.assertTrue(album_meta["completed"])
             self.assertEqual(album_meta["photo_count"], 2)
 
-            # 4. Second run (simulating Bookmarklet <-> Python cross-resume) makes 0 API/download calls!
+            # 4. Second run (simulating Bookmarklet <-> Python cross-resume): one incremental listing
+            #    check, but zero manifest fetches and zero downloads.
             client.list_albums.reset_mock()
             client.get_album_images.reset_mock()
             client.download_with_fallbacks.reset_mock()
@@ -258,7 +259,8 @@ class SyncHelpersTests(unittest.TestCase):
             self.assertEqual(stats2.photos_skipped_existing, 2)
             self.assertEqual(stats2.videos_skipped_existing, 1)
             self.assertEqual(stats2.documents_skipped_existing, 1)
-            client.list_albums.assert_not_called()
+            client.list_albums.assert_called_once()
+            self.assertIn("known", client.list_albums.call_args.kwargs)
             client.get_album_images.assert_not_called()
             client.download_with_fallbacks.assert_not_called()
 

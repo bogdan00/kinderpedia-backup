@@ -18,7 +18,8 @@ from typing import Any, Protocol
 from ..console import LiveProgress, log
 from ..models import ChildBackupStats, ChildContext
 from ..security import ensure_within_directory, redact_secrets, scrub_metadata, write_json_atomic
-from .client import WEB_API_BASE, KinderpediaClient
+from .client import WEB_API_BASE, AuthExpiredError, KinderpediaClient, album_listing_signature
+from .folder_map import FOLDER_MAP_FILE, FolderMap, load_folder_map, rebuild_folder_map, save_folder_map
 from .naming import (
     assign_album_folder_names,
     parse_date_prefix,
@@ -30,6 +31,11 @@ from .rate_limit import AdaptiveRateController
 
 _ALLOWED_IMAGE_EXTS = frozenset({"jpg", "jpeg", "png", "webp", "heic", "gif", "mp4", "mov"})
 _NUMBERED_PHOTO_RE = re.compile(r"^\d{3}_")
+_NUMBERED_PHOTO_SPLIT_RE = re.compile(r"^(\d{3,})_(.+)$")
+_LEGACY_PART_RE = re.compile(r"\.\d+\.\d+\.part(?:\.mp4)?$")
+_RESUMABLE_PART_RE = re.compile(r"\.[0-9a-f]{10}\.part$")
+RESUMABLE_PART_MAX_AGE_S = 7 * 24 * 3600
+DOCUMENTS_INDEX_MAX_AGE_S = 24 * 3600
 
 
 class _IndexFetcher(Protocol):
@@ -42,22 +48,56 @@ class _IndexFetcher(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
-def cleanup_stale_parts(root_dir: Path) -> int:
-    """Delete incomplete .part / .part.mp4 files left by interrupted runs."""
+def cleanup_stale_parts(root_dir: Path, *, resumable_max_age_s: float = RESUMABLE_PART_MAX_AGE_S) -> int:
+    """
+    Delete incomplete temporary files left by interrupted runs.
+
+    Resumable download partials (`<name>.<10-hex>.part`, see `client._resumable_part_path`) are kept
+    so the next run continues them with an HTTP `Range` request, unless older than
+    `resumable_max_age_s`. PID/thread-scoped temporaries and ffmpeg `.part.mp4` outputs are not
+    resumable and are always removed.
+    """
     removed = 0
     if not root_dir.exists():
         return 0
+    now = time.time()
     for dirpath, dirnames, filenames in os.walk(root_dir):
         dirnames[:] = [
             d for d in dirnames if d not in (".venv", "venv", ".git", "__pycache__", "node_modules")
         ]
         for fn in filenames:
-            if fn.endswith(".part") or fn.endswith(".part.mp4"):
-                fp = Path(dirpath) / fn
+            if not (fn.endswith(".part") or fn.endswith(".part.mp4")):
+                continue
+            fp = Path(dirpath) / fn
+            if _RESUMABLE_PART_RE.search(fn) and not _LEGACY_PART_RE.search(fn):
                 with contextlib.suppress(OSError):
-                    fp.unlink()
-                    removed += 1
+                    if now - fp.stat().st_mtime < resumable_max_age_s:
+                        continue
+            with contextlib.suppress(OSError):
+                fp.unlink()
+                removed += 1
     return removed
+
+
+def merge_incremental_listing(
+    fresh: list[dict[str, Any]], cached: list[dict[str, Any]], key: str = "id"
+) -> list[dict[str, Any]]:
+    """Fresh (newest-first) items replace their cached copies; cached-only items keep their order after them."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in [*fresh, *cached]:
+        if not isinstance(item, dict) or item.get(key) is None:
+            continue
+        k = str(item[key])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(item)
+    return out
+
+
+def _document_key(d: dict[str, Any]) -> str:
+    return str(d.get("id") or d.get("file_id") or d.get("url") or "")
 
 
 def set_file_mtime(path: Path, ts: float | None) -> None:
@@ -91,6 +131,7 @@ class _AlbumState:
     total_photos: int
     remaining: int
     failed: int = 0
+    expected: int = 0
 
 
 class StatusTracker:
@@ -156,6 +197,35 @@ class StatusTracker:
         if should_write_disk and self.path is not None:
             with contextlib.suppress(Exception):
                 write_json_atomic(self.path, self.snapshot())
+
+
+def _relink_renumbered_photos(album_path: Path, dests: list[Path]) -> int:
+    """
+    Rename already-downloaded `NNN_<imageid>.<ext>` files whose position changed after a teacher
+    added/removed photos (the manifest was refetched), instead of re-downloading them.
+    """
+    wanted: dict[str, Path] = {}
+    claimed = {d.name for d in dests}
+    for d in dests:
+        m = _NUMBERED_PHOTO_SPLIT_RE.match(d.name)
+        if m and not d.exists():
+            wanted.setdefault(m.group(2), d)
+    if not wanted or not album_path.is_dir():
+        return 0
+    moved = 0
+    with contextlib.suppress(OSError):
+        for entry in list(os.scandir(album_path)):
+            m = _NUMBERED_PHOTO_SPLIT_RE.match(entry.name)
+            if not m or entry.name in claimed or not entry.is_file() or entry.name.endswith(".part"):
+                continue
+            target = wanted.get(m.group(2))
+            if target is None or target.exists() or entry.stat().st_size == 0:
+                continue
+            with contextlib.suppress(OSError):
+                os.replace(entry.path, target)
+                moved += 1
+                del wanted[m.group(2)]
+    return moved
 
 
 def _count_numbered_photos(directory: Path) -> int:
@@ -226,33 +296,103 @@ def backup_child_context(
 
     tracker.update(phase="indexing", child=child_folder_name, force=True)
 
-    def _load_or_fetch_index(fname: str, fetcher: _IndexFetcher) -> list[dict[str, Any]]:
+    def _index_file(fname: str) -> tuple[Path, Path]:
         idx_file = ensure_within_directory(child_meta_dir, child_meta_dir / fname)
         stem = fname.removesuffix(".json")
-        partial_file = ensure_within_directory(child_meta_dir, child_meta_dir / f"{stem}_partial.json")
+        return idx_file, ensure_within_directory(child_meta_dir, child_meta_dir / f"{stem}_partial.json")
 
-        if idx_file.exists() and not refresh_index:
-            with contextlib.suppress(Exception):
-                cached_list = json.loads(idx_file.read_text(encoding="utf-8"))
-                if isinstance(cached_list, list) and (len(cached_list) > 0 or fname == "documents_index.json"):
-                    log(f"  [Resume] Loaded cached Metadata/{child_folder_name}/{fname} ({len(cached_list)} items)")
-                    return cached_list
+    def _read_cached_index(idx_file: Path) -> list[dict[str, Any]] | None:
+        if not idx_file.exists():
+            return None
+        try:
+            cached_list = json.loads(idx_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(cached_list, list):
+            return None
+        return [x for x in cached_list if isinstance(x, dict)]
 
-        use_partial = None if (discover_only or refresh_index) else partial_file
-        items = fetcher(kid, cid, partial_file=use_partial)
+    def _sync_index(fname: str, kind: str) -> list[dict[str, Any]]:
+        """
+        Full listing on first run / `--refresh-index`; otherwise an incremental listing that stops at
+        the first fully-known page and is merged into the cached index (D1).
+        """
+        idx_file, partial_file = _index_file(fname)
+        cached = None if refresh_index else _read_cached_index(idx_file)
+        items: list[dict[str, Any]]
+        if kind == "albums":
+            if cached:
+                known = {int(a["id"]): album_listing_signature(a) for a in cached if a.get("id") is not None}
+                fresh = client.list_albums(kid, cid, known=known)
+                items = merge_incremental_listing(fresh, cached)
+                changed = sum(1 for a in fresh if known.get(int(a["id"])) != album_listing_signature(a))
+                log(
+                    f"  [Incremental] albums: {len(fresh)} listed, {changed} new/changed, "
+                    f"{len(items)} total (Metadata/{child_folder_name}/{fname})"
+                )
+            else:
+                items = client.list_albums(kid, cid, partial_file=None if (discover_only or refresh_index) else partial_file)
+        elif kind == "videos":
+            if cached:
+                known_ids = {int(v["id"]) for v in cached if v.get("id") is not None}
+                fresh = client.list_videos(kid, cid, known_ids=known_ids)
+                items = merge_incremental_listing(fresh, cached)
+                added = sum(1 for v in fresh if int(v["id"]) not in known_ids)
+                log(f"  [Incremental] videos: {added} new, {len(items)} total")
+            else:
+                items = client.list_videos(kid, cid, partial_file=None if (discover_only or refresh_index) else partial_file)
+        else:
+            if cached is not None:
+                age_s = 0.0
+                with contextlib.suppress(OSError):
+                    age_s = time.time() - idx_file.stat().st_mtime
+                if age_s < DOCUMENTS_INDEX_MAX_AGE_S:
+                    log(f"  [Resume] Loaded cached Metadata/{child_folder_name}/{fname} ({len(cached)} items)")
+                    return cached
+                known_docs = {_document_key(d) for d in cached}
+                fresh = client.list_documents(kid, cid, known_ids=known_docs)
+                items = merge_incremental_listing(
+                    [{**d, "_kp_key": _document_key(d)} for d in fresh],
+                    [{**d, "_kp_key": _document_key(d)} for d in cached],
+                    key="_kp_key",
+                )
+                for d in items:
+                    d.pop("_kp_key", None)
+            else:
+                items = client.list_documents(
+                    kid, cid, partial_file=None if (discover_only or refresh_index) else partial_file
+                )
         if not discover_only:
             write_json_atomic(idx_file, scrub_metadata(items))
         return items
 
     # Load album listings whenever photos OR videos are enabled (videos match against day albums!)
     need_album_index = (not skip_photos) or (not skip_videos)
-    albums_for_matching = _load_or_fetch_index("albums_index.json", client.list_albums) if need_album_index else []
+    albums_for_matching = _sync_index("albums_index.json", "albums") if need_album_index else []
     albums = [] if skip_photos else albums_for_matching
-    videos = [] if skip_videos else _load_or_fetch_index("videos_index.json", client.list_videos)
-    docs = [] if skip_documents else _load_or_fetch_index("documents_index.json", client.list_documents)
+    videos = [] if skip_videos else _sync_index("videos_index.json", "videos")
+    docs = [] if skip_documents else _sync_index("documents_index.json", "documents")
 
-    album_folder_by_id = assign_album_folder_names(albums_for_matching)
-    video_targets = plan_video_targets(videos, albums_for_matching, album_folder_by_id)
+    # D2: persisted album_id -> folder identity; only unknown IDs receive (new) names.
+    folder_map_file = ensure_within_directory(child_meta_dir, child_meta_dir / FOLDER_MAP_FILE)
+    folder_map = load_folder_map(folder_map_file)
+    if folder_map is None:
+        folder_map = rebuild_folder_map(meta_albums_dir, albums_dir)
+        if folder_map.albums:
+            log(
+                f"  [FolderMap] Rebuilt {len(folder_map.albums)} album folder identities from "
+                f"Metadata/{child_folder_name}/Albums/*.json"
+            )
+    album_folder_by_id = assign_album_folder_names(albums_for_matching, folder_map.albums)
+    video_targets = plan_video_targets(videos, albums_for_matching, album_folder_by_id, folder_map.videos)
+    if not discover_only and (albums_for_matching or videos or folder_map_file.exists() or folder_map.albums):
+        save_folder_map(
+            folder_map_file,
+            FolderMap(
+                albums={**folder_map.albums, **album_folder_by_id},
+                videos={**folder_map.videos, **video_targets},
+            ),
+        )
 
     total_expected_photos = sum(int(a.get("count_images") or 0) for a in albums)
     log(
@@ -299,7 +439,9 @@ def backup_child_context(
         live_done = 0
 
         def _finalize_album(astate: _AlbumState) -> None:
-            is_complete = astate.failed == 0 and astate.total_photos >= 0
+            # An album the listing says is non-empty but whose manifest had no downloadable images is
+            # left incomplete so the next run refetches it instead of trusting an empty manifest.
+            is_complete = astate.failed == 0 and not (astate.expected > 0 and astate.total_photos == 0)
             astate.meta_payload["completed"] = is_complete
             astate.meta_payload["completed_at"] = datetime.now().isoformat()
             astate.meta_payload["photo_count"] = astate.total_photos
@@ -337,10 +479,13 @@ def backup_child_context(
             if meta_file.exists() and not refresh_index:
                 with contextlib.suppress(Exception):
                     loaded = json.loads(meta_file.read_text(encoding="utf-8"))
+                    # D1: reuse the cached manifest unless the listing's (updated_at, count_images)
+                    # changed since it was fetched, or the manifest is missing/empty for a non-empty album.
                     if (
                         isinstance(loaded, dict)
                         and isinstance(loaded.get("images"), list)
-                        and (len(loaded["images"]) >= expected_cnt or expected_cnt == 0)
+                        and album_listing_signature(loaded.get("album_listing")) == album_listing_signature(album)
+                        and (len(loaded["images"]) > 0 or expected_cnt == 0)
                     ):
                         cached_meta = loaded
                         images = loaded["images"]
@@ -391,6 +536,8 @@ def backup_child_context(
                 dest = ensure_within_directory(album_path, album_path / fname)
                 tasks.append((urls, dest, img_ts or album_ts))
 
+            if not from_cache:
+                _relink_renumbered_photos(album_path, [t[1] for t in tasks])
             astate = _AlbumState(
                 album_id=aid,
                 album_name=aname,
@@ -398,6 +545,7 @@ def backup_child_context(
                 meta_payload=meta_out,
                 total_photos=len(tasks),
                 remaining=0,
+                expected=expected_cnt,
             )
             return from_cache, False, astate, tasks
 
@@ -461,7 +609,13 @@ def backup_child_context(
 
                 try:
                     from_cache, fast_skipped, astate, tasks = _prepare_album(album)
+                except AuthExpiredError:
+                    # Every remaining album would fail the same way: stop queueing, let in-flight
+                    # photo downloads drain (the executor joins on exit), then abort the run.
+                    raise
                 except Exception as exc:
+                    with prog_lock:
+                        stats.albums_failed += 1
                     log(f"  [ERROR] Album {idx}/{len(albums)} (ID={album.get('id')}) metadata failed: {redact_secrets(str(exc))}")
                     continue
 
@@ -609,10 +763,13 @@ def backup_child_context(
             return ("downloaded", sz, vtitle_raw)
 
         failed_videos: list[tuple[int, dict[str, Any]]] = []
+        auth_error: AuthExpiredError | None = None
         with concurrent.futures.ThreadPoolExecutor(max_workers=video_workers) as vpool:
             vfuts = {vpool.submit(_dl_one_video, (i, v)): (i, v) for i, v in enumerate(videos, 1)}
             for vfut in concurrent.futures.as_completed(vfuts):
                 iv = vfuts[vfut]
+                if vfut.cancelled():
+                    continue
                 try:
                     status, sz, _ = vfut.result()
                     if status == "downloaded":
@@ -624,9 +781,17 @@ def backup_child_context(
                 except FileNotFoundError as exc:
                     stats.videos_failed += 1
                     log(f"    [SKIP] Video '{iv[1].get('name')}' skipped ({redact_secrets(str(exc))})")
+                except AuthExpiredError as exc:
+                    if auth_error is None:
+                        auth_error = exc
+                        for other in vfuts:
+                            other.cancel()
                 except Exception as exc:
                     failed_videos.append(iv)
                     log(f"    [WARN] Video retry queued for '{iv[1].get('name')}' (ID={iv[1].get('id')}): {redact_secrets(str(exc))}")
+
+        if auth_error is not None:
+            raise auth_error
 
         if failed_videos:
             log(f"  Retrying {len(failed_videos)} failed video(s)...")
@@ -636,6 +801,8 @@ def backup_child_context(
                     if status == "downloaded":
                         stats.videos_downloaded += 1
                         stats.videos_bytes += sz
+                except AuthExpiredError:
+                    raise
                 except Exception as exc:
                     stats.videos_failed += 1
                     log(f"    [ERROR] Video failed permanently '{iv[1].get('name')}' (ID={iv[1].get('id')}): {redact_secrets(str(exc))}")
@@ -689,6 +856,7 @@ def backup_child_context(
                 stats.documents_downloaded += 1
                 tracker.update(stats=stats)
             except Exception as exc:
+                stats.documents_failed += 1
                 log(f"    [WARN] Document '{raw_name}': {redact_secrets(str(exc))}")
 
     tracker.update(stats=stats, force=True)
