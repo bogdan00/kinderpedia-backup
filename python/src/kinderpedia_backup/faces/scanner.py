@@ -319,8 +319,7 @@ def _run_locked_scan(
     summary = ScanSummary(photos_total=len(photos))
     resolver = ProvenanceResolver(backup_root)
     det_id = recognizer.model_id
-    default_cap = 8 if getattr(recognizer, "engine_kind", "") == "onnxruntime" else 6
-    eff_workers = max(1, workers if workers is not None else min(default_cap, os.cpu_count() or 4))
+    eff_workers = max(1, workers if workers is not None else min(8, os.cpu_count() or 4))
     io_workers = max(4, eff_workers)
     report = RelinkReport()
 
