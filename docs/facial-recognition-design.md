@@ -97,7 +97,7 @@ flowchart TD
    - Runs `det_10g.onnx` + 5-point Umeyama similarity alignment + `w600k_r50.onnx` via `onnxruntime` (`CUDA` / `CoreML` / `CPU`) with automatic fallback to OpenCV's C++ SIMD engine (`cv2.dnn.readNetFromONNX` from `opencv-python-headless`).
    - Quality gate (`det_score >= 0.55` and `min(width, height) >= 28 px`) filters out classroom wall posters, cartoons, and dolls.
 2. **Multi-Epoch Diverse Pose Anchors:**
-   - Selects up to `max_anchors_per_year = 14` pose-diverse confirmed exemplars per `(person, year)` (`cos_sim < 0.88` diversity preference) rather than averaging toddler and preschool faces into a single blurry centroid.
+   - Selects up to `max_anchors_per_year = 8` pose-diverse confirmed exemplars per `(person, year)` (`cos_sim < 0.88` diversity preference) rather than averaging toddler and preschool faces into a single blurry centroid.
 3. **Year-Windowed Sibling Guard (`[Y-1, Y+1]`):**
    - Siblings at the same biological age (e.g., Older Sibling at age 2 in `2022` vs. Younger Sibling at age 2 in `2026`) look very similar to ArcFace. Scoring a photo from year $Y$ prioritizes anchors within $[Y-1, Y+1]$, applying a cross-era penalty (`0.06`) to distant-year anchors whenever nearby-year anchors exist.
 4. **Hard-Negative Lookalike Suppression (Photo-Level & Face-Scoped):**

@@ -107,12 +107,12 @@ Database location: `<backup_dir>/Metadata/faces_index.sqlite` (`PRAGMA journal_m
 
 | Parameter / Mechanism | Default Value | Location & Behavior |
 | :--- | :--- | :--- |
-| `auto_high_threshold` | `0.45` | Effective score `>= 0.45` promotes a face to `auto_high` (automatically included in galleries, hardlink exports, and URL exports). |
+| `auto_high_threshold` | `0.45` | Effective score `>= 0.45` promotes a face to `auto_high` (automatically included in galleries, hardlink exports, and URL exports). **Calibrated band:** scores in `[0.45, 0.60)` are only `auto_high` when the labelled-neighbour vote agrees **and** the nearest labelled face is `>= 0.52` similar; otherwise they stay `candidate` (historic decisions show 57–62 % rejections in that band without agreement). |
 | `candidate_threshold` | `0.33` | Effective score in `[0.33, 0.45)` queues the face as `candidate` for the active-learning Batch Trainer. |
-| `max_anchors_per_year` | `14` | Farthest-point greedy diversity sampling per `(person_id, year)` bucket so poses (frontal, 3/4, profile, outdoor lighting) stay balanced without `O(N^2)` slowdown. |
+| `max_anchors_per_year` | `8` (best + second-best anchor blended with weight `0.35` when a person has `>= 4` anchors) | Farthest-point greedy diversity sampling per `(person_id, year)` bucket so poses (frontal, 3/4, profile, outdoor lighting) stay balanced without `O(N^2)` slowdown. |
 | Longitudinal year window | `[Y - 1, Y + 1]` | Anchors within `±1` calendar year receive full weight (`0.78 * max_top1 + 0.22 * mean_top3`); distant years require `+0.06` higher similarity so younger siblings at age 3 do not cross-match an older sibling's age-3 anchors from 3 years earlier. |
 | Hard-negative penalty | `sim >= 0.58` | Confirmed `rejected` face embeddings penalize lookalike twin/classmate faces by `0.38 * max(0, neg_sim - 0.50)` (up to `-0.16`). |
-| Album cohesion & bursts | `0.42` | When a child is confirmed or `>= 0.54` in an album, `>= 0.42` faces in the same album promote to `auto_high`; adjacent sequence photos (`seq_num ± 2`) propagate down to `0.38` (`source = 'album_cohesion'`). |
+| Album cohesion & bursts | `0.55` | When a child is confirmed or `>= 0.54` in an album, faces with same-album similarity `>= 0.55` (raised from 0.42 after a holdout showed it halves wrong trusted matches) promote to `auto_high`; kNN candidate→trusted promotion additionally needs score `>= auto_high - 0.05`; adjacent sequence photos (`seq_num ± 2`) propagate down to `0.38` (`source = 'album_cohesion'`). |
 | Social co-occurrence | `+0.030` / `-0.045` | Built from intimate (`2–8` face) high-confidence photos (`intimacy = 2.0 / sqrt(face_count)`). Frequent playmates grant up to `+0.030` boost on ambiguous `[0.29, 0.52]` faces; isolated social circles (`>= 12` intimate photos, zero overlap, e.g. separate sibling classrooms) apply `-0.045`. |
 | Yearly clustering | `sim_threshold = 0.56` | Connected-components + iterative medoid refinement (`refine_threshold = 0.54`) inside each `photo_year` bucket (`quality_score >= 0.24`, `min_cluster_size = 3`). |
 
@@ -179,7 +179,7 @@ All tagging mutations commit to SQLite in `< 5 ms`, call `ctx.schedule_rematch()
 
 ```bash
 # 1. Pull newly posted Kinderpedia albums/videos/documents:
-kinderpedia-backup sync --output ~/kinderpedia_bk --refresh-index
+kinderpedia-backup sync --output ~/kinderpedia_bk   # incremental by default; --refresh-index forces a full re-listing
 
 # 2. Incrementally scan only new photos (already-indexed JPEGs skip in milliseconds)
 #    and auto-match against existing child anchors + refresh categorization_index.json:
@@ -240,3 +240,14 @@ gitleaks detect --source .. --verbose
 - **Batch queue.** `default_approve_min_sim = 0.50`; cards carry `default_decision` (`approved` / `unsure` for 0.38-0.50 / `disproved`), `source`, and ~2 random trusted (`album_cohesion` / `model_trusted`) rows per 24 flagged `"audit": true`.
 - `faces/pipeline.py` (legacy JSON reference-folder organizer, no production callers) was removed.
 
+
+## 9. Server, Jobs & Matcher Changes (assessment follow-up)
+
+- **Background jobs.** `POST /api/recluster` and `POST /api/materialize` return `202 {job_id, kind, label, state}` immediately; a second job of the same kind gets `409 {error, job}`. Progress/results arrive via SSE `job_status` / `job_complete` (`{ok, result | error, elapsed_ms}`), `GET /api/jobs` and `GET /api/jobs/<id>`. `bg_status` carries `jobs[]` and `external_changes`; the top-bar chip shows running jobs. Recluster runs under `_rematch_lock`.
+- **Child clusters.** `GET /api/people/<pid>/clusters` is cached per `(person, threshold, min_size, completed_rematch_seq, data_epoch)` and returns the first 12 faces per cluster (`faces_truncated`, `signature`, `faces_preview`; `faces_limit=0` for all). `GET /api/people/<pid>/clusters/faces?key=&threshold=&min_size=&offset=` serves the rest from the cache.
+- **HTTP.** HTTP/1.1 keep-alive (SSE uses `Connection: close`). Errors: `400` validation, `404` missing, `409` job conflict, `503 {retryable: true}` + `Retry-After` for `database is locked`, `500` otherwise (logged). The client only shows "backend offline" on real network errors / 502 / 504.
+- **External writers.** A watcher (`_AppContext(external_poll_sec=3)`) compares `db.get_data_version()`; when another process (e.g. `faces scan`) committed, caches and the kNN neighbour cache are dropped, SSE `data_changed` is sent and a rematch scheduled. While a scan holds its lock the refresh is deferred until the scan ends.
+- **Batch cards** honour the server's `default_decision`; `audit: true` cards show an "audit" badge; skipped conflicting approvals are reported in the toast.
+- **Alignment / model.** `align_face_112` now matches the OpenCV `warpAffine` pixel convention used to train ArcFace (embedding agreement with the reference pipeline: min 0.959 → 0.995). `model_id` is `scrfd_10g_<det>_arcface_r50_v1_align2`; changing it triggers a label-preserving rescan (§8).
+- **onnxruntime.** The `faces` extra installs `onnxruntime>=1.17` on Python < 3.15 (no 3.15 wheels yet); with it the CoreML/CUDA providers are used (~9x faster scans on Apple Silicon than the OpenCV DNN fallback). The selected engine is logged at scan start.
+- **Matcher speed.** Cold rematch ~13 s (was ~21 s), warm ~2.3 s (was ~3.3 s); yearly clustering ~9 s (was ~28 s). `recompute_active_matching(..., diagnostics={})` returns per-stage timings for evaluation.

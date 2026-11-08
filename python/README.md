@@ -46,7 +46,11 @@ kinderpedia-backup sync --discover-only
 # Back up to an external SSD or cloud-synced folder:
 kinderpedia-backup sync --output "/Volumes/FamilySSD/Kinderpedia"
 
-# Incremental sync next month (fetches only newly posted items):
+# Incremental sync next month (plain `sync` stops listing at the first unchanged page and
+# only refetches albums whose (updated_at, photo count) changed):
+kinderpedia-backup sync
+
+# Force a full re-listing of every album/video/document (slow):
 kinderpedia-backup sync --refresh-index
 
 # Filter to one child, photos only:
@@ -58,6 +62,10 @@ op read "op://Private/Kinderpedia/password" | kinderpedia-backup sync --email pa
 # Remove saved session tokens from disk:
 kinderpedia-backup sync --logout
 ```
+
+**Exit codes:** `0` complete · `1` partial (some photos/videos/documents/albums failed — re-run to resume) · `2` usage error · `3` login expired and could not be refreshed (non-interactive runs abort instead of failing every album) · `130` interrupted. `Metadata/backup_summary.json` records `status` (`complete` / `partial` / `failed`), `total_failures` and `aborted_reason`.
+
+**Stable folder names:** each child's `Metadata/<Child>/folder_map.json` pins `album id → folder` and `video id → folder/file`, so a teacher adding, deleting, renaming or re-dating an album never renames existing folders or re-downloads videos. Existing archives get the map rebuilt automatically from `Metadata/<Child>/Albums/*.json`. Large downloads resume from `.part` files with HTTP `Range` requests.
 
 ---
 

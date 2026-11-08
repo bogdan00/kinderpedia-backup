@@ -47,7 +47,10 @@ pip install ./python
 # Full backup (prompts securely for email, password, and 2FA if enabled):
 kinderpedia-backup sync --output ~/kinderpedia_bk
 
-# Incremental sync later (fetches only newly posted albums/videos/documents):
+# Incremental sync later (plain `sync` only lists what changed and fetches newly posted items):
+kinderpedia-backup sync
+
+# Force a full re-listing of every album (slow; only if something looks out of date):
 kinderpedia-backup sync --refresh-index
 ```
 
