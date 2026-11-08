@@ -655,6 +655,30 @@ class AssignmentsMixin(ScanRepoMixin):
             )
         return removed_pids
 
+    def keep_label(self, *, person_id: int, face_id: int) -> dict[str, Any]:
+        """
+        Mark `person_id`'s confirmed label on `face_id` as reviewed-OK ("keep"): the label-consistency
+        guard no longer flags it, so it counts as a normal anchor / kNN voter from the next rematch on.
+        Raises `KeyError` when `face_id` is not confirmed for `person_id`.
+        """
+        now = _now_iso()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT 1 FROM assignments WHERE person_id = ? AND face_id = ? AND status = 'confirmed'",
+                (person_id, face_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Face {face_id} is not confirmed for person {person_id}.")
+            self._conn.execute(
+                """
+                INSERT INTO label_keeps (face_id, person_id, kept_at) VALUES (?, ?, ?)
+                ON CONFLICT(face_id, person_id) DO UPDATE SET kept_at = excluded.kept_at
+                """,
+                (face_id, person_id, now),
+            )
+            self._label_outliers = self._label_outliers - {(face_id, person_id)}
+        return {"person_id": person_id, "face_id": face_id, "kept": True}
+
     def apply_person_cluster_action(
         self,
         *,

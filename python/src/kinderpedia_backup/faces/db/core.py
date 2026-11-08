@@ -42,6 +42,7 @@ class DBCore:
         self._faces_matrix_cache: dict[str, Any] | None = None
         self._photo_summary_cache: dict[str, Any] | None = None
         self._knn_neighbor_cache: dict[str, Any] | None = None
+        self._label_outliers: set[tuple[int, int]] = set()  # (face_id, person_id) from the last rematch
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         with self._lock:

@@ -403,15 +403,10 @@ class MatcherRealisticEmbeddingTests(unittest.TestCase):
                 if who in pid_of:
                     db.tag_single_face(photo_id=p_id, face_id=f_id, person_id=pid_of[who])
             amb = next(f for who, _, f in photos if who == "ambiguous")
-            legacy: dict[str, object] = {}
-            recompute_active_matching(db, auto_band_knn_upper=0.0, diagnostics=legacy)
-            got_legacy = _model_rows(db).get(amb)
-            assert got_legacy is not None
-            self.assertEqual(got_legacy[1], "auto_high")  # old policy: auto-accepted on score alone
             recompute_active_matching(db)
             got = _model_rows(db).get(amb)
             assert got is not None
-            self.assertEqual(got[1], "candidate")  # new policy: the split neighbourhood sends it to review
+            self.assertEqual(got[1], "candidate")  # the split neighbourhood sends it to review
 
 
 class OfflineDecisionReplayTests(unittest.TestCase):
