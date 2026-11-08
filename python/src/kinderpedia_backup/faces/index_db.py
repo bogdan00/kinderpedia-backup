@@ -1803,8 +1803,10 @@ class FacesIndexDB:
 
     def assign_cluster_to_person(self, cluster_id: int, person_id: int) -> int:
         """
-        Confirm all faces in `cluster_id` for `person_id` (unless already human-rejected),
-        set cover face if unset, and return the number of newly confirmed photos.
+        Confirm all faces in `cluster_id` for `person_id` (unless already human-rejected for that photo,
+        outside the person's birthday/class window, or human-confirmed for someone else — a bulk
+        cluster confirm never overrides another person's confirmed tag), set cover face if unset, and
+        return the number of newly confirmed photos.
         """
         now = _now_iso()
         with self._lock, self._conn:
@@ -1853,50 +1855,11 @@ class FacesIndexDB:
                 ).fetchone()
                 if existing is not None and str(existing["status"]) == "rejected":
                     continue
-                manual_other = self._conn.execute(
-                    """
-                    SELECT 1
-                    FROM assignments a
-                    JOIN people pe ON pe.person_id = a.person_id
-                    WHERE a.face_id = ?
-                      AND a.person_id != ?
-                      AND a.status = 'confirmed'
-                      AND a.source = 'manual_tag'
-                      AND pe.role != 'ignore'
-                    LIMIT 1
-                    """,
-                    (fid, person_id),
-                ).fetchone()
-                if manual_other is not None:
-                    continue
-                self._conn.execute(
-                    "UPDATE faces SET suppress_auto = 0 WHERE face_id = ?",
-                    (fid,),
+                res = self._claim_face_locked(
+                    fid, person_id, source="cluster_confirm", now=now, explicit=False
                 )
-                prev_holders = self._conn.execute(
-                    "SELECT person_id FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                    (fid, person_id),
-                ).fetchall()
-                self._conn.execute(
-                    "DELETE FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                    (fid, person_id),
-                )
-                for pr in prev_holders:
-                    self._refresh_cover_face_if_needed(int(pr["person_id"]), fid)
-                self._conn.execute(
-                    """
-                    INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
-                    VALUES (?, ?, ?, 'confirmed', 'cluster_confirm', 1.0, 0, ?)
-                    ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                        face_id = excluded.face_id,
-                        status = 'confirmed',
-                        source = 'cluster_confirm',
-                        similarity = 1.0,
-                        updated_at = excluded.updated_at
-                    """,
-                    (pid, person_id, fid, now),
-                )
-                confirmed += 1
+                if res["claimed"]:
+                    confirmed += 1
             return confirmed
 
     def remove_face_from_cluster(
@@ -2103,14 +2066,18 @@ class FacesIndexDB:
     ) -> dict[str, int]:
         """
         Persist an active-learning batch submission:
-        - `approved`: `[(photo_id, face_id)]` -> `confirmed` for `person_id`
+        - `approved`: `[(photo_id, face_id)]` -> `confirmed` for `person_id`. A face that meanwhile
+          became human-confirmed for someone else (stale proposal) is skipped and counted in
+          `skipped_conflicts` — another person's confirmed tag is only changed by an explicit action.
         - `disproved`: `[(photo_id, face_id)]` -> `rejected` (hard negative!) for `person_id`
         - `unsure`: `[(photo_id, face_id)]` -> `unsure` (skipped without teaching positive or negative)
-        - `reassigned`: `[(photo_id, face_id, target_person_id)]` -> `rejected` for `person_id` + `confirmed` for `target_person_id`
+        - `reassigned`: `[(photo_id, face_id, target_person_id)]` -> explicit claim of the face for
+          `target_person_id` + face-scoped negative (`rejected` / `reassigned`) for `person_id`
         """
         now = _now_iso()
         unsure_list = unsure or []
         reassigned_list = reassigned or []
+        skipped_conflicts = 0
         with self._lock, self._conn:
             rules_cache: dict[int, tuple[int, list[tuple[str, int, int]]]] = {}
 
@@ -2122,45 +2089,30 @@ class FacesIndexDB:
 
             approved = [(ph, fc) for ph, fc in approved if _birth_ok(ph, person_id)]
             reassigned_list = [(ph, fc, tp) for ph, fc, tp in reassigned_list if _birth_ok(ph, tp)]
-            first_fid: int | None = None
+            applied_approved = 0
             for photo_id, face_id in approved:
-                if first_fid is None and face_id is not None:
-                    first_fid = face_id
-                self._conn.execute(
-                    """
-                    INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
-                    VALUES (?, ?, ?, 'confirmed', 'batch_approve', 1.0, 0, ?)
-                    ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                        face_id = COALESCE(excluded.face_id, assignments.face_id),
-                        status = 'confirmed',
-                        source = 'batch_approve',
-                        similarity = 1.0,
-                        updated_at = excluded.updated_at
-                    """,
-                    (photo_id, person_id, face_id, now),
-                )
-                # Enforce 1-person-per-face-box exclusivity across all non-rejected assignments:
-                if face_id is not None:
+                if face_id is None:
                     self._conn.execute(
-                        "UPDATE faces SET suppress_auto = 0 WHERE face_id = ?",
-                        (face_id,),
+                        """
+                        INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
+                        VALUES (?, ?, NULL, 'confirmed', 'batch_approve', 1.0, 0, ?)
+                        ON CONFLICT(photo_id, person_id) DO UPDATE SET
+                            status = 'confirmed',
+                            source = 'batch_approve',
+                            similarity = 1.0,
+                            updated_at = excluded.updated_at
+                        """,
+                        (photo_id, person_id, now),
                     )
-                    prev_holders = self._conn.execute(
-                        "SELECT person_id FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                        (face_id, person_id),
-                    ).fetchall()
-                    self._conn.execute(
-                        "DELETE FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                        (face_id, person_id),
-                    )
-                    for pr in prev_holders:
-                        self._refresh_cover_face_if_needed(int(pr["person_id"]), face_id)
-
-            if first_fid is not None:
-                self._conn.execute(
-                    "UPDATE people SET cover_face_id = COALESCE(cover_face_id, ?) WHERE person_id = ?",
-                    (first_fid, person_id),
+                    applied_approved += 1
+                    continue
+                res = self._claim_face_locked(
+                    face_id, person_id, source="batch_approve", now=now, explicit=False, photo_id=photo_id
                 )
+                if res["claimed"]:
+                    applied_approved += 1
+                else:
+                    skipped_conflicts += 1
 
             for photo_id, face_id in disproved:
                 self._conn.execute(
@@ -2197,60 +2149,159 @@ class FacesIndexDB:
                 )
 
             for photo_id, face_id, target_pid in reassigned_list:
+                self._claim_face_locked(
+                    face_id, target_pid, source="manual_tag", now=now, explicit=True, photo_id=photo_id
+                )
                 if target_pid != person_id:
-                    self._conn.execute(
-                        """
-                        INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
-                        VALUES (?, ?, ?, 'rejected', 'reassigned', 0.0, 0, ?)
-                        ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                            face_id = excluded.face_id,
-                            status = 'rejected',
-                            source = 'reassigned',
-                            similarity = 0.0,
-                            is_anchor = 0,
-                            updated_at = excluded.updated_at
-                        """,
-                        (photo_id, person_id, face_id, now),
-                    )
-                    self._refresh_cover_face_if_needed(person_id, face_id)
-                self._conn.execute(
-                    """
-                    INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
-                    VALUES (?, ?, ?, 'confirmed', 'manual_tag', 1.0, 0, ?)
-                    ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                        face_id = excluded.face_id,
-                        status = 'confirmed',
-                        source = 'manual_tag',
-                        similarity = 1.0,
-                        updated_at = excluded.updated_at
-                    """,
-                    (photo_id, target_pid, face_id, now),
-                )
-                self._conn.execute(
-                    "UPDATE faces SET suppress_auto = 0 WHERE face_id = ?",
-                    (face_id,),
-                )
-                other_holders = self._conn.execute(
-                    "SELECT person_id FROM assignments WHERE face_id = ? AND person_id NOT IN (?, ?) AND status != 'rejected'",
-                    (face_id, person_id, target_pid),
-                ).fetchall()
-                self._conn.execute(
-                    "DELETE FROM assignments WHERE face_id = ? AND person_id NOT IN (?, ?) AND status != 'rejected'",
-                    (face_id, person_id, target_pid),
-                )
-                for oh in other_holders:
-                    self._refresh_cover_face_if_needed(int(oh["person_id"]), face_id)
-                self._conn.execute(
-                    "UPDATE people SET cover_face_id = COALESCE(cover_face_id, ?) WHERE person_id = ?",
-                    (face_id, target_pid),
-                )
+                    self._record_face_negative_locked(photo_id, person_id, face_id, now=now)
 
         return {
-            "approved": len(approved),
+            "approved": applied_approved,
             "disproved": len(disproved),
             "unsure": len(unsure_list),
             "reassigned": len(reassigned_list),
+            "skipped_conflicts": skipped_conflicts,
         }
+
+    def _record_face_negative_locked(self, photo_id: int, person_id: int, face_id: int, *, now: str) -> None:
+        """Face-scoped hard negative (`rejected` / `reassigned`) for `person_id` on `face_id`, without
+        touching any row `person_id` holds on a DIFFERENT face of the same photo."""
+        self._conn.execute(
+            """
+            INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
+            VALUES (?, ?, ?, 'rejected', 'reassigned', 0.0, 0, ?)
+            ON CONFLICT(photo_id, person_id) DO UPDATE SET
+                face_id = excluded.face_id,
+                status = 'rejected',
+                source = 'reassigned',
+                similarity = 0.0,
+                is_anchor = 0,
+                updated_at = excluded.updated_at
+            WHERE assignments.face_id IS NULL
+               OR assignments.face_id = excluded.face_id
+            """,
+            (photo_id, person_id, face_id, now),
+        )
+        self._refresh_cover_face_if_needed(person_id, face_id)
+
+    def _claim_face_locked(
+        self,
+        face_id: int,
+        winner_person_id: int,
+        *,
+        source: AssignmentSource,
+        now: str,
+        explicit: bool,
+        photo_id: int | None = None,
+        similarity: float = 1.0,
+    ) -> dict[str, Any]:
+        """
+        The single "this face box is `winner_person_id`" primitive used by every confirm path
+        (batch approve, cluster confirm, batch reassign, `tag_single_face`, manual boxes).
+
+        Policy (must be called with `_lock` held, inside a transaction):
+        - A human `confirmed` tag of another (non-`ignore`) person is never deleted. Bulk/implicit
+          callers (`explicit=False`: batch approve, cluster confirm) skip such faces and get
+          `{"claimed": False, "blocked_by": [...]}`; explicit single-face actions demote the holder
+          to a face-scoped negative (`rejected` / `reassigned`).
+        - Other holders' `unsure` rows become face-scoped negatives; model guesses (`auto_high` /
+          `candidate`) become negatives on explicit claims and are dropped on bulk ones.
+        - Implicit claims also never move the winner's own confirmed tag off another face of the photo.
+        - Clears `suppress_auto` (manual boxes stay suppressed), detaches the face from a cluster
+          assigned to someone else, refreshes displaced covers and sets the winner's cover if unset.
+        """
+        f_row = self._conn.execute(
+            "SELECT photo_id, cluster_id FROM faces WHERE face_id = ?", (face_id,)
+        ).fetchone()
+        if f_row is None or (photo_id is not None and int(f_row["photo_id"]) != int(photo_id)):
+            raise KeyError(f"Face {face_id} not found" + (f" on photo {photo_id}." if photo_id else "."))
+        ph = int(f_row["photo_id"])
+        holders = self._conn.execute(
+            """
+            SELECT a.person_id, a.status, pe.role
+            FROM assignments a
+            JOIN people pe ON pe.person_id = a.person_id
+            WHERE a.face_id = ? AND a.person_id != ? AND a.status != 'rejected'
+            """,
+            (face_id, winner_person_id),
+        ).fetchall()
+        blocked_by = [
+            int(h["person_id"])
+            for h in holders
+            if str(h["status"]) == "confirmed" and str(h["role"]) != "ignore"
+        ]
+        if blocked_by and not explicit:
+            return {"claimed": False, "blocked_by": blocked_by, "displaced": []}
+        own = self._conn.execute(
+            "SELECT face_id, status FROM assignments WHERE photo_id = ? AND person_id = ?",
+            (ph, winner_person_id),
+        ).fetchone()
+        own_other_fid = (
+            int(own["face_id"])
+            if own is not None and own["face_id"] is not None and int(own["face_id"]) != face_id
+            else None
+        )
+        if not explicit and own_other_fid is not None and str(own["status"]) == "confirmed":
+            return {"claimed": False, "blocked_by": [winner_person_id], "displaced": []}
+
+        displaced: list[int] = []
+        for h in holders:
+            old_pid = int(h["person_id"])
+            if not explicit and str(h["status"]) in ("auto_high", "candidate"):
+                self._conn.execute(
+                    "DELETE FROM assignments WHERE photo_id = ? AND person_id = ? AND face_id = ?",
+                    (ph, old_pid, face_id),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE assignments
+                    SET status = 'rejected', source = 'reassigned', similarity = 0.0, is_anchor = 0, updated_at = ?
+                    WHERE photo_id = ? AND person_id = ? AND face_id = ?
+                    """,
+                    (now, ph, old_pid, face_id),
+                )
+            displaced.append(old_pid)
+
+        self._conn.execute(
+            """
+            INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
+            VALUES (?, ?, ?, 'confirmed', ?, ?, 0, ?)
+            ON CONFLICT(photo_id, person_id) DO UPDATE SET
+                face_id = excluded.face_id,
+                status = 'confirmed',
+                source = excluded.source,
+                similarity = excluded.similarity,
+                is_anchor = CASE
+                    WHEN assignments.status = 'confirmed' AND assignments.face_id IS excluded.face_id
+                    THEN assignments.is_anchor ELSE 0 END,
+                updated_at = excluded.updated_at
+            """,
+            (ph, winner_person_id, face_id, source, float(similarity), now),
+        )
+        self._conn.execute(
+            "UPDATE faces SET suppress_auto = CASE WHEN is_manual != 0 THEN 1 ELSE 0 END WHERE face_id = ?",
+            (face_id,),
+        )
+        if f_row["cluster_id"] is not None:
+            c_owner = self._conn.execute(
+                "SELECT person_id FROM clusters WHERE cluster_id = ?", (int(f_row["cluster_id"]),)
+            ).fetchone()
+            if (
+                c_owner is not None
+                and c_owner["person_id"] is not None
+                and int(c_owner["person_id"]) != winner_person_id
+            ):
+                self._conn.execute("UPDATE faces SET cluster_id = NULL WHERE face_id = ?", (face_id,))
+        for old_pid in displaced:
+            self._refresh_cover_face_if_needed(old_pid, face_id)
+        if own_other_fid is not None:
+            self._refresh_cover_face_if_needed(winner_person_id, own_other_fid)
+        self._conn.execute(
+            "UPDATE people SET cover_face_id = COALESCE(cover_face_id, ?) WHERE person_id = ?",
+            (face_id, winner_person_id),
+        )
+        return {"claimed": True, "blocked_by": [], "displaced": displaced}
 
     def _refresh_cover_face_if_needed(self, person_id: int, lost_face_id: int) -> None:
         self._conn.execute(
@@ -2335,24 +2386,8 @@ class FacesIndexDB:
                     int(self._photo_summary_cache["faces_total"]) + 1
                 )
 
-            self._conn.execute(
-                """
-                INSERT INTO assignments (
-                    photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at
-                ) VALUES (?, ?, ?, 'confirmed', 'manual_tag', 1.0, 0, ?)
-                ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                    face_id = excluded.face_id,
-                    status = 'confirmed',
-                    source = 'manual_tag',
-                    similarity = 1.0,
-                    is_anchor = 0,
-                    updated_at = excluded.updated_at
-                """,
-                (photo_id, person_id, new_fid, now),
-            )
-            self._conn.execute(
-                "UPDATE people SET cover_face_id = COALESCE(cover_face_id, ?) WHERE person_id = ?",
-                (new_fid, person_id),
+            self._claim_face_locked(
+                new_fid, person_id, source="manual_tag", now=now, explicit=True, photo_id=photo_id
             )
         return new_fid
 
@@ -2371,9 +2406,9 @@ class FacesIndexDB:
         When `status == 'confirmed'`:
         - Resolves `face_id` automatically if `face_id is None` (from `replace_person_id`'s row or
           from `faces` when `photo_id` has a single detected face) so the face box itself is tagged.
-        - Converts any previous holder of `face_id` (and `replace_person_id` if provided) into a
-          face-scoped hard negative (`status = 'rejected', source = 'reassigned'`) and refreshes
-          their `cover_face_id` if needed.
+        - Explicitly claims the face via `_claim_face_locked`: any previous holder of `face_id` (and
+          `replace_person_id` if provided) becomes a face-scoped hard negative
+          (`status = 'rejected', source = 'reassigned'`) and their `cover_face_id` is refreshed.
         Returns the resolved `face_id` (if any).
         """
         now = _now_iso()
@@ -2396,88 +2431,37 @@ class FacesIndexDB:
                 if len(only_faces) == 1:
                     face_id = int(only_faces[0]["face_id"])
 
-            is_manual_face = False
             if face_id is not None:
                 mf_row = self._conn.execute(
                     "SELECT is_manual FROM faces WHERE face_id = ? AND photo_id = ?",
                     (face_id, photo_id),
                 ).fetchone()
-                if mf_row is not None and bool(mf_row["is_manual"]):
-                    is_manual_face = True
-                    if status == "rejected":
-                        self.untag_face(photo_id=photo_id, face_id=face_id)
-                        return None
+                if mf_row is not None and bool(mf_row["is_manual"]) and status == "rejected":
+                    self.untag_face(photo_id=photo_id, face_id=face_id)
+                    return None
 
-            displaced_pids: set[int] = set()
-            if status == "confirmed":
-                if face_id is not None:
-                    self._conn.execute(
-                        "UPDATE faces SET suppress_auto = CASE WHEN is_manual != 0 THEN 1 ELSE 0 END WHERE face_id = ?",
-                        (face_id,),
-                    )
-                    # Any other person who previously held this face box (e.g. from Batch Trainer,
-                    # Gallery, or auto-match) learns a face-scoped hard-negative (`reassigned`):
-                    prev_holders = self._conn.execute(
-                        "SELECT person_id FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                        (face_id, person_id),
-                    ).fetchall()
-                    for pr in prev_holders:
-                        old_pid = int(pr["person_id"])
-                        displaced_pids.add(old_pid)
-                        self._conn.execute(
-                            """
-                            UPDATE assignments
-                            SET status = 'rejected', source = 'reassigned', similarity = 0.0, is_anchor = 0, updated_at = ?
-                            WHERE photo_id = ? AND person_id = ? AND face_id = ?
-                            """,
-                            (now, photo_id, old_pid, face_id),
-                        )
-                    self._conn.execute(
-                        "DELETE FROM assignments WHERE face_id = ? AND person_id != ? AND status != 'rejected'",
-                        (face_id, person_id),
-                    )
-                    f_cluster = self._conn.execute(
-                        """
-                        SELECT c.cluster_id, c.person_id
-                        FROM faces f
-                        JOIN clusters c ON c.cluster_id = f.cluster_id
-                        WHERE f.face_id = ?
-                        """,
-                        (face_id,),
-                    ).fetchone()
-                    if (
-                        f_cluster is not None
-                        and f_cluster["person_id"] is not None
-                        and int(f_cluster["person_id"]) != person_id
-                    ):
-                        self._conn.execute(
-                            "UPDATE faces SET cluster_id = NULL WHERE face_id = ?",
-                            (face_id,),
-                        )
-                    self._conn.execute(
-                        "UPDATE people SET cover_face_id = COALESCE(cover_face_id, ?) WHERE person_id = ?",
-                        (face_id, person_id),
-                    )
-
+            if status == "confirmed" and face_id is not None:
+                self._claim_face_locked(
+                    face_id, person_id, source=source, now=now, explicit=True, photo_id=photo_id
+                )
                 if replace_person_id is not None and replace_person_id != person_id:
-                    displaced_pids.add(replace_person_id)
-                    self._conn.execute(
-                        """
-                        INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
-                        VALUES (?, ?, ?, 'rejected', 'reassigned', 0.0, 0, ?)
-                        ON CONFLICT(photo_id, person_id) DO UPDATE SET
-                            face_id = COALESCE(excluded.face_id, assignments.face_id),
-                            status = 'rejected',
-                            source = 'reassigned',
-                            similarity = 0.0,
-                            is_anchor = 0,
-                            updated_at = excluded.updated_at
-                        WHERE assignments.face_id IS NULL
-                           OR excluded.face_id IS NULL
-                           OR assignments.face_id = excluded.face_id
-                        """,
-                        (photo_id, replace_person_id, face_id, now),
-                    )
+                    self._record_face_negative_locked(photo_id, replace_person_id, face_id, now=now)
+                return face_id
+
+            if status == "confirmed" and replace_person_id is not None and replace_person_id != person_id:
+                self._conn.execute(
+                    """
+                    INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
+                    VALUES (?, ?, NULL, 'rejected', 'reassigned', 0.0, 0, ?)
+                    ON CONFLICT(photo_id, person_id) DO UPDATE SET
+                        status = 'rejected',
+                        source = 'reassigned',
+                        similarity = 0.0,
+                        is_anchor = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (photo_id, replace_person_id, now),
+                )
 
             self._conn.execute(
                 """
@@ -2488,7 +2472,7 @@ class FacesIndexDB:
                     status = excluded.status,
                     source = excluded.source,
                     similarity = excluded.similarity,
-                    is_anchor = CASE WHEN excluded.status = 'confirmed' AND ? = 0 THEN assignments.is_anchor ELSE 0 END,
+                    is_anchor = CASE WHEN excluded.status = 'confirmed' THEN assignments.is_anchor ELSE 0 END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -2499,15 +2483,11 @@ class FacesIndexDB:
                     source,
                     1.0 if status == "confirmed" else 0.0,
                     now,
-                    1 if is_manual_face else 0,
                 ),
             )
 
-            if face_id is not None:
-                for old_pid in displaced_pids:
-                    self._refresh_cover_face_if_needed(old_pid, face_id)
-                if status != "confirmed":
-                    self._refresh_cover_face_if_needed(person_id, face_id)
+            if face_id is not None and status != "confirmed":
+                self._refresh_cover_face_if_needed(person_id, face_id)
 
         return face_id
 

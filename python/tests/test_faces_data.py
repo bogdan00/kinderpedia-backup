@@ -473,6 +473,87 @@ class ScanLockTests(unittest.TestCase):
                 run_archive_face_scan(backup_dir=backup, recognizer=_ScanStub())
 
 
+class ClaimPrimitiveTests(unittest.TestCase):
+    """Every confirm path goes through `_claim_face_locked` with one policy."""
+
+    def _setup(self, tmp: str) -> tuple[FacesIndexDB, int, int, int, int, int]:
+        db = FacesIndexDB(Path(tmp) / "f.sqlite")
+        prov = PhotoProvenance(
+            rel_path="A/Albums/2025/01/x/a.jpg", archive_child="A", year="2025", month="01",
+            album_leaf="x", filename="a.jpg",
+        )
+        faces = [
+            DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=_vec(0)),
+            DetectedFace(box=BoundingBox(0, 150, 50, 100), embedding=_vec(1)),
+        ]
+        ((photo_id, (f0, f1)),) = db.upsert_scanned_batch([(prov, 200, 200, 1, 1, "d", faces)])
+        x = db.ensure_person("Alex")
+        y = db.ensure_person("Maya")
+        return db, photo_id, f0, f1, x, y
+
+    def _status(self, db: FacesIndexDB, photo_id: int, person_id: int) -> tuple[Any, ...] | None:
+        row = db._conn.execute(
+            "SELECT status, source, face_id FROM assignments WHERE photo_id = ? AND person_id = ?",
+            (photo_id, person_id),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+
+    def test_stale_batch_approve_never_overrides_cluster_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, _f1, x, y = self._setup(tmp)
+            # The model proposed f0 for X (an old batch shows it) ...
+            db.replace_model_assignments([(ph, x, f0, "candidate", 0.41, "model_match")], set())
+            # ... meanwhile f0 is cluster-confirmed for Y.
+            db.save_clusters(
+                [{"archive_child": "A", "year": "2025", "medoid_face_id": f0, "sample_face_ids": [f0],
+                  "face_ids": [f0], "photo_count": 1}]
+            )
+            cid = db.list_clusters()[0]["cluster_id"]
+            self.assertEqual(db.assign_cluster_to_person(cid, y), 1)
+            self.assertIsNone(self._status(db, ph, x))  # stale model guess dropped (bulk claim)
+            res = db.apply_batch_decisions(person_id=x, approved=[(ph, f0)], disproved=[])
+            self.assertEqual(res["approved"], 0)
+            self.assertEqual(res["skipped_conflicts"], 1)
+            self.assertEqual(self._status(db, ph, y), ("confirmed", "cluster_confirm", f0))
+            self.assertIsNone(self._status(db, ph, x))
+            db.close()
+
+    def test_cluster_confirm_skips_face_confirmed_for_someone_else(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, _f1, x, y = self._setup(tmp)
+            db.apply_batch_decisions(person_id=x, approved=[(ph, f0)], disproved=[])
+            db.save_clusters(
+                [{"archive_child": "A", "year": "2025", "medoid_face_id": f0, "sample_face_ids": [f0],
+                  "face_ids": [f0], "photo_count": 1}]
+            )
+            cid = db.list_clusters()[0]["cluster_id"]
+            self.assertEqual(db.assign_cluster_to_person(cid, y), 0)
+            self.assertEqual(self._status(db, ph, x), ("confirmed", "batch_approve", f0))
+            self.assertIsNone(self._status(db, ph, y))
+            db.close()
+
+    def test_explicit_tag_demotes_previous_confirmed_holder_to_face_negative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, f1, x, y = self._setup(tmp)
+            db.apply_batch_decisions(person_id=y, approved=[(ph, f0)], disproved=[])
+            db.update_person(y, cover_face_id=f0)
+            db.untag_face(photo_id=ph, face_id=f1)
+            db.tag_single_face(photo_id=ph, face_id=f0, person_id=x)
+            self.assertEqual(self._status(db, ph, x), ("confirmed", "manual_tag", f0))
+            self.assertEqual(self._status(db, ph, y), ("rejected", "reassigned", f0))
+            people = {p["person_id"]: p for p in db.list_people()}
+            self.assertNotEqual(people[y]["cover_face_id"], f0)
+            self.assertEqual(people[x]["cover_face_id"], f0)
+            # Batch reassign is explicit too, and suppress_auto is cleared on the claimed face.
+            res = db.apply_batch_decisions(person_id=x, approved=[], disproved=[], reassigned=[(ph, f1, y)])
+            self.assertEqual(res["reassigned"], 1)
+            self.assertEqual(self._status(db, ph, y), ("confirmed", "manual_tag", f1))
+            sup = db._conn.execute("SELECT suppress_auto FROM faces WHERE face_id = ?", (f1,)).fetchone()[0]
+            self.assertEqual(sup, 0)
+            self.assertEqual(self._status(db, ph, x), ("confirmed", "manual_tag", f0))  # untouched
+            db.close()
+
+
 class UpsertBatchApiTests(unittest.TestCase):
     def test_upsert_without_hashes_still_works_and_returns_face_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "f.sqlite") as db:
