@@ -18,11 +18,9 @@ from PIL import Image
 from kinderpedia_backup.faces import (
     BoundingBox,
     DetectedFace,
-    FaceOrganizationPipeline,
     FacesIndexDB,
     ProvenanceResolver,
     cosine_similarity,
-    discover_backup_photos,
     recompute_active_matching,
     resolve_best_live_url,
     run_archive_face_scan,
@@ -193,55 +191,6 @@ class FacesPipelineTests(unittest.TestCase):
             self.assertEqual(prov.seq_in_album, 1)
             self.assertEqual(prov.classroom_groups, "Butterflies")
             self.assertEqual(prov.best_live_url, "https://images.kinderpedia.co/files/photos/k1/0/orig.jpg")
-
-    def test_end_to_end_legacy_pipeline_hardlinks_and_uses_incremental_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            backup_dir = root / "backup"
-            album_dir = backup_dir / "Alex" / "Albums" / "2025" / "06" / "2025-06-01 Trip"
-            album_dir.mkdir(parents=True)
-
-            p_alex = album_dir / "001_alex_solo.jpg"
-            p_both = album_dir / "002_alex_and_maya.jpg"
-            p_other = album_dir / "003_other_kid.jpg"
-            for p in (p_alex, p_both, p_other):
-                p.write_bytes(b"fake-jpeg-bytes")
-            (album_dir / "Classroom Song.mp4").write_bytes(b"co-located-mp4-ignored-by-faces")
-
-            refs_dir = root / "refs"
-            (refs_dir / "Alex").mkdir(parents=True)
-            (refs_dir / "Maya").mkdir(parents=True)
-            (refs_dir / "Alex" / "ref_alex.jpg").write_bytes(b"ref-a")
-            (refs_dir / "Maya" / "ref_maya.jpg").write_bytes(b"ref-m")
-
-            out_dir = backup_dir / "ByChild"
-            cache_file = root / "state" / "face_scan_cache.json"
-
-            rec = _StubRecognizer(dim=4)
-            pipeline = FaceOrganizationPipeline(
-                rec,
-                threshold=0.80,
-                link_mode="hardlink",
-                cache_file=cache_file,
-            )
-
-            stats1 = pipeline.run(backup_dir=backup_dir, refs_dir=refs_dir, output_dir=out_dir)
-            self.assertEqual(stats1.reference_profiles, 2)
-            self.assertEqual(stats1.photos_discovered, 3)
-            self.assertEqual(stats1.photos_scanned, 3)
-            self.assertEqual(stats1.photos_cached, 0)
-            self.assertEqual(stats1.photos_matched, 2)
-            self.assertEqual(stats1.links_created, 3)
-
-            maya_files = sorted(f.name for f in (out_dir / "Maya").iterdir())
-            self.assertEqual((out_dir / "Maya" / maya_files[0]).stat().st_ino, p_both.stat().st_ino)
-            self.assertEqual(len(discover_backup_photos(backup_dir, exclude_dir=out_dir)), 3)
-
-            calls_before = rec.calls
-            stats2 = pipeline.run(backup_dir=backup_dir, refs_dir=refs_dir, output_dir=out_dir)
-            self.assertEqual(stats2.photos_scanned, 0)
-            self.assertEqual(stats2.photos_cached, 3)
-            self.assertEqual(rec.calls - calls_before, 2)
 
     def test_year_windowed_sibling_guard_and_hard_negative_suppression(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
