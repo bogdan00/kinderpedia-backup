@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import queue
 import shutil
 import sqlite3
@@ -416,19 +417,181 @@ def _find_chrome() -> str | None:
     return None
 
 
-_JS_SMOKE = Path(__file__).resolve().parent / "js" / "faces_ui_smoke.mjs"
+# Tiny CDP driver for headless Chrome (Node >= 22 ships a global WebSocket; no npm packages needed).
+_JS_SMOKE = r'''// Headless-Chrome smoke test for the faces UI (driven over the DevTools protocol, no npm deps).
+// Usage: node faces_ui_smoke.mjs <server-url> <chrome-binary>
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const [, , serverUrl, chromeBin] = process.argv;
+const profile = mkdtempSync(join(tmpdir(), "kp-faces-smoke-"));
+const chrome = spawn(
+  chromeBin,
+  [
+    "--headless=new",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--remote-debugging-port=0",
+    `--user-data-dir=${profile}`,
+    "about:blank",
+  ],
+  { stdio: ["ignore", "ignore", "pipe"] }
+);
+
+function fail(msg) {
+  console.error(`SMOKE FAIL: ${msg}`);
+  cleanup();
+  process.exit(1);
+}
+function cleanup() {
+  try {
+    chrome.kill("SIGKILL");
+  } catch (_e) {}
+  try {
+    rmSync(profile, { recursive: true, force: true });
+  } catch (_e) {}
+}
+const hardTimer = setTimeout(() => fail("timeout"), 75000);
+
+const browserWs = await new Promise((resolve, reject) => {
+  let buf = "";
+  chrome.stderr.on("data", (chunk) => {
+    buf += chunk.toString();
+    const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
+    if (m) resolve(m[1]);
+  });
+  chrome.on("exit", (code) => reject(new Error(`chrome exited (${code}): ${buf}`)));
+}).catch((e) => fail(String(e)));
+
+const port = new URL(browserWs).port;
+const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
+const ws = new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((res, rej) => {
+  ws.onopen = res;
+  ws.onerror = rej;
+});
+let nextId = 1;
+const pending = new Map();
+const exceptions = [];
+ws.onmessage = (msg) => {
+  const data = JSON.parse(msg.data);
+  if (data.id && pending.has(data.id)) {
+    pending.get(data.id)(data);
+    pending.delete(data.id);
+  } else if (data.method === "Runtime.exceptionThrown") {
+    exceptions.push(data.params.exceptionDetails);
+  }
+};
+function send(method, params = {}) {
+  const id = nextId++;
+  ws.send(JSON.stringify({ id, method, params }));
+  return new Promise((res) => pending.set(id, res));
+}
+async function evaluate(expr) {
+  const r = await send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true });
+  if (r.result && r.result.exceptionDetails) fail(`eval error in ${expr}: ${JSON.stringify(r.result.exceptionDetails)}`);
+  return r.result && r.result.result ? r.result.result.value : undefined;
+}
+async function waitFor(expr, label, timeoutMs = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (await evaluate(expr)) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  fail(`waiting for ${label}: ${expr}`);
+}
+
+await send("Runtime.enable");
+await send("Page.enable");
+await send("Page.navigate", { url: serverUrl });
+
+// 1) Batch trainer renders cards for the first child.
+await waitFor(`document.querySelectorAll("#batchGrid .face-card").length > 0`, "batch cards");
+const nCards = await evaluate(`document.querySelectorAll("#batchGrid .face-card").length`);
+// 1b) Cards flagged `audit: true` carry the audit badge + explanatory tooltip.
+if (!(await evaluate(`/keep them honest/.test((document.querySelector("#batchGrid .audit-pill") || {}).title || "")`))) {
+  fail("audit badge missing");
+}
+
+// 2) Clicking a card updates it in place (other card nodes survive = no full-grid re-render).
+await evaluate(`(() => {
+  const cards = document.querySelectorAll("#batchGrid .face-card");
+  window.__kpOther = cards[cards.length - 1];
+  window.__kpBefore = cards[0].className;
+  cards[0].click();
+  return true;
+})()`);
+await waitFor(
+  `document.querySelector("#batchGrid .face-card").className !== window.__kpBefore`,
+  "card decision toggled"
+);
+if (nCards > 1 && !(await evaluate(`window.__kpOther.isConnected`))) fail("batch grid was fully re-rendered");
+if (!(await evaluate(`/Submit Batch/.test(document.getElementById("btnSubmitBatch").textContent)`))) {
+  fail("submit label not updated");
+}
+
+// 3) Submit -> toast + next batch (or the empty state) without JS errors.
+await evaluate(`document.getElementById("btnSubmitBatch").click(), true`);
+await waitFor(`/Saved:/.test(document.getElementById("toast").textContent || "")`, "submit toast");
+await waitFor(
+  `document.querySelector("#batchGrid .face-card, #batchGrid .empty-state") !== null`,
+  "next batch rendered"
+);
+
+// 4) Background job: Refresh scan -> 202 -> buttons disabled -> completion toast via SSE.
+await evaluate(`document.getElementById("btnRecluster").click(), true`);
+await waitFor(`/Refreshed index/.test(document.getElementById("toast").textContent || "")`, "recluster toast", 30000);
+await waitFor(`!document.getElementById("btnRecluster").disabled`, "recluster button re-enabled");
+if (await evaluate(`!document.getElementById("backendAlertBanner").hidden`)) fail("backend flagged offline");
+
+// 5) Child clusters view: preview strip + "Show all" expands via the extra-faces endpoint.
+await evaluate(`document.querySelector('.tab-btn[data-mode="childclusters"]').click(), true`);
+await waitFor(`document.querySelectorAll("#childClustersList .cc-card").length > 0`, "child cluster cards");
+const hasToggle = await evaluate(`!!document.querySelector("#childClustersList .cc-toggle-all")`);
+if (hasToggle) {
+  await evaluate(`document.querySelector("#childClustersList .cc-toggle-all").click(), true`);
+  await waitFor(
+    `document.querySelectorAll("#childClustersList .cc-card.cc-expanded .cc-thumb").length > 12`,
+    "expanded cluster shows all faces"
+  );
+}
+
+if (exceptions.length) fail(`uncaught page exceptions: ${JSON.stringify(exceptions.slice(0, 3))}`);
+clearTimeout(hardTimer);
+console.log(`SMOKE OK (cards=${nCards}, expanded=${hasToggle})`);
+ws.close();
+cleanup();
+process.exit(0);
+'''
 
 
-@unittest.skipUnless(_find_chrome() and shutil.which("node") and _JS_SMOKE.is_file(), "needs Chrome + node")
+@unittest.skipUnless(
+    _find_chrome() and shutil.which("node") and not os.environ.get("KP_SKIP_BROWSER_TESTS"),
+    "needs a local Chrome/Chromium + node (set KP_SKIP_BROWSER_TESTS=1 to skip)",
+)
 class FacesUiBrowserSmokeTests(unittest.TestCase):
-    """Drive the real `app.js` in headless Chrome over CDP: batch -> submit -> next batch."""
+    """Drive the real `app.js` in headless Chrome: batch -> card toggle in place -> submit -> next batch,
+    audit badge, recluster job completion via SSE, child-cluster "Show all" expansion."""
 
-    def test_batch_flow_in_headless_chrome(self) -> None:
+    def test_ui_smoke_in_headless_chrome(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             backup_dir = Path(tmp) / "bk"
+            script = Path(tmp) / "faces_ui_smoke.mjs"
+            script.write_text(_JS_SMOKE, encoding="utf-8")
             db = FacesIndexDB(backup_dir / "Metadata" / "faces_index.sqlite")
             try:
                 _seed(db)
+                orig_batch = db.get_batch_proposal
+
+                def batch_with_audit(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                    res = orig_batch(*args, **kwargs)
+                    if res.get("cards"):
+                        res["cards"][0]["audit"] = True
+                    return res
+
                 ctx = _AppContext(
                     backup_dir=backup_dir,
                     output_dir=backup_dir / "ByChild",
@@ -441,13 +604,19 @@ class FacesUiBrowserSmokeTests(unittest.TestCase):
                 th = threading.Thread(target=httpd.serve_forever, daemon=True)
                 th.start()
                 try:
-                    proc = subprocess.run(
-                        [str(shutil.which("node")), str(_JS_SMOKE), f"http://127.0.0.1:{int(httpd.server_address[1])}/", str(_find_chrome())],
-                        capture_output=True,
-                        text=True,
-                        timeout=90,
-                    )
-                    self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+                    with mock.patch.object(db, "get_batch_proposal", side_effect=batch_with_audit):
+                        proc = subprocess.run(
+                            [
+                                str(shutil.which("node")),
+                                str(script),
+                                f"http://127.0.0.1:{int(httpd.server_address[1])}/",
+                                str(_find_chrome()),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=100,
+                        )
+                    self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-4000:]}")
                     self.assertIn("SMOKE OK", proc.stdout)
                 finally:
                     httpd.shutdown()

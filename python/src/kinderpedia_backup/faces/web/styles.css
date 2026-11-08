@@ -2324,6 +2324,35 @@ input:disabled {
   background: rgba(168, 101, 24, 0.92);
 }
 
+/* Batch Trainer: random audit sample of auto-accepted matches */
+.audit-pill {
+  position: absolute;
+  top: 36px;
+  left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #fff;
+  background: rgba(79, 70, 160, 0.92);
+  cursor: help;
+}
+
+.face-card.is-audit {
+  box-shadow: 0 0 0 2px rgba(79, 70, 160, 0.45);
+}
+
+/* Lightbox thumbnail strip: windowed ±30 around the current photo */
+.modal-strip-more {
+  align-self: center;
+  padding: 0 6px;
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
 /* Backend background-work status chip (top bar) */
 .bg-status-chip {
   display: inline-flex;
