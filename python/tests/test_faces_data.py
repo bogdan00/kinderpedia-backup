@@ -300,6 +300,46 @@ class LabelPreservingRescanTests(_ArchiveCase):
         self.assertTrue(all("Renamed Trip" in str(r[0]) for r in rows))
         self.assertTrue(all(str(r[1]) == "2025-07-02 Renamed Trip" and str(r[2]) == "07" for r in rows))
 
+    def test_rename_keeps_pre2024_fullsize_best_live_url(self) -> None:
+        """Re-keying a renamed album must pick `best_live_url` exactly like a fresh scan (with pixel size)."""
+
+        def write_meta(leaf: str) -> None:
+            meta_dir = self.backup / "Metadata" / "Alex" / "Albums"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            images = [
+                {
+                    "id": 5000 + i,
+                    # Pre-2024 migrated album: download_url 404s, fullsize carries the local pixel size.
+                    "download_url": f"https://images.example.invalid/files/photos/k1/{i}/dead.jpg",
+                    "fullsize": f"https://images.example.invalid/200x200/files/photos/k1/{i}/live.jpg",
+                    "thumb": f"https://images.example.invalid/300x300/files/photos/k1/{i}/live.jpg",
+                }
+                for i in range(len(self.files))
+            ]
+            (meta_dir / f"{leaf}.json").write_text(
+                json.dumps({"album_listing": {"id": 77, "name": "Trip"}, "images": images}), encoding="utf-8"
+            )
+
+        def urls() -> dict[str, str]:
+            with FacesIndexDB(self.db_path) as db:
+                rows = db._conn.execute("SELECT filename, best_live_url, width, height FROM photos").fetchall()
+            self.assertTrue(all((int(r[2]), int(r[3])) == (200, 200) for r in rows))
+            return {str(r[0]): str(r[1]) for r in rows}
+
+        write_meta(self.album.name)
+        self.scan(_ScanStub())
+        before = urls()
+        self.assertEqual(len(before), 5)
+        self.assertTrue(all("/200x200/" in u and u.endswith("live.jpg") for u in before.values()))
+
+        new_album = self.album.with_name("2025-06-01 Trip Renamed")
+        self.album.rename(new_album)
+        write_meta(new_album.name)
+        rec = _ScanStub()
+        summary = self.scan(rec)
+        self.assertEqual((summary.photos_rekeyed, rec.calls), (5, 0))
+        self.assertEqual(urls(), before)
+
     def test_deleted_photo_rows_are_removed_and_counts_stay_consistent(self) -> None:
         self.scan(_ScanStub())
         self._seed_labels()

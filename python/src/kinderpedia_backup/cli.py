@@ -201,18 +201,13 @@ def _add_faces_arguments(parser: argparse.ArgumentParser) -> None:
         "--workers",
         type=int,
         default=None,
-        help="Concurrent photo inference threads during `faces scan` (default: up to 6 CPU cores)",
+        help="Concurrent photo inference threads during `faces scan` (default: up to 8 CPU cores)",
     )
     parser.add_argument(
         "--mode",
         choices=("hardlink", "symlink", "copy"),
         default="hardlink",
         help="How matched photos are materialized into ByChild/<Person>/ (default: hardlink — zero extra disk space)",
-    )
-    parser.add_argument(
-        "--backend",
-        default="auto",
-        help="Local ONNX execution backend: auto, onnxruntime, or opencv (default: auto)",
     )
     parser.add_argument(
         "--host",
@@ -647,7 +642,7 @@ def run_faces(args: argparse.Namespace) -> int:
     # Default action == "scan":
     out_dir = Path(args.output).expanduser().resolve() if args.output else (backup_dir / "ByChild").resolve()
     try:
-        recognizer = load_default_recognizer(args.backend, det_size=args.det_size)
+        recognizer = load_default_recognizer(det_size=args.det_size)
     except MissingFacesBackendError as exc:
         log(f"[Faces] {exc}")
         return 2

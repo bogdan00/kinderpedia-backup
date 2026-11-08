@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10,<3.15"
 # dependencies = [
 #   "requests>=2.28,<3",
+#   "numpy>=1.24",
+#   "pillow>=10.0",
+#   "onnxruntime>=1.17",
 # ]
 # ///
 """Zero-install entrypoint for running directly from a git checkout (`uv run python/kinderpedia.py`)."""

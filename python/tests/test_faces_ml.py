@@ -1,14 +1,16 @@
-"""Numerical / golden tests for the faces ML layer: alignment, SCRFD decoding, backends and matcher."""
+"""Numerical / golden tests for the faces ML layer: alignment, SCRFD decoding, ONNX Runtime engine and matcher."""
 
 from __future__ import annotations
 
-import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
+import onnxruntime as ort
 from numpy.typing import NDArray
 from PIL import Image
 
@@ -18,13 +20,17 @@ from kinderpedia_backup.faces.alignment import (
     SCRFD_STRIDE_HEADS,
     align_face_112,
     decode_scrfd_outputs,
+    letterbox_scrfd_input,
     umeyama_similarity_2d,
 )
 from kinderpedia_backup.faces.models import PhotoProvenance
-from kinderpedia_backup.faces.onnx_backend import _OpenCvDnnRunner, map_scrfd_outputs_by_shape
-from kinderpedia_backup.faces.weights import default_models_dir
-
-HAS_CV2 = importlib.util.find_spec("cv2") is not None
+from kinderpedia_backup.faces.onnx_backend import ScrfdArcFaceRecognizer, _OrtRunner
+from kinderpedia_backup.faces.weights import (
+    DET_MODEL_FILENAME,
+    REC_MODEL_FILENAME,
+    default_models_dir,
+    ensure_buffalo_l_weights,
+)
 
 
 def _smooth_test_image(width: int = 320, height: int = 240, seed: int = 3) -> NDArray[np.uint8]:
@@ -110,10 +116,8 @@ class AlignmentGoldenTests(unittest.TestCase):
             self.assertLess(float(diff.mean()), 0.75, msg=f"case {angle, scale}")
             self.assertLessEqual(float(diff.max()), 1.5, msg=f"case {angle, scale}")
 
-    @unittest.skipUnless(HAS_CV2, "opencv not installed")
     def test_matches_cv2_warpaffine_golden(self) -> None:
-        import cv2
-
+        # opencv-python-headless (dev extra) is only the golden reference; production warps with Pillow.
         img = _smooth_test_image()
         for angle, scale, offset in self.CASES:
             lm = _landmarks(angle, scale, offset)
@@ -196,72 +200,88 @@ class ScrfdDecodeGoldenTests(unittest.TestCase):
         self.assertEqual([round(d.score, 2) for d in dets], [0.90])
 
 
-class BackendOutputMappingTests(unittest.TestCase):
-    def test_shape_mapping_is_independent_of_graph_order(self) -> None:
-        det_size = 640
-        named: dict[str, NDArray[np.float32]] = {}
-        rng = np.random.default_rng(0)
-        for stride, s_key, b_key, k_key in SCRFD_STRIDE_HEADS:
-            n = 2 * (det_size // stride) ** 2
-            named[s_key] = rng.random((n, 1)).astype(np.float32)
-            named[b_key] = rng.random((n, 4)).astype(np.float32)
-            named[k_key] = rng.random((n, 10)).astype(np.float32)
-        # OpenCV / ONNX graph order is type-major (all scores, all boxes, all kps):
-        graph_order = [str(h[pos]) for pos in (1, 2, 3) for h in SCRFD_STRIDE_HEADS]
-        mapped = map_scrfd_outputs_by_shape([named[k] for k in graph_order], det_size=det_size)
-        self.assertEqual(set(mapped), set(named))
-        for key, arr in named.items():
-            self.assertIs(mapped[key], arr)
-        # Shuffled order and an extra batch axis still map correctly:
-        shuffled = list(reversed(graph_order))
-        mapped2 = map_scrfd_outputs_by_shape([named[k][None] for k in shuffled], det_size=det_size)
-        for key, arr in named.items():
-            np.testing.assert_array_equal(mapped2[key][0], arr)
-        # Unknown shapes -> refuse to guess:
-        self.assertEqual(map_scrfd_outputs_by_shape([named[k] for k in graph_order[:-1]], det_size=det_size), {})
-        self.assertEqual(map_scrfd_outputs_by_shape([np.zeros((7, 3))], det_size=det_size), {})
+REQUIRE_ORT_PARITY = os.environ.get("KP_REQUIRE_ORT_PARITY") == "1"
 
 
-def _cached_weights() -> tuple[Path, Path] | None:
+def _parity_weights() -> tuple[Path, Path] | None:
+    """Pinned weights: downloaded + SHA-verified when parity is required (CI), else only if cached."""
+    if REQUIRE_ORT_PARITY:
+        return ensure_buffalo_l_weights()
     md = default_models_dir()
-    det, rec = md / "det_10g.onnx", md / "w600k_r50.onnx"
+    det, rec = md / DET_MODEL_FILENAME, md / REC_MODEL_FILENAME
     return (det, rec) if det.is_file() and rec.is_file() else None
 
 
-@unittest.skipUnless(HAS_CV2 and _cached_weights() is not None, "needs opencv + cached ONNX weights")
-class BackendParityTests(unittest.TestCase):
-    """Runs only on machines with the model cache (never downloads)."""
+class OrtEngineParityTests(unittest.TestCase):
+    """
+    The production `_OrtRunner` (CoreML on macOS, CUDA if available, else CPU) against a plain
+    CPU `InferenceSession` on the pinned SCRFD / ArcFace weights. Skips without cached weights unless
+    `KP_REQUIRE_ORT_PARITY=1`, which downloads them and turns any problem into a failure.
+    """
 
-    def test_opencv_runner_exposes_all_heads_and_matches_onnxruntime(self) -> None:
-        weights = _cached_weights()
-        assert weights is not None
-        det_path, rec_path = weights
-        blob = np.random.default_rng(1).uniform(-1.0, 1.0, size=(1, 3, 640, 640)).astype(np.float32)
-        crops = np.random.default_rng(2).uniform(-1.0, 1.0, size=(2, 3, 112, 112)).astype(np.float32)
-        cv_runner = _OpenCvDnnRunner(det_path, rec_path)
-        cv_out = cv_runner.run_detector(blob)
-        for stride, s_key, b_key, k_key in SCRFD_STRIDE_HEADS:
-            n = 2 * (640 // stride) ** 2
-            self.assertEqual(int(cv_out[s_key].size), n)
-            self.assertEqual(int(cv_out[b_key].size), n * 4)
-            self.assertEqual(int(cv_out[k_key].size), n * 10)
-        cv_emb = cv_runner.run_embedder(crops[:1])
-        if importlib.util.find_spec("onnxruntime") is None:
-            return
-        import onnxruntime as ort
+    weights: tuple[Path, Path]
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        weights = _parity_weights()
+        if weights is None:
+            raise unittest.SkipTest("ONNX weights not cached (set KP_REQUIRE_ORT_PARITY=1 to download)")
+        cls.weights = weights
+
+    def _cpu_sessions(self) -> tuple[ort.InferenceSession, ort.InferenceSession]:
         so = ort.SessionOptions()
         so.log_severity_level = 3
-        det = ort.InferenceSession(str(det_path), so, providers=["CPUExecutionProvider"])
-        rec = ort.InferenceSession(str(rec_path), so, providers=["CPUExecutionProvider"])
-        names = [o.name for o in det.get_outputs()]
-        ort_out = dict(zip(names, det.run(names, {det.get_inputs()[0].name: blob}), strict=True))
-        for key in ort_out:
-            np.testing.assert_allclose(np.asarray(cv_out[key]).reshape(-1), ort_out[key].reshape(-1), atol=1e-3)
-        ort_emb = rec.run(None, {rec.get_inputs()[0].name: crops[:1]})[0]
-        a = cv_emb[0] / np.linalg.norm(cv_emb[0])
-        b = ort_emb[0] / np.linalg.norm(ort_emb[0])
-        self.assertGreater(float(a @ b), 0.999)
+        det_path, rec_path = self.weights
+        return (
+            ort.InferenceSession(str(det_path), so, providers=["CPUExecutionProvider"]),
+            ort.InferenceSession(str(rec_path), so, providers=["CPUExecutionProvider"]),
+        )
+
+    def test_runner_maps_scrfd_heads_by_name_and_matches_cpu_reference(self) -> None:
+        det_path, rec_path = self.weights
+        runner = _OrtRunner(det_path, rec_path, det_size=640)
+        self.assertIn("CPUExecutionProvider", runner.active_providers)
+        blob, _ = letterbox_scrfd_input(Image.fromarray(_smooth_test_image(960, 720)), det_size=640)
+        out = runner.run_detector(blob)
+        for stride, s_key, b_key, k_key in SCRFD_STRIDE_HEADS:
+            n = 2 * (640 // stride) ** 2
+            self.assertEqual(int(out[s_key].size), n)
+            self.assertEqual(int(out[b_key].size), n * 4)
+            self.assertEqual(int(out[k_key].size), n * 10)
+        det_cpu, rec_cpu = self._cpu_sessions()
+        names = [o.name for o in det_cpu.get_outputs()]
+        ref = dict(zip(names, det_cpu.run(names, {det_cpu.get_inputs()[0].name: blob}), strict=True))
+        self.assertEqual(set(ref), set(out))
+        # CoreML runs in reduced precision: scores must agree tightly; box / keypoint distances (in
+        # stride units, |v| up to ~3.5) on this synthetic input drift by <= ~0.25 at worst.
+        score_keys = {s for _, s, _, _ in SCRFD_STRIDE_HEADS}
+        for key, ref_arr in ref.items():
+            diff = np.abs(out[key].reshape(-1) - ref_arr.reshape(-1))
+            if key in score_keys:
+                self.assertLess(float(diff.max()), 0.01, msg=key)
+            else:
+                self.assertLess(float(diff.mean()), 0.03, msg=key)
+                self.assertLess(float(diff.max()), 0.35, msg=key)
+
+        crops = np.random.default_rng(2).uniform(-1.0, 1.0, size=(3, 3, 112, 112)).astype(np.float32)
+        emb = runner.run_embedder(crops)
+        self.assertEqual(emb.shape, (3, 512))
+        ref_emb = np.concatenate(
+            [rec_cpu.run(None, {rec_cpu.get_inputs()[0].name: crops[i : i + 1]})[0] for i in range(3)]
+        )
+        for i in range(3):
+            a = emb[i] / np.linalg.norm(emb[i])
+            b = ref_emb[i] / np.linalg.norm(ref_emb[i])
+            self.assertGreater(float(a @ b), 0.995)
+
+    def test_recognizer_end_to_end_on_a_faceless_image(self) -> None:
+        rec = ScrfdArcFaceRecognizer(models_dir=self.weights[0].parent)
+        self.assertTrue(rec.model_id.startswith("scrfd_10g_640_arcface_r50_v1_align"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.png"
+            Image.fromarray(_smooth_test_image()).save(path)
+            width, height, faces, thumbs = rec.analyze_photo(path, thumb_size=64)
+        self.assertEqual((width, height, faces, thumbs), (320, 240, [], []))
 
 
 class _SyntheticClassroom:

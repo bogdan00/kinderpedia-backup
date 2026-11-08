@@ -171,6 +171,8 @@ class PhotoScanState:
     content_hash: str
     kinderpedia_image_id: int | None
     filename: str
+    width: int  # EXIF-normalized pixel size from the last detection pass (feeds `best_live_url`)
+    height: int
 
 
 @dataclass

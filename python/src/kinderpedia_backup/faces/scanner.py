@@ -319,8 +319,7 @@ def _run_locked_scan(
     summary = ScanSummary(photos_total=len(photos))
     resolver = ProvenanceResolver(backup_root)
     det_id = recognizer.model_id
-    default_cap = 8 if getattr(recognizer, "engine_kind", "") == "onnxruntime" else 6
-    eff_workers = max(1, workers if workers is not None else min(default_cap, os.cpu_count() or 4))
+    eff_workers = max(1, workers if workers is not None else min(8, os.cpu_count() or 4))
     io_workers = max(4, eff_workers)
     report = RelinkReport()
 
@@ -453,21 +452,23 @@ def _scan_body(
         new_hashes = _hash_many([(p, sz) for p, sz, _ in new_files], io_workers)
         still_new: list[tuple[Path, int, int]] = []
         for (p, sz, mtime_ns), h in zip(new_files, new_hashes, strict=True):
-            prov = resolver.resolve(p)
             old_rel = by_hash.get(h) if h else None
             if old_rel is None or old_rel not in missing:
                 old_rel = None
-                if prov.kinderpedia_image_id is not None:
-                    cands = [
-                        r for r in by_kp.get((prov.kinderpedia_image_id, sz), []) if r in missing
-                    ]
-                    same_name = [r for r in cands if missing[r].filename == prov.filename]
+                # Pixel size is irrelevant for the Kinderpedia image id lookup.
+                img_id = resolver.resolve(p, width=0, height=0).kinderpedia_image_id
+                if img_id is not None:
+                    cands = [r for r in by_kp.get((img_id, sz), []) if r in missing]
+                    same_name = [r for r in cands if missing[r].filename == p.resolve().name]
                     pick = same_name or cands
                     old_rel = pick[0] if pick else None
             if old_rel is None:
                 still_new.append((p, sz, mtime_ns))
                 continue
             prev = missing.pop(old_rel)
+            # Same content (fingerprint, or Kinderpedia id + size) -> same pixel size as the indexed row,
+            # so `best_live_url` is chosen exactly as a fresh scan would.
+            prov = resolver.resolve(p, width=prev.width, height=prev.height)
             db.rekey_photo(prev.photo_id, prov, mtime_ns=mtime_ns, content_hash=h or "")
             summary.photos_rekeyed += 1
             if force or prev.detector_id != det_id or prev.file_size != sz:
