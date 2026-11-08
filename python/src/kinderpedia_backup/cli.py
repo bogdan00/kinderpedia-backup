@@ -228,6 +228,33 @@ def _add_faces_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Inspect discovered album photos, avatars, and reference portraits without running ML inference",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="`faces scan`: re-detect every photo (labels are preserved by re-linking faces to their old ids)",
+    )
+    prune_group = parser.add_mutually_exclusive_group()
+    prune_group.add_argument(
+        "--prune-missing",
+        dest="prune_missing",
+        action="store_const",
+        const=True,
+        default=None,
+        help="`faces scan`: always delete index rows of photos no longer on disk (default: auto-guarded)",
+    )
+    prune_group.add_argument(
+        "--keep-missing",
+        dest="prune_missing",
+        action="store_const",
+        const=False,
+        help="`faces scan`: never delete index rows of photos missing on disk",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=0.0,
+        help="`faces scan`: seconds to wait for another running scan to finish (default: 0 = refuse)",
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -557,6 +584,8 @@ def run_faces(args: argparse.Namespace) -> int:
         log(f"[Faces] {exc}")
         return 2
 
+    from .faces.db.scan_lock import ScanLockBusyError
+
     progress = LiveProgress(enabled=not args.no_progress)
     set_active_progress(progress)
     try:
@@ -570,7 +599,13 @@ def run_faces(args: argparse.Namespace) -> int:
                 auto_high_threshold=args.threshold,
                 candidate_threshold=args.candidate_threshold,
                 progress=progress,
+                force=bool(getattr(args, "force", False)),
+                prune_missing=getattr(args, "prune_missing", None),
+                lock_timeout_s=float(getattr(args, "lock_timeout", 0.0) or 0.0),
             )
+    except ScanLockBusyError as exc:
+        log(f"[Faces] {exc}")
+        return 3
     except KeyboardInterrupt:
         progress.close()
         set_active_progress(None)
@@ -586,6 +621,12 @@ def run_faces(args: argparse.Namespace) -> int:
         f"clusters={summary.clusters_created:,}, seeded_people={summary.people_seeded}, "
         f"auto_matches={summary.auto_high_matches:,}, review_candidates={summary.candidate_matches:,}"
     )
+    if summary.photos_verified or summary.photos_rekeyed or summary.photos_removed or summary.faces_relinked:
+        log(
+            f"[Faces] Reconcile: verified-unchanged={summary.photos_verified:,}, "
+            f"re-keyed={summary.photos_rekeyed:,}, removed={summary.photos_removed:,}, "
+            f"faces re-linked={summary.faces_relinked:,}, labels without face box={summary.labels_orphaned:,}"
+        )
     log("[Faces] Next step: run `kinderpedia-backup faces ui` to batch-confirm children & classmates!")
     return 0
 

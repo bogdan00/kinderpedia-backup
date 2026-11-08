@@ -16,6 +16,8 @@ from numpy.typing import NDArray
 
 from ..security import ensure_within_directory, write_json_atomic
 from ..sync.naming import sanitize_name
+from .db.relink import StoredFace, match_faces
+from .db.schema import apply_migrations, read_schema_version
 from .models import (
     AssignmentSource,
     AssignmentStatus,
@@ -25,247 +27,10 @@ from .models import (
     OrganizeStats,
     PersonRole,
     PhotoProvenance,
+    PhotoScanState,
+    RelinkReport,
 )
 from .storage import link_or_copy_photo
-
-_SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS photos (
-    photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    rel_path TEXT UNIQUE NOT NULL,
-    archive_child TEXT NOT NULL,
-    year TEXT NOT NULL,
-    month TEXT NOT NULL,
-    album_leaf TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    kinderpedia_album_id INTEGER,
-    album_title TEXT NOT NULL DEFAULT '',
-    album_date TEXT NOT NULL DEFAULT '',
-    classroom_groups TEXT NOT NULL DEFAULT '',
-    kinderpedia_image_id INTEGER,
-    seq_in_album INTEGER,
-    image_dateadd TEXT NOT NULL DEFAULT '',
-    best_live_url TEXT NOT NULL DEFAULT '',
-    download_url TEXT NOT NULL DEFAULT '',
-    fullsize_url TEXT NOT NULL DEFAULT '',
-    thumb_url TEXT NOT NULL DEFAULT '',
-    width INTEGER NOT NULL DEFAULT 0,
-    height INTEGER NOT NULL DEFAULT 0,
-    file_size INTEGER NOT NULL,
-    mtime_ns INTEGER NOT NULL,
-    detector_id TEXT NOT NULL,
-    face_count INTEGER NOT NULL DEFAULT 0,
-    scanned_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_photos_child_year ON photos(archive_child, year);
-CREATE INDEX IF NOT EXISTS idx_photos_kp_img_id ON photos(kinderpedia_image_id);
-
-CREATE TABLE IF NOT EXISTS people (
-    person_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    display_name TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    role TEXT NOT NULL DEFAULT 'classmate',
-    archive_hint TEXT NOT NULL DEFAULT '',
-    cover_face_id INTEGER,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS clusters (
-    cluster_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    archive_child TEXT NOT NULL,
-    year TEXT NOT NULL,
-    person_id INTEGER REFERENCES people(person_id) ON DELETE SET NULL,
-    medoid_face_id INTEGER,
-    sample_face_ids_json TEXT NOT NULL DEFAULT '[]',
-    face_count INTEGER NOT NULL DEFAULT 0,
-    photo_count INTEGER NOT NULL DEFAULT 0,
-    suggested_person_id INTEGER REFERENCES people(person_id) ON DELETE SET NULL,
-    suggested_similarity REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_clusters_year ON clusters(year, face_count DESC);
-
-CREATE TABLE IF NOT EXISTS faces (
-    face_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    photo_id INTEGER NOT NULL REFERENCES photos(photo_id) ON DELETE CASCADE,
-    face_idx INTEGER NOT NULL,
-    det_score REAL NOT NULL,
-    bbox_top INTEGER NOT NULL,
-    bbox_right INTEGER NOT NULL,
-    bbox_bottom INTEGER NOT NULL,
-    bbox_left INTEGER NOT NULL,
-    embedding_f16 BLOB NOT NULL,
-    cluster_id INTEGER REFERENCES clusters(cluster_id) ON DELETE SET NULL,
-    suppress_auto INTEGER NOT NULL DEFAULT 0,
-    is_manual INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(photo_id, face_idx)
-);
-
-CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
-CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster_id);
-
-CREATE TABLE IF NOT EXISTS reference_seeds (
-    seed_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
-    source_key TEXT UNIQUE NOT NULL,
-    anchor_year INTEGER,
-    embedding_f16 BLOB NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS assignments (
-    photo_id INTEGER NOT NULL REFERENCES photos(photo_id) ON DELETE CASCADE,
-    person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
-    face_id INTEGER REFERENCES faces(face_id) ON DELETE SET NULL,
-    status TEXT NOT NULL,
-    source TEXT NOT NULL,
-    similarity REAL NOT NULL DEFAULT 0.0,
-    is_anchor INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (photo_id, person_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_assignments_person_status ON assignments(person_id, status, similarity DESC);
-CREATE INDEX IF NOT EXISTS idx_assignments_person_cov
-    ON assignments(person_id, status, similarity DESC, source, face_id, photo_id);
-CREATE INDEX IF NOT EXISTS idx_assignments_cat_faces
-    ON assignments(face_id, person_id)
-    WHERE face_id IS NOT NULL AND status IN ('confirmed', 'auto_high');
-CREATE INDEX IF NOT EXISTS idx_assignments_confirmed_photo
-    ON assignments(photo_id, person_id)
-    WHERE status = 'confirmed';
-CREATE INDEX IF NOT EXISTS idx_assignments_face ON assignments(face_id);
-
-CREATE TABLE IF NOT EXISTS school_classes (
-    class_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL COLLATE NOCASE,
-    archive_child TEXT NOT NULL DEFAULT '',
-    start_date TEXT NOT NULL DEFAULT '',
-    end_date TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS class_members (
-    class_id INTEGER NOT NULL REFERENCES school_classes(class_id) ON DELETE CASCADE,
-    person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
-    PRIMARY KEY (class_id, person_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_class_members_person ON class_members(person_id);
-
-CREATE TABLE IF NOT EXISTS person_face_pressure (
-    person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
-    face_id INTEGER NOT NULL REFERENCES faces(face_id) ON DELETE CASCADE,
-    weight REAL NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (person_id, face_id)
-);
-
-CREATE TABLE IF NOT EXISTS person_assignment_counts (
-    person_id INTEGER PRIMARY KEY REFERENCES people(person_id) ON DELETE CASCADE,
-    confirmed_count INTEGER NOT NULL DEFAULT 0,
-    auto_high_count INTEGER NOT NULL DEFAULT 0,
-    album_cohesion_count INTEGER NOT NULL DEFAULT 0,
-    candidate_count INTEGER NOT NULL DEFAULT 0,
-    unsure_count INTEGER NOT NULL DEFAULT 0,
-    rejected_count INTEGER NOT NULL DEFAULT 0,
-    categorized_face_count INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TRIGGER IF NOT EXISTS trg_assignments_ai_counts
-AFTER INSERT ON assignments
-BEGIN
-    INSERT INTO person_assignment_counts (
-        person_id,
-        confirmed_count,
-        auto_high_count,
-        album_cohesion_count,
-        candidate_count,
-        unsure_count,
-        rejected_count,
-        categorized_face_count
-    ) VALUES (
-        NEW.person_id,
-        CASE WHEN NEW.status = 'confirmed' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'auto_high' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'auto_high' AND NEW.source IN ('album_cohesion', 'model_trusted') THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'candidate' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'unsure' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'rejected' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.face_id IS NOT NULL AND NEW.status IN ('confirmed', 'auto_high') THEN 1 ELSE 0 END
-    )
-    ON CONFLICT(person_id) DO UPDATE SET
-        confirmed_count = confirmed_count + excluded.confirmed_count,
-        auto_high_count = auto_high_count + excluded.auto_high_count,
-        album_cohesion_count = album_cohesion_count + excluded.album_cohesion_count,
-        candidate_count = candidate_count + excluded.candidate_count,
-        unsure_count = unsure_count + excluded.unsure_count,
-        rejected_count = rejected_count + excluded.rejected_count,
-        categorized_face_count = categorized_face_count + excluded.categorized_face_count;
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_assignments_ad_counts
-AFTER DELETE ON assignments
-BEGIN
-    UPDATE person_assignment_counts
-    SET confirmed_count = confirmed_count - (CASE WHEN OLD.status = 'confirmed' THEN 1 ELSE 0 END),
-        auto_high_count = auto_high_count - (CASE WHEN OLD.status = 'auto_high' THEN 1 ELSE 0 END),
-        album_cohesion_count = album_cohesion_count - (CASE WHEN OLD.status = 'auto_high' AND OLD.source IN ('album_cohesion', 'model_trusted') THEN 1 ELSE 0 END),
-        candidate_count = candidate_count - (CASE WHEN OLD.status = 'candidate' THEN 1 ELSE 0 END),
-        unsure_count = unsure_count - (CASE WHEN OLD.status = 'unsure' THEN 1 ELSE 0 END),
-        rejected_count = rejected_count - (CASE WHEN OLD.status = 'rejected' THEN 1 ELSE 0 END),
-        categorized_face_count = categorized_face_count - (CASE WHEN OLD.face_id IS NOT NULL AND OLD.status IN ('confirmed', 'auto_high') THEN 1 ELSE 0 END)
-    WHERE person_id = OLD.person_id;
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_assignments_au_counts
-AFTER UPDATE OF person_id, face_id, status, source ON assignments
-BEGIN
-    UPDATE person_assignment_counts
-    SET confirmed_count = confirmed_count - (CASE WHEN OLD.status = 'confirmed' THEN 1 ELSE 0 END),
-        auto_high_count = auto_high_count - (CASE WHEN OLD.status = 'auto_high' THEN 1 ELSE 0 END),
-        album_cohesion_count = album_cohesion_count - (CASE WHEN OLD.status = 'auto_high' AND OLD.source IN ('album_cohesion', 'model_trusted') THEN 1 ELSE 0 END),
-        candidate_count = candidate_count - (CASE WHEN OLD.status = 'candidate' THEN 1 ELSE 0 END),
-        unsure_count = unsure_count - (CASE WHEN OLD.status = 'unsure' THEN 1 ELSE 0 END),
-        rejected_count = rejected_count - (CASE WHEN OLD.status = 'rejected' THEN 1 ELSE 0 END),
-        categorized_face_count = categorized_face_count - (CASE WHEN OLD.face_id IS NOT NULL AND OLD.status IN ('confirmed', 'auto_high') THEN 1 ELSE 0 END)
-    WHERE person_id = OLD.person_id;
-
-    INSERT INTO person_assignment_counts (
-        person_id,
-        confirmed_count,
-        auto_high_count,
-        album_cohesion_count,
-        candidate_count,
-        unsure_count,
-        rejected_count,
-        categorized_face_count
-    ) VALUES (
-        NEW.person_id,
-        CASE WHEN NEW.status = 'confirmed' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'auto_high' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'auto_high' AND NEW.source IN ('album_cohesion', 'model_trusted') THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'candidate' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'unsure' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.status = 'rejected' THEN 1 ELSE 0 END,
-        CASE WHEN NEW.face_id IS NOT NULL AND NEW.status IN ('confirmed', 'auto_high') THEN 1 ELSE 0 END
-    )
-    ON CONFLICT(person_id) DO UPDATE SET
-        confirmed_count = confirmed_count + excluded.confirmed_count,
-        auto_high_count = auto_high_count + excluded.auto_high_count,
-        album_cohesion_count = album_cohesion_count + excluded.album_cohesion_count,
-        candidate_count = candidate_count + excluded.candidate_count,
-        unsure_count = unsure_count + excluded.unsure_count,
-        rejected_count = rejected_count + excluded.rejected_count,
-        categorized_face_count = categorized_face_count + excluded.categorized_face_count;
-END;
-"""
 
 
 def _now_iso() -> str:
@@ -408,85 +173,8 @@ class FacesIndexDB:
             self._conn.execute("PRAGMA journal_mode = WAL;")
             self._conn.execute("PRAGMA synchronous = NORMAL;")
             self._conn.execute("PRAGMA foreign_keys = ON;")
-            self._conn.executescript(_SCHEMA_SQL)
-            face_cols = {
-                str(r["name"])
-                for r in self._conn.execute("PRAGMA table_info(faces)").fetchall()
-            }
-            if "suppress_auto" not in face_cols:
-                self._conn.execute(
-                    "ALTER TABLE faces ADD COLUMN suppress_auto INTEGER NOT NULL DEFAULT 0"
-                )
-            if "is_manual" not in face_cols:
-                self._conn.execute(
-                    "ALTER TABLE faces ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0"
-                )
-            people_cols = {
-                str(r["name"])
-                for r in self._conn.execute("PRAGMA table_info(people)").fetchall()
-            }
-            if "birth_date" not in people_cols:
-                self._conn.execute(
-                    "ALTER TABLE people ADD COLUMN birth_date TEXT NOT NULL DEFAULT ''"
-                )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_faces_suppressed ON faces(face_id) WHERE suppress_auto != 0"
-            )
-            self._conn.execute(
-                """
-                DELETE FROM assignments
-                WHERE face_id IS NOT NULL
-                  AND status != 'rejected'
-                  AND person_id IN (SELECT person_id FROM people WHERE role = 'ignore')
-                  AND EXISTS (
-                      SELECT 1
-                      FROM assignments a2
-                      JOIN people pe2 ON pe2.person_id = a2.person_id
-                      WHERE a2.face_id = assignments.face_id
-                        AND a2.status != 'rejected'
-                        AND pe2.role != 'ignore'
-                  )
-                """
-            )
-            counts_ver = self._conn.execute(
-                "SELECT value FROM meta WHERE key = 'person_assignment_counts_v1'"
-            ).fetchone()
-            if counts_ver is None or str(counts_ver["value"]) != "2":
-                # v2: `album_cohesion_count` also counts `model_trusted` auto matches (no review needed).
-                for trg in ("trg_assignments_ai_counts", "trg_assignments_ad_counts", "trg_assignments_au_counts"):
-                    self._conn.execute(f"DROP TRIGGER IF EXISTS {trg}")
-                self._conn.executescript(_SCHEMA_SQL)
-                self._conn.execute("DELETE FROM person_assignment_counts")
-                self._conn.execute(
-                    """
-                    INSERT INTO person_assignment_counts (
-                        person_id,
-                        confirmed_count,
-                        auto_high_count,
-                        album_cohesion_count,
-                        candidate_count,
-                        unsure_count,
-                        rejected_count,
-                        categorized_face_count
-                    )
-                    SELECT
-                        person_id,
-                        SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'auto_high' THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'auto_high' AND source IN ('album_cohesion', 'model_trusted') THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'candidate' THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'unsure' THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN face_id IS NOT NULL AND status IN ('confirmed', 'auto_high') THEN 1 ELSE 0 END)
-                    FROM assignments
-                    GROUP BY person_id
-                    """
-                )
-                self._conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('person_assignment_counts_v1', '2') "
-                    "ON CONFLICT(key) DO UPDATE SET value = '2'"
-                )
             self._conn.commit()
+            apply_migrations(self._conn)
 
     def close(self) -> None:
         with self._faces_matrix_lock:
@@ -540,19 +228,329 @@ class FacesIndexDB:
             for r in rows
         }
 
+    def get_photo_scan_states(self) -> dict[str, PhotoScanState]:
+        """Return `{rel_path: PhotoScanState}` (size, mtime, detector, content hash, Kinderpedia id)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT photo_id, rel_path, file_size, mtime_ns, detector_id, content_hash,
+                       kinderpedia_image_id, filename
+                FROM photos
+                """
+            ).fetchall()
+        return {
+            str(r["rel_path"]): PhotoScanState(
+                photo_id=int(r["photo_id"]),
+                file_size=int(r["file_size"]),
+                mtime_ns=int(r["mtime_ns"]),
+                detector_id=str(r["detector_id"]),
+                content_hash=str(r["content_hash"] or ""),
+                kinderpedia_image_id=(
+                    int(r["kinderpedia_image_id"]) if r["kinderpedia_image_id"] is not None else None
+                ),
+                filename=str(r["filename"]),
+            )
+            for r in rows
+        }
+
+    def set_photo_fingerprints(self, items: list[tuple[int, str, int]]) -> int:
+        """Store `(photo_id, content_hash, mtime_ns)` for photos verified unchanged (no rescan)."""
+        if not items:
+            return 0
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "UPDATE photos SET content_hash = ?, mtime_ns = ? WHERE photo_id = ?",
+                [(h, int(m), int(pid)) for pid, h, m in items],
+            )
+        return len(items)
+
+    def rekey_photo(
+        self,
+        photo_id: int,
+        prov: PhotoProvenance,
+        *,
+        mtime_ns: int,
+        content_hash: str,
+    ) -> None:
+        """Move an indexed photo to a new `rel_path` (album renamed / file moved) keeping `photo_id`,
+        its faces and every label. Provenance columns are refreshed from `prov`."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE photos SET
+                    rel_path = ?, archive_child = ?, year = ?, month = ?, album_leaf = ?, filename = ?,
+                    kinderpedia_album_id = ?, album_title = ?, album_date = ?, classroom_groups = ?,
+                    kinderpedia_image_id = ?, seq_in_album = ?, image_dateadd = ?,
+                    best_live_url = ?, download_url = ?, fullsize_url = ?, thumb_url = ?,
+                    mtime_ns = ?, content_hash = ?
+                WHERE photo_id = ?
+                """,
+                (
+                    prov.rel_path,
+                    prov.archive_child,
+                    prov.year,
+                    prov.month,
+                    prov.album_leaf,
+                    prov.filename,
+                    prov.kinderpedia_album_id,
+                    prov.album_title,
+                    prov.album_date,
+                    prov.classroom_groups,
+                    prov.kinderpedia_image_id,
+                    prov.seq_in_album,
+                    prov.image_dateadd,
+                    prov.best_live_url,
+                    prov.download_url,
+                    prov.fullsize_url,
+                    prov.thumb_url,
+                    int(mtime_ns),
+                    content_hash,
+                    int(photo_id),
+                ),
+            )
+            self._photo_summary_cache = None
+        with self._faces_matrix_lock:
+            self._faces_matrix_cache = None
+
+    def delete_photos(self, photo_ids: list[int]) -> dict[str, Any]:
+        """Remove photos that no longer exist on disk, with all their faces, labels and pressure.
+
+        Rows are deleted explicitly child-first (instead of relying on FK cascades) so the count
+        triggers stay exact; `trg_faces_ad_refs` clears covers / medoids pointing at removed faces.
+        Returns `{photos, faces, human_labels, face_ids}`.
+        """
+        out: dict[str, Any] = {"photos": 0, "faces": 0, "human_labels": 0, "face_ids": []}
+        if not photo_ids:
+            return out
+        ids_json = json.dumps(sorted({int(p) for p in photo_ids}))
+        with self._lock, self._conn:
+            face_ids = [
+                int(r["face_id"])
+                for r in self._conn.execute(
+                    "SELECT face_id FROM faces WHERE photo_id IN (SELECT value FROM json_each(?))",
+                    (ids_json,),
+                ).fetchall()
+            ]
+            human = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM assignments
+                WHERE photo_id IN (SELECT value FROM json_each(?))
+                  AND status IN ('confirmed', 'rejected', 'unsure')
+                """,
+                (ids_json,),
+            ).fetchone()
+            touched = [
+                (int(r["person_id"]), int(r["face_id"]))
+                for r in self._conn.execute(
+                    """
+                    SELECT person_id, face_id FROM assignments
+                    WHERE photo_id IN (SELECT value FROM json_each(?)) AND face_id IS NOT NULL
+                    """,
+                    (ids_json,),
+                ).fetchall()
+            ]
+            self._conn.execute(
+                "DELETE FROM assignments WHERE photo_id IN (SELECT value FROM json_each(?))", (ids_json,)
+            )
+            for person_id, fid in touched:
+                self._refresh_cover_face_if_needed(person_id, fid)
+            self._conn.execute(
+                """
+                DELETE FROM person_face_pressure
+                WHERE face_id IN (SELECT face_id FROM faces WHERE photo_id IN (SELECT value FROM json_each(?)))
+                """,
+                (ids_json,),
+            )
+            self._conn.execute(
+                "DELETE FROM faces WHERE photo_id IN (SELECT value FROM json_each(?))", (ids_json,)
+            )
+            cur = self._conn.execute(
+                "DELETE FROM photos WHERE photo_id IN (SELECT value FROM json_each(?))", (ids_json,)
+            )
+            out = {
+                "photos": int(cur.rowcount),
+                "faces": len(face_ids),
+                "human_labels": int(human["n"]) if human is not None else 0,
+                "face_ids": face_ids,
+            }
+            self._photo_summary_cache = None
+        with self._faces_matrix_lock:
+            self._faces_matrix_cache = None
+        return out
+
+    def _relink_photo_faces_locked(
+        self,
+        photo_id: int,
+        faces: list[DetectedFace],
+        report: RelinkReport | None,
+    ) -> list[int]:
+        """Replace the auto-detected faces of an already indexed photo while preserving `face_id`s.
+
+        Old faces are matched to the new detections (bbox IoU, then embedding cosine); matched rows
+        are updated in place, unmatched new detections inserted, unmatched old rows deleted (their
+        human labels survive as `(photo, person)` rows with `face_id = NULL` and are counted in
+        `meta.orphaned_face_labels_total`). Returns face ids in the order of `faces`.
+        """
+        old_rows = self._conn.execute(
+            """
+            SELECT face_id, bbox_top, bbox_right, bbox_bottom, bbox_left, embedding_f16
+            FROM faces WHERE photo_id = ? AND is_manual = 0
+            ORDER BY face_idx ASC
+            """,
+            (photo_id,),
+        ).fetchall()
+        old_faces: list[StoredFace] = []
+        old_boxes: dict[int, tuple[int, int, int, int]] = {}
+        for r in old_rows:
+            blob = bytes(r["embedding_f16"]) if r["embedding_f16"] is not None else b""
+            emb = unpack_embeddings_f32([blob], dim=len(blob) // 2)[0] if len(blob) >= 2 else None
+            fid = int(r["face_id"])
+            box = (int(r["bbox_top"]), int(r["bbox_right"]), int(r["bbox_bottom"]), int(r["bbox_left"]))
+            old_boxes[fid] = box
+            old_faces.append(StoredFace(fid, box[0], box[1], box[2], box[3], emb))
+
+        new_boxes = [(f.box.top, f.box.right, f.box.bottom, f.box.left) for f in faces]
+        new_embs: NDArray[np.float32] | None = None
+        if faces:
+            raw = np.asarray([f.embedding for f in faces], dtype=np.float32)
+            if raw.ndim == 2 and raw.shape[1] > 0:
+                raw /= np.maximum(np.linalg.norm(raw, axis=1, keepdims=True), np.float32(1e-8))
+                new_embs = raw
+        mapping = match_faces(old_faces, new_boxes, new_embs) if old_faces else {}
+
+        # Park old auto faces on unique negative indexes so in-place updates never collide on
+        # UNIQUE(photo_id, face_idx); manual boxes live at >= 1000 and are untouched.
+        self._conn.execute(
+            "UPDATE faces SET face_idx = -1 - face_id WHERE photo_id = ? AND is_manual = 0", (photo_id,)
+        )
+        kept = set(mapping.values())
+        gone = [f.face_id for f in old_faces if f.face_id not in kept]
+        if gone:
+            gone_json = json.dumps(gone)
+            lab = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM assignments
+                WHERE face_id IN (SELECT value FROM json_each(?))
+                  AND status IN ('confirmed', 'rejected', 'unsure')
+                """,
+                (gone_json,),
+            ).fetchone()
+            orphaned = int(lab["n"]) if lab is not None else 0
+            holders = self._conn.execute(
+                "SELECT DISTINCT person_id, face_id FROM assignments WHERE face_id IN (SELECT value FROM json_each(?))",
+                (gone_json,),
+            ).fetchall()
+            self._conn.execute(
+                """
+                DELETE FROM assignments
+                WHERE face_id IN (SELECT value FROM json_each(?)) AND status IN ('auto_high', 'candidate')
+                """,
+                (gone_json,),
+            )
+            for h in holders:
+                self._refresh_cover_face_if_needed(int(h["person_id"]), int(h["face_id"]))
+            self._conn.execute(
+                "UPDATE assignments SET is_anchor = 0 WHERE face_id IN (SELECT value FROM json_each(?))",
+                (gone_json,),
+            )
+            self._conn.execute(
+                "DELETE FROM faces WHERE face_id IN (SELECT value FROM json_each(?))", (gone_json,)
+            )
+            if orphaned:
+                self._conn.execute(
+                    """
+                    INSERT INTO meta (key, value) VALUES ('orphaned_face_labels_total', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)
+                    """,
+                    (str(orphaned), orphaned),
+                )
+            if report is not None:
+                report.faces_removed += len(gone)
+                report.labels_orphaned += orphaned
+                report.removed_face_ids.extend(gone)
+
+        face_ids: list[int] = []
+        for f_idx, face in enumerate(faces):
+            old_fid = mapping.get(f_idx)
+            if old_fid is not None:
+                self._conn.execute(
+                    """
+                    UPDATE faces SET face_idx = ?, det_score = ?,
+                        bbox_top = ?, bbox_right = ?, bbox_bottom = ?, bbox_left = ?, embedding_f16 = ?
+                    WHERE face_id = ?
+                    """,
+                    (
+                        f_idx,
+                        face.confidence,
+                        face.box.top,
+                        face.box.right,
+                        face.box.bottom,
+                        face.box.left,
+                        pack_embedding_f16(face.embedding),
+                        old_fid,
+                    ),
+                )
+                face_ids.append(old_fid)
+                if report is not None:
+                    report.faces_relinked += 1
+                    if old_boxes.get(old_fid) != new_boxes[f_idx]:
+                        report.moved_face_ids.append(old_fid)
+                continue
+            face_ids.append(self._insert_face_locked(photo_id, f_idx, face))
+            if report is not None:
+                report.faces_new += 1
+        return face_ids
+
+    def _insert_face_locked(self, photo_id: int, f_idx: int, face: DetectedFace) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO faces (
+                photo_id, face_idx, det_score,
+                bbox_top, bbox_right, bbox_bottom, bbox_left, embedding_f16
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                photo_id,
+                f_idx,
+                face.confidence,
+                face.box.top,
+                face.box.right,
+                face.box.bottom,
+                face.box.left,
+                pack_embedding_f16(face.embedding),
+            ),
+        )
+        if cur.lastrowid is None:
+            raise RuntimeError("SQLite did not return lastrowid for inserted face.")
+        return int(cur.lastrowid)
+
     def upsert_scanned_batch(
         self,
         items: list[tuple[PhotoProvenance, int, int, int, int, str, list[DetectedFace]]],
+        *,
+        content_hashes: list[str] | None = None,
+        report: RelinkReport | None = None,
     ) -> list[tuple[int, list[int]]]:
         """
         Atomically persist a batch of scanned photos and their detected faces.
-        Each item is `(prov, width, height, file_size, mtime_ns, detector_id, faces)`.
+        Each item is `(prov, width, height, file_size, mtime_ns, detector_id, faces)`; optional
+        `content_hashes[i]` stores the head/tail fingerprint of item `i`.
+        Re-scanned photos keep their `face_id`s via `_relink_photo_faces_locked` (label-preserving).
         Returns `[(photo_id, [face_id, ...]), ...]` in matching order so callers can save crop thumbs.
         """
+        if content_hashes is not None and len(content_hashes) != len(items):
+            raise ValueError("content_hashes must align with items.")
         now = _now_iso()
         out_ids: list[tuple[int, list[int]]] = []
         with self._lock, self._conn:
-            for prov, width, height, fsize, mtime_ns, det_id, faces in items:
+            for item_i, (prov, width, height, fsize, mtime_ns, det_id, faces) in enumerate(items):
+                c_hash = content_hashes[item_i] if content_hashes is not None else ""
+                existed = (
+                    self._conn.execute(
+                        "SELECT photo_id FROM photos WHERE rel_path = ?", (prov.rel_path,)
+                    ).fetchone()
+                    is not None
+                )
                 self._conn.execute(
                     """
                     INSERT INTO photos (
@@ -560,8 +558,9 @@ class FacesIndexDB:
                         kinderpedia_album_id, album_title, album_date, classroom_groups,
                         kinderpedia_image_id, seq_in_album, image_dateadd,
                         best_live_url, download_url, fullsize_url, thumb_url,
-                        width, height, file_size, mtime_ns, detector_id, face_count, scanned_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        width, height, file_size, mtime_ns, detector_id, face_count, scanned_at,
+                        content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(rel_path) DO UPDATE SET
                         archive_child = excluded.archive_child,
                         year = excluded.year,
@@ -585,7 +584,8 @@ class FacesIndexDB:
                         mtime_ns = excluded.mtime_ns,
                         detector_id = excluded.detector_id,
                         face_count = excluded.face_count,
-                        scanned_at = excluded.scanned_at
+                        scanned_at = excluded.scanned_at,
+                        content_hash = excluded.content_hash
                     """,
                     (
                         prov.rel_path,
@@ -612,6 +612,7 @@ class FacesIndexDB:
                         det_id,
                         len(faces),
                         now,
+                        c_hash,
                     ),
                 )
                 row = self._conn.execute(
@@ -622,10 +623,12 @@ class FacesIndexDB:
                     raise RuntimeError(f"Failed to read photo_id after upsert: {prov.rel_path}")
                 photo_id = int(row["photo_id"])
 
-                self._conn.execute(
-                    "DELETE FROM faces WHERE photo_id = ? AND is_manual = 0",
-                    (photo_id,),
-                )
+                if existed:
+                    face_ids = self._relink_photo_faces_locked(photo_id, faces, report)
+                else:
+                    face_ids = [self._insert_face_locked(photo_id, i, f) for i, f in enumerate(faces)]
+                    if report is not None:
+                        report.faces_new += len(faces)
                 manual_row = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM faces WHERE photo_id = ? AND is_manual != 0",
                     (photo_id,),
@@ -636,34 +639,50 @@ class FacesIndexDB:
                         "UPDATE photos SET face_count = ? WHERE photo_id = ?",
                         (len(faces) + manual_cnt, photo_id),
                     )
-                face_ids: list[int] = []
-                for f_idx, face in enumerate(faces):
-                    cur = self._conn.execute(
-                        """
-                        INSERT INTO faces (
-                            photo_id, face_idx, det_score,
-                            bbox_top, bbox_right, bbox_bottom, bbox_left, embedding_f16
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            photo_id,
-                            f_idx,
-                            face.confidence,
-                            face.box.top,
-                            face.box.right,
-                            face.box.bottom,
-                            face.box.left,
-                            pack_embedding_f16(face.embedding),
-                        ),
-                    )
-                    if cur.lastrowid is None:
-                        raise RuntimeError("SQLite did not return lastrowid for inserted face.")
-                    face_ids.append(int(cur.lastrowid))
                 out_ids.append((photo_id, face_ids))
             self._photo_summary_cache = None
         with self._faces_matrix_lock:
             self._faces_matrix_cache = None
         return out_ids
+
+    # ------------------------------------------------------------------
+    # Cross-process change signal (`faces scan` -> running `faces ui`)
+    # ------------------------------------------------------------------
+
+    def get_data_version(self) -> int:
+        """Monotonic counter bumped by `faces scan` (and photo reconciliation) after it commits.
+
+        A long-running process (the Web UI) polls this cheaply and drops its in-memory caches
+        (`invalidate_caches()`) when the value changes, since the scan runs in another process.
+        """
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
+        try:
+            return int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_data_version(self, *, scan_finished: bool = False) -> int:
+        """Atomically increment `meta.data_version` (and stamp `meta.last_scan_at` for scans)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO meta (key, value) VALUES ('data_version', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                """
+            )
+            if scan_finished:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('last_scan_at', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_now_iso(),),
+                )
+            row = self._conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
+        return int(row["value"])
+
+    def get_schema_version(self) -> int:
+        with self._lock:
+            return read_schema_version(self._conn)
 
     # ------------------------------------------------------------------
     # People & Reference Seed Management

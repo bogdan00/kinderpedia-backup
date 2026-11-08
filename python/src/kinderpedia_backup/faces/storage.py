@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -55,6 +56,29 @@ def discover_backup_photos(backup_dir: Path, *, exclude_dir: Path | None = None)
             if p.suffix.lower() in _PHOTO_SUFFIXES:
                 found.append(p)
     return found
+
+
+FINGERPRINT_CHUNK = 64 * 1024
+
+
+def file_fingerprint(path: Path, *, size: int | None = None) -> str:
+    """
+    Cheap content fingerprint: BLAKE2b-128 over `size`, the first and the last 64 KiB of the file.
+
+    Used to tell a touched / copied-without-`-p` file (same bytes, new mtime) from a genuinely changed
+    one without re-running face detection; reads at most 128 KiB per file.
+    """
+    with path.open("rb") as fh:
+        eff_size = int(size) if size is not None else os.fstat(fh.fileno()).st_size
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(eff_size).encode("ascii"))
+        h.update(fh.read(FINGERPRINT_CHUNK))
+        if eff_size > 2 * FINGERPRINT_CHUNK:
+            fh.seek(eff_size - FINGERPRINT_CHUNK)
+            h.update(fh.read(FINGERPRINT_CHUNK))
+        elif eff_size > FINGERPRINT_CHUNK:
+            h.update(fh.read())
+    return h.hexdigest()
 
 
 def discover_reference_photos(refs_dir: Path) -> dict[str, list[Path]]:
