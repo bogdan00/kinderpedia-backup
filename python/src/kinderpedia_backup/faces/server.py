@@ -126,6 +126,7 @@ class _AppContext:
         self._closed_event = threading.Event()
         self.external_poll_sec = max(0.0, float(external_poll_sec))
         self._ext_signal: tuple[Any, ...] | None = None
+        self._ext_pending = False
         with contextlib.suppress(Exception):
             self._ext_signal = self._read_external_signal()
 
@@ -567,9 +568,22 @@ class _AppContext:
         if self._ext_signal is None:
             self._ext_signal = sig
             return False
-        if sig == self._ext_signal:
-            return False
+        changed = sig != self._ext_signal
         self._ext_signal = sig
+        if changed:
+            self._ext_pending = True
+        if not self._ext_pending:
+            return False
+        # While a `faces scan` holds its lock the token changes on every batch commit: defer the
+        # (expensive) cache drop + rematch until the scan has finished.
+        status_getter = getattr(self.db, "get_scan_status", None)
+        if callable(status_getter):
+            try:
+                if status_getter() is not None:
+                    return False
+            except Exception:  # noqa: S110 - unreadable lock file: fall through and refresh now
+                pass
+        self._ext_pending = False
         log("[Faces UI] Face index changed on disk (e.g. `faces scan`): refreshing caches and re-matching.")
         with self._rematch_lock:
             if self.is_closed:

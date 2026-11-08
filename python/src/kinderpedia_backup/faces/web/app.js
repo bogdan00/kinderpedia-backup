@@ -593,7 +593,8 @@
     state.batchMeta = batchData;
     state.batchCards = (batchData.cards || []).map((c) => ({
       ...c,
-      decision: c.default_approved ? "approved" : "disproved",
+      // Server-side default: approved (>= 0.50), unsure (ambiguous band, opt-in), disproved (low).
+      decision: c.default_decision || (c.default_approved ? "approved" : "disproved"),
       targetName: "",
       targetPersonId: null,
       alreadySavedInModal: false,
@@ -1019,8 +1020,12 @@
         const cohNote = sweptDelta > 0 ? ` (+${sweptDelta} same-album burst photos auto-matched!)` : "";
         const unsNote = res.applied.unsure > 0 ? `, ${res.applied.unsure} marked unsure` : "";
         const reNote = res.applied.reassigned > 0 ? `, ${res.applied.reassigned} reassigned` : "";
+        const conflictNote =
+          res.applied.skipped_conflicts > 0
+            ? ` (${res.applied.skipped_conflicts} skipped: already confirmed for another child)`
+            : "";
         showToast(
-          `Saved: +${res.applied.approved} confirmed for ${selP.display_name}${cohNote}, ${res.applied.disproved} hard-negatives${unsNote}${reNote}.`
+          `Saved: +${res.applied.approved} confirmed for ${selP.display_name}${cohNote}, ${res.applied.disproved} hard-negatives${unsNote}${reNote}${conflictNote}.`
         );
       },
       {

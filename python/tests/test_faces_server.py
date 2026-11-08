@@ -352,6 +352,31 @@ class FacesServerTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    def test_external_changes_deferred_while_scan_lock_held(self) -> None:
+        self.assertTrue(self.ctx.wait_for_rematch(timeout=15))
+        self.db.load_all_faces_matrix()
+        self.assertFalse(self.ctx.check_external_changes())
+        scan_running = {"on": True}
+        orig_status = self.db.get_scan_status
+        self.db.get_scan_status = lambda: {"pid": 1} if scan_running["on"] else None  # type: ignore[method-assign]
+        try:
+            other = sqlite3.connect(str(self.db.db_path))
+            try:
+                other.execute("INSERT INTO meta (key, value) VALUES ('scan_probe', '1')")
+                other.commit()
+            finally:
+                other.close()
+            # Mid-scan: change is noticed but caches are kept (no reload storm every batch commit).
+            self.assertFalse(self.ctx.check_external_changes())
+            self.assertIsNotNone(self.db._faces_matrix_cache)
+            scan_running["on"] = False
+            # Scan finished: the deferred refresh happens even though the token is unchanged now.
+            self.assertTrue(self.ctx.check_external_changes())
+            self.assertIsNone(self.db._faces_matrix_cache)
+            self.assertFalse(self.ctx.check_external_changes())
+        finally:
+            self.db.get_scan_status = orig_status  # type: ignore[method-assign]
+
     def test_external_writer_invalidates_caches_and_schedules_rematch(self) -> None:
         self.assertTrue(self.ctx.wait_for_rematch(timeout=15))
         self.db.load_all_faces_matrix()
