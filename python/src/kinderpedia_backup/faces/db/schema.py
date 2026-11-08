@@ -348,9 +348,7 @@ def _m1_baseline(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE faces ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0")
     if "birth_date" not in _columns(conn, "people"):
         conn.execute("ALTER TABLE people ADD COLUMN birth_date TEXT NOT NULL DEFAULT ''")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_faces_suppressed ON faces(face_id) WHERE suppress_auto != 0"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_suppressed ON faces(face_id) WHERE suppress_auto != 0")
 
 
 def _m2_counts_triggers(conn: sqlite3.Connection) -> None:

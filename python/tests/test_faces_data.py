@@ -30,7 +30,7 @@ from kinderpedia_backup.faces.models import PhotoProvenance
 from kinderpedia_backup.faces.storage import file_fingerprint
 
 DIM = 512
-MATERIALIZE_MODULE = "kinderpedia_backup.faces.index_db"
+MATERIALIZE_MODULE = "kinderpedia_backup.faces.db.exports"
 
 
 def _vec(index: int, *, noise: float = 0.0, seed: int = 0) -> tuple[float, ...]:
