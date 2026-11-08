@@ -150,3 +150,36 @@ class ScanSummary:
     people_seeded: int = 0
     auto_high_matches: int = 0
     candidate_matches: int = 0
+    photos_verified: int = 0
+    photos_rekeyed: int = 0
+    photos_removed: int = 0
+    photos_missing_kept: int = 0
+    faces_relinked: int = 0
+    faces_removed: int = 0
+    labels_orphaned: int = 0
+    labels_removed_with_photos: int = 0
+
+
+@dataclass(frozen=True)
+class PhotoScanState:
+    """Per-photo fingerprint stored in the index, used to decide skip / verify / rescan / re-key."""
+
+    photo_id: int
+    file_size: int
+    mtime_ns: int
+    detector_id: str
+    content_hash: str
+    kinderpedia_image_id: int | None
+    filename: str
+
+
+@dataclass
+class RelinkReport:
+    """Accumulates what `upsert_scanned_batch` did to previously stored faces (label-preserving rescan)."""
+
+    faces_relinked: int = 0
+    faces_new: int = 0
+    faces_removed: int = 0
+    labels_orphaned: int = 0
+    removed_face_ids: list[int] = field(default_factory=list)
+    moved_face_ids: list[int] = field(default_factory=list)

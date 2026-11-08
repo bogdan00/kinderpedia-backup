@@ -17,7 +17,6 @@ from .models import (
     ReferenceProfile,
     ScanSummary,
 )
-from .pipeline import FaceOrganizationPipeline
 from .provenance import ProvenanceResolver, discover_child_avatars, resolve_best_live_url
 from .recognizer import (
     FaceRecognizer,
@@ -39,7 +38,6 @@ __all__ = [
     "BoundingBox",
     "DetectedFace",
     "FaceMatch",
-    "FaceOrganizationPipeline",
     "FaceRecognizer",
     "FacesIndexDB",
     "LinkMode",
