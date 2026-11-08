@@ -18,6 +18,10 @@
     showSeenPhotos: false,
     galleryOffset: 0,
     galleryLimit: 96,
+    galleryItems: [], // items of the currently rendered gallery page (modal nav context)
+    gallerySig: "", // cheap signature of the rendered gallery page (skip no-op re-renders)
+    pendingJobs: new Map(), // job_id -> job started from this tab (recluster / materialize)
+    handledJobIds: new Set(),
     modalPhoto: null,
     modalHighlightFaceId: null,
     modalNavContext: null,
@@ -214,23 +218,40 @@
           Object.assign({}, opts, { headers, signal: controller.signal })
         );
       } catch (netErr) {
-        const msg =
-          netErr && netErr.name === "AbortError"
-            ? "Request timed out waiting for backend server"
-            : "Cannot reach backend on 127.0.0.1:8765 (server may be restarting)";
+        if (netErr && netErr.name === "AbortError") {
+          // A slow answer is not a dead backend: keep the UI online and let the status chip /
+          // SSE stream tell the real story. Only genuine network failures flag "offline".
+          const slowErr = new Error(
+            "The backend is taking longer than usual to answer — it is still working; watch the status chip and retry in a moment"
+          );
+          slowErr.timedOut = true;
+          throw slowErr;
+        }
+        const msg = "Cannot reach backend on 127.0.0.1:8765 (server may be restarting)";
         setBackendDisconnected(msg);
         throw new Error(msg);
       }
 
-      if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+      if (resp.status === 502 || resp.status === 504) {
         const msg = `Backend temporarily unavailable (HTTP ${resp.status})`;
         setBackendDisconnected(msg);
         throw new Error(msg);
       }
 
       const data = await resp.json().catch(() => ({}));
+      if (resp.status === 503 && !(data && data.retryable)) {
+        const msg = `Backend temporarily unavailable (HTTP ${resp.status})`;
+        setBackendDisconnected(msg);
+        throw new Error(msg);
+      }
       if (!resp.ok) {
-        throw new Error(data.error || `Request failed (HTTP ${resp.status})`);
+        // 503 + retryable: the DB is briefly locked (e.g. a concurrent `faces scan`) — not offline.
+        const apiErr = new Error(data.error || `Request failed (HTTP ${resp.status})`);
+        apiErr.status = resp.status;
+        apiErr.data = data;
+        apiErr.retryable = Boolean(data && data.retryable);
+        clearBackendDisconnected(true);
+        throw apiErr;
       }
       clearBackendDisconnected(true);
       if (data && data.rematch_scheduled) {
@@ -402,44 +423,6 @@
     }
     rosterEl.innerHTML = html;
 
-    rosterEl.querySelectorAll(".roster-edit-btn").forEach((editBtn) => {
-      editBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const pid = Number(editBtn.getAttribute("data-edit-pid"));
-        openRenameModal(pid);
-      });
-    });
-
-    rosterEl.querySelectorAll(".roster-delete-btn").forEach((delBtn) => {
-      delBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const pid = Number(delBtn.getAttribute("data-delete-pid"));
-        deletePerson(pid, delBtn);
-      });
-    });
-
-    rosterEl.querySelectorAll(".roster-item").forEach((rowEl) => {
-      rowEl.addEventListener("click", () => {
-        const pid = Number(rowEl.getAttribute("data-pid"));
-        runBusy(rowEl, () => selectPerson(pid), { context: "Load child" });
-      });
-      rowEl.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") {
-          if (
-            ev.target &&
-            ev.target.classList &&
-            (ev.target.classList.contains("roster-edit-btn") ||
-              ev.target.classList.contains("roster-delete-btn"))
-          ) {
-            return;
-          }
-          ev.preventDefault();
-          const pid = Number(rowEl.getAttribute("data-pid"));
-          runBusy(rowEl, () => selectPerson(pid), { context: "Load child" });
-        }
-      });
-    });
-
     const selP = getSelectedPerson();
     const toolbar = el("personToolbar");
     if (selP) {
@@ -448,6 +431,40 @@
     } else {
       toolbar.hidden = true;
     }
+  }
+
+  /** Roster rows are re-rendered on every overview update; listen once on the container. */
+  function bindRosterEvents() {
+    const rosterEl = el("rosterList");
+    if (!rosterEl) return;
+    rosterEl.addEventListener("click", (ev) => {
+      const editBtn = ev.target.closest(".roster-edit-btn");
+      if (editBtn && rosterEl.contains(editBtn)) {
+        ev.stopPropagation();
+        openRenameModal(Number(editBtn.getAttribute("data-edit-pid")));
+        return;
+      }
+      const delBtn = ev.target.closest(".roster-delete-btn");
+      if (delBtn && rosterEl.contains(delBtn)) {
+        ev.stopPropagation();
+        deletePerson(Number(delBtn.getAttribute("data-delete-pid")), delBtn);
+        return;
+      }
+      const rowEl = ev.target.closest(".roster-item");
+      if (rowEl && rosterEl.contains(rowEl)) {
+        const pid = Number(rowEl.getAttribute("data-pid"));
+        runBusy(rowEl, () => selectPerson(pid), { context: "Load child" });
+      }
+    });
+    rosterEl.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      if (ev.target.closest(".roster-edit-btn, .roster-delete-btn")) return;
+      const rowEl = ev.target.closest(".roster-item");
+      if (!rowEl || !rosterEl.contains(rowEl)) return;
+      ev.preventDefault();
+      const pid = Number(rowEl.getAttribute("data-pid"));
+      runBusy(rowEl, () => selectPerson(pid), { context: "Load child" });
+    });
   }
 
   function openRenameModal(personId) {
@@ -742,6 +759,8 @@
 
         if (ctx.source === "gallery") {
           await loadGallery();
+        } else if (state.mode === "batch" && ctx.source === "batch" && ctx.cardIdx !== null) {
+          updateBatchCardEls([ctx.cardIdx]);
         } else if (state.mode === "batch") {
           renderBatchGrid(state.batchMeta);
         }
@@ -806,131 +825,144 @@
     el("batchControls").hidden = false;
     updateBatchHeaderCopy(effMeta);
 
-    grid.innerHTML = state.batchCards
-      .map((c, idx) => {
-        const stClass = `state-${c.decision}`;
-        const liveTargetName = resolvePersonName(c.targetPersonId, c.targetName);
-        const badgeText =
-          c.decision === "approved"
-            ? `✓ ${escapeHtml(selP.display_name)}`
-            : c.decision === "unsure"
-            ? `? Not sure`
-            : c.decision === "reassigned"
-            ? `↪ ${escapeHtml(liveTargetName)}${c.alreadySavedInModal ? " ✓" : ""}`
-            : `✗ Not ${escapeHtml(selP.display_name)}`;
-        const thumbSrc = c.face_id ? `/media/face/${c.face_id}.jpg` : `/media/photo/${c.photo_id}`;
-        const unsureActive = c.decision === "unsure" ? "active-unsure" : "";
-        const compList = Array.isArray(c.companions) ? c.companions : [];
-        const peerSuffix = compList.length ? ` · with ${compList.slice(0, 2).join(", ")}` : "";
-        const dateLine = `${c.album_date || c.year} · ${c.archive_child}${peerSuffix}`;
-        return `
-          <article class="face-card ${stClass}" data-idx="${idx}">
-            <div class="face-thumb-wrap">
-              <img src="${thumbSrc}" alt="" loading="lazy" />
-              <span class="decision-badge">${badgeText}</span>
-              <span class="sim-pill">${c.similarity.toFixed(2)} · ${escapeHtml(c.year)}</span>
-              ${c.impact > 0 ? `<span class="impact-pill" title="Answering this photo also settles ~${c.impact} other open photos of this child">⚡ ${c.impact}</span>` : ""}
-              <div class="card-quick-tools">
-                <button type="button" class="icon-btn btn-card-unsure ${unsureActive}" data-idx="${idx}" title="I'm not sure — skip without teaching positive or negative">?</button>
-                <button type="button" class="icon-btn btn-card-reassign" data-idx="${idx}" title="Actually another child…">↪</button>
-                <button type="button" class="icon-btn btn-card-zoom" data-idx="${idx}" data-photo="${c.photo_id}" data-face="${c.face_id || ""}" title="Inspect full classroom group photo (←/→ to step through batch)">🔍</button>
-              </div>
-            </div>
-            <div class="face-card-body">
-              <div class="card-date" title="${escapeHtml(dateLine)}">${escapeHtml(dateLine)}</div>
-              <div class="card-album" title="${escapeHtml(c.album_title)}">${escapeHtml(c.album_title)}</div>
-            </div>
-          </article>`;
-      })
-      .join("");
-
-    grid.querySelectorAll(".face-card").forEach((cardEl) => {
-      cardEl.addEventListener("click", (ev) => {
-        if (ev.target.closest(".icon-btn")) return;
-        const idx = Number(cardEl.getAttribute("data-idx"));
-        const targetDecision =
-          state.batchCards[idx].decision === "approved" ? "disproved" : "approved";
-        if (ev.shiftKey && state.lastClickedBatchIdx !== null) {
-          const a = Math.min(state.lastClickedBatchIdx, idx);
-          const b = Math.max(state.lastClickedBatchIdx, idx);
-          for (let i = a; i <= b; i++) {
-            state.batchCards[i].decision = targetDecision;
-            state.batchCards[i].targetName = "";
-            state.batchCards[i].targetPersonId = null;
-            state.batchCards[i].alreadySavedInModal = false;
-          }
-        } else {
-          state.batchCards[idx].decision = targetDecision;
-          state.batchCards[idx].targetName = "";
-          state.batchCards[idx].targetPersonId = null;
-          state.batchCards[idx].alreadySavedInModal = false;
-        }
-        state.batchUserTouched = true;
-        state.lastClickedBatchIdx = idx;
-        renderBatchGrid(effMeta);
-      });
-    });
-
-    grid.querySelectorAll(".btn-card-unsure").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const idx = Number(btn.getAttribute("data-idx"));
-        const cur = state.batchCards[idx].decision;
-        state.batchCards[idx].decision = cur === "unsure" ? "approved" : "unsure";
-        state.batchCards[idx].targetName = "";
-        state.batchCards[idx].targetPersonId = null;
-        state.batchCards[idx].alreadySavedInModal = false;
-        state.batchUserTouched = true;
-        state.lastClickedBatchIdx = idx;
-        renderBatchGrid(effMeta);
-      });
-    });
-
-    grid.querySelectorAll(".btn-card-zoom").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const idx = Number(btn.getAttribute("data-idx"));
-        runBusy(
-          btn,
-          () => {
-            state.modalNavContext = {
-              type: "batch",
-              cards: state.batchCards,
-              index: Number.isFinite(idx) ? idx : 0,
-              personId: selP.person_id,
-              personName: selP.display_name,
-            };
-            state.modalDirty = false;
-            return openPhotoModal(
-              Number(btn.getAttribute("data-photo")),
-              Number(btn.getAttribute("data-face")) || null,
-              true
-            );
-          },
-          { context: "Load full photo" }
-        );
-      });
-    });
-
-    grid.querySelectorAll(".btn-card-reassign").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const idx = Number(btn.getAttribute("data-idx"));
-        const c = state.batchCards[idx];
-        if (!c) return;
-        openReassignModal({
-          source: "batch",
-          cardIdx: idx,
-          photoId: c.photo_id,
-          faceId: c.face_id || null,
-          fromPersonId: selP ? selP.person_id : null,
-          fromPersonName: selP ? selP.display_name : "",
-          initialName: resolvePersonName(c.targetPersonId, c.targetName || ""),
-        });
-      });
-    });
-
+    grid.innerHTML = state.batchCards.map((c, idx) => renderBatchCardHtml(c, idx, selP)).join("");
     updateBatchButtonLabel();
+  }
+
+  const AUDIT_TOOLTIP = "random sample of auto-accepted matches, to keep them honest";
+
+  function renderBatchCardHtml(c, idx, selP) {
+    const stClass = `state-${c.decision}`;
+    const liveTargetName = resolvePersonName(c.targetPersonId, c.targetName);
+    const badgeText =
+      c.decision === "approved"
+        ? `✓ ${escapeHtml(selP.display_name)}`
+        : c.decision === "unsure"
+        ? `? Not sure`
+        : c.decision === "reassigned"
+        ? `↪ ${escapeHtml(liveTargetName)}${c.alreadySavedInModal ? " ✓" : ""}`
+        : `✗ Not ${escapeHtml(selP.display_name)}`;
+    const thumbSrc = c.face_id ? `/media/face/${c.face_id}.jpg` : `/media/photo/${c.photo_id}`;
+    const unsureActive = c.decision === "unsure" ? "active-unsure" : "";
+    const compList = Array.isArray(c.companions) ? c.companions : [];
+    const peerSuffix = compList.length ? ` · with ${compList.slice(0, 2).join(", ")}` : "";
+    const dateLine = `${c.album_date || c.year} · ${c.archive_child}${peerSuffix}`;
+    const sim = Number(c.similarity || 0);
+    return `
+      <article class="face-card ${stClass}${c.audit ? " is-audit" : ""}" data-idx="${idx}">
+        <div class="face-thumb-wrap">
+          <img src="${thumbSrc}" alt="" loading="lazy" />
+          <span class="decision-badge">${badgeText}</span>
+          ${c.audit ? `<span class="audit-pill" title="${escapeHtml(AUDIT_TOOLTIP)}">audit</span>` : ""}
+          <span class="sim-pill">${sim.toFixed(2)} · ${escapeHtml(c.year)}</span>
+          ${c.impact > 0 ? `<span class="impact-pill" title="Answering this photo also settles ~${c.impact} other open photos of this child">⚡ ${c.impact}</span>` : ""}
+          <div class="card-quick-tools">
+            <button type="button" class="icon-btn btn-card-unsure ${unsureActive}" data-idx="${idx}" title="I'm not sure — skip without teaching positive or negative">?</button>
+            <button type="button" class="icon-btn btn-card-reassign" data-idx="${idx}" title="Actually another child…">↪</button>
+            <button type="button" class="icon-btn btn-card-zoom" data-idx="${idx}" data-photo="${c.photo_id}" data-face="${c.face_id || ""}" title="Inspect full classroom group photo (←/→ to step through batch)">🔍</button>
+          </div>
+        </div>
+        <div class="face-card-body">
+          <div class="card-date" title="${escapeHtml(dateLine)}">${escapeHtml(dateLine)}</div>
+          <div class="card-album" title="${escapeHtml(c.album_title)}">${escapeHtml(c.album_title)}</div>
+        </div>
+      </article>`;
+  }
+
+  /** Re-render only the given batch cards in place (no full-grid innerHTML rebuild). */
+  function updateBatchCardEls(indices) {
+    const selP = getSelectedPerson();
+    const grid = el("batchGrid");
+    if (!selP || !grid || state.mode !== "batch") return;
+    for (const idx of new Set(indices)) {
+      const c = state.batchCards[idx];
+      const cardEl = grid.querySelector(`.face-card[data-idx="${idx}"]`);
+      if (!c || !cardEl) {
+        renderBatchGrid(state.batchMeta);
+        return;
+      }
+      const tmp = document.createElement("div");
+      tmp.innerHTML = renderBatchCardHtml(c, idx, selP).trim();
+      if (tmp.firstElementChild) cardEl.replaceWith(tmp.firstElementChild);
+    }
+    updateBatchButtonLabel();
+  }
+
+  function setBatchDecision(idx, decision) {
+    const c = state.batchCards[idx];
+    if (!c) return;
+    c.decision = decision;
+    c.targetName = "";
+    c.targetPersonId = null;
+    c.alreadySavedInModal = false;
+  }
+
+  /** Batch grid listeners are bound once on the container (cards are re-rendered freely). */
+  function bindBatchGridEvents() {
+    const grid = el("batchGrid");
+    grid.addEventListener("click", (ev) => {
+      const cardEl = ev.target.closest(".face-card[data-idx]");
+      if (!cardEl || !grid.contains(cardEl)) return;
+      const selP = getSelectedPerson();
+      const idx = Number(cardEl.getAttribute("data-idx"));
+      const card = state.batchCards[idx];
+      if (!selP || !card) return;
+
+      const iconBtn = ev.target.closest(".icon-btn");
+      if (iconBtn) {
+        ev.stopPropagation();
+        if (iconBtn.classList.contains("btn-card-unsure")) {
+          setBatchDecision(idx, card.decision === "unsure" ? "approved" : "unsure");
+          state.batchUserTouched = true;
+          state.lastClickedBatchIdx = idx;
+          updateBatchCardEls([idx]);
+        } else if (iconBtn.classList.contains("btn-card-zoom")) {
+          runBusy(
+            iconBtn,
+            () => {
+              state.modalNavContext = {
+                type: "batch",
+                cards: state.batchCards,
+                index: idx,
+                personId: selP.person_id,
+                personName: selP.display_name,
+              };
+              state.modalDirty = false;
+              return openPhotoModal(card.photo_id, card.face_id || null, true);
+            },
+            { context: "Load full photo" }
+          );
+        } else if (iconBtn.classList.contains("btn-card-reassign")) {
+          openReassignModal({
+            source: "batch",
+            cardIdx: idx,
+            photoId: card.photo_id,
+            faceId: card.face_id || null,
+            fromPersonId: selP.person_id,
+            fromPersonName: selP.display_name,
+            initialName: resolvePersonName(card.targetPersonId, card.targetName || ""),
+          });
+        }
+        return;
+      }
+
+      const targetDecision = card.decision === "approved" ? "disproved" : "approved";
+      const changed = [];
+      if (ev.shiftKey && state.lastClickedBatchIdx !== null) {
+        const a = Math.min(state.lastClickedBatchIdx, idx);
+        const b = Math.max(state.lastClickedBatchIdx, idx);
+        for (let i = a; i <= b; i++) {
+          setBatchDecision(i, targetDecision);
+          changed.push(i);
+        }
+      } else {
+        setBatchDecision(idx, targetDecision);
+        changed.push(idx);
+      }
+      state.batchUserTouched = true;
+      state.lastClickedBatchIdx = idx;
+      updateBatchCardEls(changed);
+    });
   }
 
   async function submitCurrentBatch() {
@@ -1005,6 +1037,7 @@
   // ------------------------------------------------------------------
 
   const CHILD_CLUSTER_STRIP_MAX = 12;
+  const MODAL_STRIP_RADIUS = 30; // lightbox thumbnail strip shows ±30 items around the current one
 
   function childClusterIsFullyConfirmed(c) {
     const ct = c.counts || {};
@@ -1037,6 +1070,69 @@
     return sel && sel.size ? sel : null;
   }
 
+  function childClusterIsTruncated(c) {
+    return Boolean(c && c.faces_truncated && (c.faces || []).length < Number(c.size || 0));
+  }
+
+  const childClusterFetches = new Map(); // cluster_key -> in-flight Promise
+
+  /**
+   * The clusters payload ships only the first faces of each card; fetch the remainder (served
+   * from the server-side cache) before expanding, opening the lightbox or acting on "all".
+   */
+  async function ensureFullChildCluster(ckey, opts = {}) {
+    const { quiet = false, noReload = false } = opts;
+    const key = String(ckey);
+    const data = state.childClusters;
+    const c = findChildCluster(key);
+    if (!c || !childClusterIsTruncated(c)) return c;
+    if (childClusterFetches.has(key)) return childClusterFetches.get(key);
+    const p = (async () => {
+      const qs = new URLSearchParams({
+        key,
+        threshold: el("childClustersThreshold").value || "0.50",
+        min_size: "3",
+        offset: String((c.faces || []).length),
+      });
+      const path = `/api/people/${state.childClustersPersonId}/clusters/faces?${qs.toString()}`;
+      const res = quiet
+        ? await fetchQuietJson(path)
+        : await api(path).catch(async (err) => {
+            if (err && err.status === 404 && !noReload) {
+              await reloadChildClustersPreservingUi({ quiet: true });
+              return null;
+            }
+            throw err;
+          });
+      if (!res || state.childClusters !== data) return findChildCluster(key);
+      if (res.signature && data.signature && res.signature !== data.signature) {
+        // Data moved on server-side since this view was loaded: refresh everything instead.
+        if (noReload) return c;
+        await reloadChildClustersPreservingUi({ quiet: true });
+        return findChildCluster(key);
+      }
+      c.faces = (c.faces || []).concat(res.faces || []);
+      c.faces_truncated = false;
+      return c;
+    })();
+    childClusterFetches.set(key, p);
+    try {
+      return await p;
+    } finally {
+      childClusterFetches.delete(key);
+    }
+  }
+
+  /** Like ensureFullChildCluster, but never returns a still-truncated card (retries once after a reload). */
+  async function ensureFullChildClusterStrict(ckey) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const c = await ensureFullChildCluster(ckey);
+      if (!c) return null;
+      if (!childClusterIsTruncated(c)) return c;
+    }
+    throw new Error("This child's clusters changed while loading — please try again");
+  }
+
   async function loadChildClusters(opts = {}) {
     const { quiet = false } = opts;
     const selP = getSelectedPerson();
@@ -1066,6 +1162,17 @@
     if (!data) return;
     if (state.selectedPersonId !== pid || state.mode !== "childclusters") return; // stale response
 
+    const prev = state.childClusters;
+    if (
+      prev &&
+      state.childClustersPersonId === pid &&
+      data.signature &&
+      prev.signature === data.signature &&
+      el("childClustersList").querySelector(".cc-card, .empty-state")
+    ) {
+      return; // nothing changed server-side: keep DOM + already-expanded faces as they are
+    }
+
     state.childClusters = data;
     state.childClustersPersonId = pid;
 
@@ -1074,6 +1181,13 @@
     for (const key of Array.from(state.childClustersExpanded)) {
       if (!byKey.has(key)) state.childClustersExpanded.delete(key);
     }
+    // Expanded cards need their full face list again (the payload only ships a preview):
+    await Promise.all(
+      Array.from(state.childClustersExpanded).map((key) =>
+        ensureFullChildCluster(key, { quiet: true, noReload: true }).catch(() => null)
+      )
+    );
+    if (state.childClusters !== data) return; // superseded by a newer load meanwhile
     for (const [key, sel] of Array.from(state.childClustersSelected.entries())) {
       const c = byKey.get(key);
       if (!c) {
@@ -1147,10 +1261,11 @@
       })
       .join("");
 
+    const totalFaces = Math.max(faces.length, Number(c.size || 0));
     const toggleHtml =
-      faces.length > CHILD_CLUSTER_STRIP_MAX
+      totalFaces > CHILD_CLUSTER_STRIP_MAX
         ? `<button type="button" class="btn btn-ghost btn-xs cc-toggle-all" data-ckey="${escapeHtml(key)}">${
-            expanded ? "Show fewer" : `Show all ${faces.length}`
+            expanded ? "Show fewer" : `Show all ${totalFaces}`
           }</button>`
         : "";
 
@@ -1242,15 +1357,19 @@
   }
 
   function openChildClusterFace(ckey, fidx, triggerEl) {
-    const c = findChildCluster(ckey);
     const selP = getSelectedPerson();
-    if (!c || !selP) return;
-    const faces = c.faces || [];
-    const item = faces[fidx];
-    if (!item) return;
+    const c0 = findChildCluster(ckey);
+    const anchor = c0 && (c0.faces || [])[fidx];
+    if (!anchor || !selP) return;
     runBusy(
       triggerEl,
-      () => {
+      async () => {
+        const c = await ensureFullChildClusterStrict(ckey);
+        if (!c) return;
+        const faces = c.faces || [];
+        const idx = faces.findIndex((f) => f.face_id === anchor.face_id);
+        const item = faces[idx];
+        if (!item) return;
         state.modalNavContext = {
           type: "gallery",
           dedupe: true,
@@ -1258,7 +1377,7 @@
           ccKey: ckey,
           rawItems: faces,
           items: faces,
-          index: fidx,
+          index: idx,
           personId: selP.person_id,
           personName: selP.display_name,
         };
@@ -1271,17 +1390,16 @@
   }
 
   function runChildClusterAction(ckey, action, btn) {
-    const c = findChildCluster(ckey);
+    const c0 = findChildCluster(ckey);
     const selP = getSelectedPerson();
-    if (!c || !selP) return;
+    if (!c0 || !selP) return;
     const sel = childClusterSelection(ckey);
-    const chosen = (c.faces || []).filter((f) => !sel || sel.has(f.face_id));
-    const faces = chosen.map((f) => ({ photo_id: f.photo_id, face_id: f.face_id }));
-    if (!faces.length) return;
+    const nPlanned = sel ? sel.size : Math.max((c0.faces || []).length, Number(c0.size || 0));
+    if (!nPlanned) return;
     const name = selP.display_name;
     if (action === "exclude") {
       const ok = window.confirm(
-        `Remove ${faces.length} face${faces.length === 1 ? "" : "s"} from ${name}? They become hard negatives.`
+        `Remove ${nPlanned} face${nPlanned === 1 ? "" : "s"} from ${name}? They become hard negatives.`
       );
       if (!ok) return;
     }
@@ -1298,6 +1416,13 @@
     runBusy(
       btn,
       async () => {
+        // Acting on "all" needs every face of the card, not just the preview strip:
+        const c = sel ? c0 : await ensureFullChildClusterStrict(ckey);
+        if (!c) return;
+        const faces = (c.faces || [])
+          .filter((f) => !sel || sel.has(f.face_id))
+          .map((f) => ({ photo_id: f.photo_id, face_id: f.face_id }));
+        if (!faces.length) return;
         const res = await api(`/api/people/${selP.person_id}/cluster-action`, {
           method: "POST",
           body: JSON.stringify({ action, faces }),
@@ -1351,9 +1476,20 @@
       const toggle = ev.target.closest(".cc-toggle-all");
       if (toggle) {
         const ckey = String(toggle.getAttribute("data-ckey"));
-        if (state.childClustersExpanded.has(ckey)) state.childClustersExpanded.delete(ckey);
-        else state.childClustersExpanded.add(ckey);
-        rerenderChildClusterCard(ckey);
+        if (state.childClustersExpanded.has(ckey)) {
+          state.childClustersExpanded.delete(ckey);
+          rerenderChildClusterCard(ckey);
+          return;
+        }
+        runBusy(
+          toggle,
+          async () => {
+            await ensureFullChildCluster(ckey);
+            state.childClustersExpanded.add(ckey);
+            rerenderChildClusterCard(ckey);
+          },
+          { busyText: "Loading…", context: "Show all faces" }
+        );
         return;
       }
       const clearSel = ev.target.closest(".cc-clear-sel");
@@ -1525,10 +1661,13 @@
   // Mode 3: Confirmed Gallery, Rename/Merge & Export
   // ------------------------------------------------------------------
 
-  async function loadGallery() {
+  async function loadGallery(opts = {}) {
+    const { quiet = false, _clampRetry = false } = opts;
     const selP = getSelectedPerson();
     const grid = el("galleryGrid");
     if (!selP) {
+      state.galleryItems = [];
+      state.gallerySig = "";
       grid.innerHTML = `<div class="empty-state">Select a child in the left roster to inspect their photo gallery.</div>`;
       el("galleryPagination").innerHTML = "";
       return;
@@ -1542,8 +1681,34 @@
       offset: String(state.galleryOffset),
       limit: String(state.galleryLimit),
     });
-    const data = await api(`/api/gallery?${qs.toString()}`);
+    const path = `/api/gallery?${qs.toString()}`;
+    const data = quiet ? await fetchQuietJson(path) : await api(path);
+    if (!data || state.selectedPersonId !== selP.person_id) return;
+
+    // Removals / rematch can shrink the list under the current page: clamp to the last page
+    // that still has items instead of dead-ending on an empty page with no "Newer" button.
+    if (!data.items.length && data.total > 0 && state.galleryOffset > 0 && !_clampRetry) {
+      const lim = Math.max(1, state.galleryLimit);
+      state.galleryOffset = Math.max(0, Math.floor((data.total - 1) / lim) * lim);
+      await loadGallery({ quiet, _clampRetry: true });
+      return;
+    }
+
     el("galleryHeading").textContent = `${selP.display_name} — ${data.total.toLocaleString()} photos`;
+
+    const sig = JSON.stringify([
+      selP.person_id,
+      st,
+      yr,
+      state.galleryOffset,
+      data.total,
+      data.items.map((it) => [it.photo_id, it.face_id, it.status, it.source, it.similarity]),
+    ]);
+    state.galleryItems = data.items;
+    if (sig === state.gallerySig && grid.querySelector(".face-card")) {
+      return; // SSE refresh with no visible change: keep DOM (scroll, focus, loaded images) intact
+    }
+    state.gallerySig = sig;
 
     if (!data.items.length) {
       grid.innerHTML = `<div class="empty-state">No photos match this filter yet.</div>`;
@@ -1557,18 +1722,19 @@
           ? `/media/face/${item.face_id}.jpg`
           : `/media/photo/${item.photo_id}`;
         const galStateClass = item.status === "unsure" ? "state-unsure" : "state-approved";
+        const simTxt = Number(item.similarity || 0).toFixed(2);
         const badgeLabel =
           item.status === "confirmed"
             ? "✓ Confirmed"
             : item.status === "unsure"
             ? "? Unsure"
             : item.source === "album_cohesion"
-            ? `✓ Same-Album (${item.similarity.toFixed(2)})`
+            ? `✓ Same-Album (${simTxt})`
             : item.source === "model_trusted"
-            ? `✓ Learned (${item.similarity.toFixed(2)})`
+            ? `✓ Learned (${simTxt})`
             : item.status === "auto_high"
-            ? `Auto (${item.similarity.toFixed(2)})`
-            : `Cand (${item.similarity.toFixed(2)})`;
+            ? `Auto (${simTxt})`
+            : `Cand (${simTxt})`;
         return `
           <article class="face-card ${galStateClass}" data-gidx="${idx}" data-photo="${item.photo_id}" data-face="${item.face_id || ""}">
             <div class="face-thumb-wrap">
@@ -1589,10 +1755,25 @@
       })
       .join("");
 
+    const pag = el("galleryPagination");
+    const hasPrev = state.galleryOffset > 0;
+    const hasNext = state.galleryOffset + state.galleryLimit < data.total;
+    pag.innerHTML = `
+      <button type="button" class="btn btn-secondary btn-sm" id="galPrev" data-gal-page="prev" ${hasPrev ? "" : "disabled"}>← Newer</button>
+      <span>${state.galleryOffset + 1}–${Math.min(data.total, state.galleryOffset + data.items.length)} of ${data.total}</span>
+      <button type="button" class="btn btn-secondary btn-sm" id="galNext" data-gal-page="next" ${hasNext ? "" : "disabled"}>Older →</button>
+    `;
+  }
+
+  /** Gallery grid + pagination listeners, bound once on their containers. */
+  function bindGalleryEvents() {
+    const grid = el("galleryGrid");
     const openGalleryItemInModal = (gidx, photoId, faceId) => {
+      const selP = getSelectedPerson();
+      if (!selP) return undefined;
       state.modalNavContext = {
         type: "gallery",
-        items: data.items,
+        items: state.galleryItems || [],
         index: Number.isFinite(gidx) ? gidx : 0,
         personId: selP.person_id,
         personName: selP.display_name,
@@ -1601,60 +1782,36 @@
       return openPhotoModal(photoId, faceId, true);
     };
 
-    grid.querySelectorAll(".face-card").forEach((card) => {
-      card.addEventListener("click", (ev) => {
-        if (ev.target.closest(".icon-btn")) return;
+    grid.addEventListener("click", (ev) => {
+      const card = ev.target.closest(".face-card[data-gidx]");
+      if (!card || !grid.contains(card)) return;
+      const selP = getSelectedPerson();
+      if (!selP) return;
+      const btn = ev.target.closest(".icon-btn");
+      const src = btn || card;
+      const photoId = Number(src.getAttribute("data-photo"));
+      const faceId = Number(src.getAttribute("data-face")) || null;
+      if (!btn || btn.classList.contains("btn-gal-zoom")) {
+        if (btn) ev.stopPropagation();
         runBusy(
-          card,
-          () =>
-            openGalleryItemInModal(
-              Number(card.getAttribute("data-gidx")),
-              Number(card.getAttribute("data-photo")),
-              Number(card.getAttribute("data-face")) || null
-            ),
+          src,
+          () => openGalleryItemInModal(Number(card.getAttribute("data-gidx")), photoId, faceId),
           { context: "Load full photo" }
         );
-      });
-    });
-
-    grid.querySelectorAll(".btn-gal-zoom").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        runBusy(
-          btn,
-          () =>
-            openGalleryItemInModal(
-              Number(btn.getAttribute("data-gidx")),
-              Number(btn.getAttribute("data-photo")),
-              Number(btn.getAttribute("data-face")) || null
-            ),
-          { context: "Load full photo" }
-        );
-      });
-    });
-
-    grid.querySelectorAll(".btn-gal-reassign").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const photoId = Number(btn.getAttribute("data-photo"));
-        const faceId = Number(btn.getAttribute("data-face")) || null;
+        return;
+      }
+      ev.stopPropagation();
+      if (btn.classList.contains("btn-gal-reassign")) {
         openReassignModal({
           source: "gallery",
           cardIdx: null,
           photoId,
           faceId,
-          fromPersonId: selP ? selP.person_id : null,
-          fromPersonName: selP ? selP.display_name : "",
+          fromPersonId: selP.person_id,
+          fromPersonName: selP.display_name,
           initialName: "",
         });
-      });
-    });
-
-    grid.querySelectorAll(".btn-gal-remove").forEach((btn) => {
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const photoId = Number(btn.getAttribute("data-photo"));
-        const faceId = Number(btn.getAttribute("data-face")) || null;
+      } else if (btn.classList.contains("btn-gal-remove")) {
         runBusy(
           btn,
           async () => {
@@ -1674,41 +1831,25 @@
           },
           { context: "Remove photo" }
         );
-      });
+      }
     });
 
-    const pag = el("galleryPagination");
-    const hasPrev = state.galleryOffset > 0;
-    const hasNext = state.galleryOffset + state.galleryLimit < data.total;
-    pag.innerHTML = `
-      <button type="button" class="btn btn-secondary btn-sm" id="galPrev" ${hasPrev ? "" : "disabled"}>← Newer</button>
-      <span>${state.galleryOffset + 1}–${Math.min(data.total, state.galleryOffset + data.items.length)} of ${data.total}</span>
-      <button type="button" class="btn btn-secondary btn-sm" id="galNext" ${hasNext ? "" : "disabled"}>Older →</button>
-    `;
-    if (hasPrev) {
-      el("galPrev").addEventListener("click", (ev) => {
-        runBusy(
-          ev.currentTarget,
-          async () => {
-            state.galleryOffset = Math.max(0, state.galleryOffset - state.galleryLimit);
-            await loadGallery();
-          },
-          { busyText: "Loading…", context: "Load newer photos" }
-        );
-      });
-    }
-    if (hasNext) {
-      el("galNext").addEventListener("click", (ev) => {
-        runBusy(
-          ev.currentTarget,
-          async () => {
-            state.galleryOffset += state.galleryLimit;
-            await loadGallery();
-          },
-          { busyText: "Loading…", context: "Load older photos" }
-        );
-      });
-    }
+    el("galleryPagination").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-gal-page]");
+      if (!btn || btn.disabled) return;
+      const dir = btn.getAttribute("data-gal-page");
+      runBusy(
+        btn,
+        async () => {
+          state.galleryOffset =
+            dir === "prev"
+              ? Math.max(0, state.galleryOffset - state.galleryLimit)
+              : state.galleryOffset + state.galleryLimit;
+          await loadGallery();
+        },
+        { busyText: "Loading…", context: dir === "prev" ? "Load newer photos" : "Load older photos" }
+      );
+    });
   }
 
   // ------------------------------------------------------------------
@@ -2358,8 +2499,19 @@
     }
 
     const thumbsEl = el("modalClusterThumbs");
-    thumbsEl.innerHTML = items
-      .map((item, idx) => {
+    // Window the strip to ±MODAL_STRIP_RADIUS around the current photo: rebuilding one <img> per
+    // item on every arrow key is what made long clusters / galleries sluggish.
+    const winStart = Math.max(0, ctx.index - MODAL_STRIP_RADIUS);
+    const winEnd = Math.min(items.length, ctx.index + MODAL_STRIP_RADIUS + 1);
+    const beforeHtml = winStart > 0 ? `<span class="modal-strip-more" title="Earlier photos">… ${winStart} more</span>` : "";
+    const afterHtml =
+      winEnd < items.length
+        ? `<span class="modal-strip-more" title="Later photos">${items.length - winEnd} more …</span>`
+        : "";
+    const stripHtml = items
+      .slice(winStart, winEnd)
+      .map((item, relIdx) => {
+        const idx = winStart + relIdx;
         const thumbSrc = item.face_id
           ? `/media/face/${item.face_id}.jpg`
           : `/media/photo/${item.photo_id}`;
@@ -2389,6 +2541,7 @@
         </button>`;
       })
       .join("");
+    thumbsEl.innerHTML = beforeHtml + stripHtml + afterHtml;
 
     thumbsEl.querySelectorAll(".modal-cluster-thumb-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -2433,7 +2586,8 @@
             curCard.alreadySavedInModal = false;
             state.batchUserTouched = true;
             if (state.mode === "batch") {
-              renderBatchGrid(state.batchMeta);
+              const gridIdx = state.batchCards.indexOf(curCard);
+              if (gridIdx >= 0) updateBatchCardEls([gridIdx]);
             }
             renderModalNavControls();
           });
@@ -2499,24 +2653,24 @@
 
   function syncBatchCardFromModalTag(photoId, faceId, taggedPersonId, taggedName, status) {
     if (!state.batchCards.length) return;
-    let changed = false;
-    for (const c of state.batchCards) {
+    const changedIdx = [];
+    state.batchCards.forEach((c, cIdx) => {
       const matchesFace = faceId && c.face_id === faceId;
       const matchesPhotoFallback = !c.face_id && c.photo_id === photoId;
-      if (!matchesFace && !matchesPhotoFallback) continue;
+      if (!matchesFace && !matchesPhotoFallback) return;
 
       if (status === "unsure") {
         c.decision = "unsure";
         c.targetPersonId = null;
         c.targetName = "";
         c.alreadySavedInModal = true;
-        changed = true;
+        changedIdx.push(cIdx);
       } else if (status === "rejected") {
         c.decision = "disproved";
         c.targetPersonId = null;
         c.targetName = "";
         c.alreadySavedInModal = true;
-        changed = true;
+        changedIdx.push(cIdx);
       } else if (status === "confirmed") {
         if (taggedPersonId === state.selectedPersonId) {
           c.decision = "approved";
@@ -2528,12 +2682,12 @@
           c.targetName = resolvePersonName(taggedPersonId, taggedName);
         }
         c.alreadySavedInModal = true;
-        changed = true;
+        changedIdx.push(cIdx);
       }
-    }
-    if (changed) {
+    });
+    if (changedIdx.length) {
       if (state.mode === "batch") {
-        renderBatchGrid(state.batchMeta);
+        updateBatchCardEls(changedIdx);
       }
       if (!el("photoModal").hidden && state.modalNavContext && state.modalNavContext.type === "batch") {
         renderModalNavControls();
@@ -3223,6 +3377,125 @@
   // Live Server-Sent Events (`/api/events`) Background Rematch Sync
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Long-running backend jobs (recluster / ByChild sync): 202 + job id, completion via SSE
+  // ------------------------------------------------------------------
+
+  const JOB_BUTTON_IDS = {
+    recluster: ["btnRecluster"],
+    materialize: ["btnMaterializeAll", "btnSyncPersonFolder"],
+  };
+
+  function activeJobKinds() {
+    const kinds = new Set();
+    for (const j of (state.bgStatus && state.bgStatus.jobs) || []) kinds.add(j.kind);
+    for (const j of state.pendingJobs.values()) kinds.add(j.kind);
+    return kinds;
+  }
+
+  /** Buttons stay disabled while a job of their kind runs (driven by bg_status + local pending jobs). */
+  function syncJobButtons() {
+    const kinds = activeJobKinds();
+    for (const [kind, ids] of Object.entries(JOB_BUTTON_IDS)) {
+      const running = kinds.has(kind);
+      for (const id of ids) {
+        const btn = el(id);
+        if (!btn || btn.dataset.busy === "1") continue;
+        btn.disabled = running;
+        btn.classList.toggle("is-loading", running);
+        if (running) {
+          btn.setAttribute("aria-busy", "true");
+          btn.dataset.jobRunning = "1";
+        } else {
+          btn.removeAttribute("aria-busy");
+          delete btn.dataset.jobRunning;
+        }
+      }
+    }
+  }
+
+  function trackJob(job) {
+    if (!job || !job.job_id || state.handledJobIds.has(job.job_id)) return;
+    state.pendingJobs.set(job.job_id, job);
+    syncJobButtons();
+  }
+
+  let jobStartsInFlight = 0;
+
+  async function startBackgroundJob(path, body) {
+    jobStartsInFlight += 1;
+    try {
+      const job = await api(path, { method: "POST", body: JSON.stringify(body || {}) });
+      if (state.handledJobIds.has(job.job_id)) return job; // finished before the 202 even arrived
+      trackJob(job);
+      showToast(`${job.label || "Background job"} started — keep working, you'll be notified when it's done.`);
+      return job;
+    } catch (err) {
+      if (err && err.status === 409 && err.data && err.data.job) {
+        trackJob(err.data.job);
+        showToast(`${err.data.job.label || "That job"} is already running — you'll be notified when it finishes.`);
+        return err.data.job;
+      }
+      throw err;
+    } finally {
+      jobStartsInFlight -= 1;
+    }
+  }
+
+  async function handleJobComplete(job) {
+    if (!job || !job.job_id || state.handledJobIds.has(job.job_id)) return;
+    state.handledJobIds.add(job.job_id);
+    const wasMine = state.pendingJobs.delete(job.job_id) || jobStartsInFlight > 0;
+    syncJobButtons();
+    const ok = job.ok !== undefined ? Boolean(job.ok) : job.state === "done";
+    if (!ok) {
+      showToast(`${job.label || job.kind} failed: ${job.error || "unknown error"}`, "error");
+      return;
+    }
+    const r = job.result || {};
+    if (job.kind === "recluster") {
+      if (r.overview) {
+        state.overview = r.overview;
+        renderOverview();
+      }
+      if (
+        wasMine &&
+        el("photoModal").hidden &&
+        el("reassignModal").hidden &&
+        !(state.mode === "batch" && state.batchUserTouched)
+      ) {
+        try {
+          await loadActiveView();
+        } catch (_e) {}
+      }
+      const photos = r.overview ? Number(r.overview.photos_total || 0).toLocaleString() : "?";
+      showToast(`Refreshed index: ${photos} photos, ${r.clusters_created ?? "?"} recurring clusters.`);
+    } else if (job.kind === "materialize") {
+      const where = r.person ? `ByChild/${r.person}/` : "ByChild/";
+      showToast(
+        `Synced ${where}: ${r.links_created ?? 0} new links, ${r.links_existing ?? 0} existing, ${r.links_pruned ?? 0} pruned.`
+      );
+    } else if (wasMine) {
+      showToast(`${job.label || job.kind} finished.`);
+    }
+  }
+
+  /** SSE fallback: a pending job that vanished from bg_status finished while we were not listening. */
+  async function reconcilePendingJobs(st) {
+    if (!state.pendingJobs.size) return;
+    const live = new Set(((st && st.jobs) || []).map((j) => j.job_id));
+    for (const jobId of Array.from(state.pendingJobs.keys())) {
+      if (live.has(jobId)) continue;
+      const job = await fetchQuietJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+      if (job && job.state && job.state !== "running") {
+        await handleJobComplete(job);
+      } else if (!job) {
+        state.pendingJobs.delete(jobId); // server restarted: the job is gone
+        syncJobButtons();
+      }
+    }
+  }
+
   function updateSyncIndicator() {
     const pill = el("rematchStatusPill");
     const active = Boolean(state.rematchPending || state.rematchRunning);
@@ -3254,6 +3527,8 @@
     state.rematchRunning = st.rematch === "running";
     state.rematchPending = st.rematch !== "idle";
     renderBgStatus();
+    syncJobButtons();
+    reconcilePendingJobs(st);
     const busy = Boolean(st.busy) || st.snapshot === "pending";
     if (busy && !bgStatusTicker) {
       bgStatusTicker = setInterval(renderBgStatus, 500);
@@ -3299,7 +3574,9 @@
     let label = "✓ Up to date";
     if (st.sync_op) {
       stateName = "running";
-      label = st.sync_op;
+      const jobs = Array.isArray(st.jobs) ? st.jobs : [];
+      const longest = jobs.reduce((acc, j) => Math.max(acc, Number(j.running_ms || 0)), 0);
+      label = jobs.length ? `${st.sync_op} ${fmtSecs(longest + since)}s` : st.sync_op;
     } else if (st.rematch === "running") {
       stateName = "running";
       const elapsed = (st.rematch_running_ms || 0) + since;
@@ -3447,6 +3724,32 @@
       } catch (_e) {}
     });
 
+    es.addEventListener("job_status", (ev) => {
+      try {
+        const job = JSON.parse(ev.data || "{}");
+        if (job && job.state === "running" && state.bgStatus) {
+          const jobs = (state.bgStatus.jobs || []).filter((j) => j.job_id !== job.job_id);
+          state.bgStatus.jobs = [...jobs, job];
+        }
+        syncJobButtons();
+      } catch (_e) {}
+    });
+
+    es.addEventListener("job_complete", (ev) => {
+      try {
+        handleJobComplete(JSON.parse(ev.data || "{}"));
+      } catch (_e) {}
+    });
+
+    es.addEventListener("data_changed", (ev) => {
+      try {
+        const data = JSON.parse(ev.data || "{}");
+        if (data.source === "external") {
+          showToast("↻ New scan data detected on disk — refreshing caches and re-matching in the background.");
+        }
+      } catch (_e) {}
+    });
+
     es.addEventListener("rematch_complete", async (ev) => {
       let payload = null;
       try {
@@ -3511,7 +3814,7 @@
         el("galleryStatusFilter").value !== "confirmed"
       ) {
         try {
-          await loadGallery();
+          await loadGallery({ quiet: true });
         } catch (_e) {}
       } else if (
         state.mode === "childclusters" &&
@@ -3565,19 +3868,10 @@
 
     el("btnRecluster").addEventListener("click", () => {
       const btn = el("btnRecluster");
-      runBusy(
-        btn,
-        async () => {
-          const res = await api("/api/recluster", { method: "POST", body: "{}" });
-          state.overview = res.overview;
-          renderOverview();
-          await loadActiveView();
-          showToast(
-            `Refreshed index: ${res.overview.photos_total.toLocaleString()} photos, ${res.clusters_created} recurring clusters.`
-          );
-        },
-        { busyText: "Refreshing…", context: "Refresh scan" }
-      );
+      runBusy(btn, () => startBackgroundJob("/api/recluster", {}), {
+        context: "Refresh scan",
+        onFinally: syncJobButtons,
+      });
     });
 
     el("btnDiscoverClusters").addEventListener("click", () => {
@@ -3587,6 +3881,9 @@
 
     bindChildClusterEvents();
     bindClassesEvents();
+    bindRosterEvents();
+    bindBatchGridEvents();
+    bindGalleryEvents();
 
     el("btnAddPerson").addEventListener("click", () => {
       const btn = el("btnAddPerson");
@@ -3859,35 +4156,20 @@
 
     el("btnMaterializeAll").addEventListener("click", () => {
       const btn = el("btnMaterializeAll");
-      runBusy(
-        btn,
-        async () => {
-          const res = await api("/api/materialize", { method: "POST", body: "{}" });
-          showToast(
-            `Synced ByChild/: ${res.links_created} new links, ${res.links_existing} existing, ${res.links_pruned} pruned.`
-          );
-        },
-        { busyText: "Syncing ByChild/…", context: "Sync all folders" }
-      );
+      runBusy(btn, () => startBackgroundJob("/api/materialize", {}), {
+        context: "Sync all folders",
+        onFinally: syncJobButtons,
+      });
     });
 
     el("btnSyncPersonFolder").addEventListener("click", () => {
       const btn = el("btnSyncPersonFolder");
       const selP = getSelectedPerson();
       if (!selP) return;
-      runBusy(
-        btn,
-        async () => {
-          const res = await api("/api/materialize", {
-            method: "POST",
-            body: JSON.stringify({ person: selP.display_name }),
-          });
-          showToast(
-            `Synced ByChild/${selP.display_name}/: ${res.links_created} new, ${res.links_existing} existing.`
-          );
-        },
-        { busyText: "Syncing…", context: "Sync folder" }
-      );
+      runBusy(btn, () => startBackgroundJob("/api/materialize", { person: selP.display_name }), {
+        context: "Sync folder",
+        onFinally: syncJobButtons,
+      });
     });
 
     document.querySelectorAll("[data-export]").forEach((btn) => {
