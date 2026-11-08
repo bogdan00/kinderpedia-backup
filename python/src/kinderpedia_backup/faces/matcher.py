@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -307,12 +308,23 @@ def rebuild_yearly_clusters(
         centroids: list[NDArray[np.float32]] = []
         medoid_local_idx: list[int] = []
 
-        for loc_i_raw in order:
-            loc_i = int(loc_i_raw)
-            if assigned[loc_i] != -1 or int(density[loc_i]) < (min_cluster_photos - 1):
-                continue
+        # Similarity columns of upcoming medoid candidates are computed in blocks (one SGEMM per
+        # block instead of one matrix-vector product per candidate on 20k+ face buckets).
+        elig_order = [int(i) for i in order if int(density[int(i)]) >= (min_cluster_photos - 1)]
+        elig_pos = {j: p for p, j in enumerate(elig_order)}
+        block_cols: dict[int, int] = {}
+        block_sims: NDArray[np.float32] = np.zeros((idx_arr.shape[0], 0), dtype=np.float32)
+        next_block = 0
 
-            sims = sub_embs @ sub_embs[loc_i]
+        for loc_i in elig_order:
+            if assigned[loc_i] != -1:
+                continue
+            if loc_i not in block_cols:
+                upcoming = [j for j in elig_order[next_block:] if assigned[j] == -1][:128]
+                next_block = elig_pos[upcoming[-1]] + 1
+                block_cols = {j: c for c, j in enumerate(upcoming)}
+                block_sims = sub_embs @ sub_embs[upcoming].T
+            sims = block_sims[:, block_cols[loc_i]]
             core_members = np.where((assigned == -1) & (sims >= core_sim))[0]
             if core_members.size < (min_cluster_photos - 1):
                 continue
@@ -474,13 +486,30 @@ def rebuild_yearly_clusters(
     return db.save_clusters(cluster_specs)
 
 
-def _robust_anchor_score(sims: NDArray[np.float32], top2_weight: float) -> NDArray[np.float32]:
+def _max_sim_to_others(embs: NDArray[np.float32], chunk_size: int = 2048) -> NDArray[np.float32]:
+    """For each row, the highest cosine similarity to any OTHER row (chunked, -1 for a single row)."""
+    n = int(embs.shape[0])
+    out = np.full((n,), -1.0, dtype=np.float32)
+    if n < 2:
+        return out
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        sims = embs[start:end] @ embs.T
+        sims[np.arange(end - start), np.arange(start, end)] = -1.0
+        out[start:end] = np.max(sims, axis=1)
+    return out
+
+
+def _robust_anchor_score(
+    sims: NDArray[np.float32], top2_weight: float, min_anchors: int = 4
+) -> NDArray[np.float32]:
     """
     Blend the best and second-best anchor similarity so a single atypical (or mistaken) anchor
     cannot pull in a whole ring of weak look-alikes on its own. Falls back to the max when a
-    person only has one anchor.
+    person has fewer than `min_anchors` anchors (e.g. only an avatar per age): there the second
+    anchor is usually a different age, not a second opinion.
     """
-    if top2_weight <= 0.0 or sims.shape[1] < 2:
+    if top2_weight <= 0.0 or sims.shape[1] < max(2, min_anchors):
         return np.asarray(np.max(sims, axis=1), dtype=np.float32)
     top2 = -np.partition(-sims, 1, axis=1)[:, :2]
     best = np.max(top2, axis=1)
@@ -529,16 +558,21 @@ def _cached_label_neighbors(
     removed = old_bank - bank_set
 
     def _full(rows_sub: NDArray[np.int64]) -> None:
+        # Small query chunks keep the (chunk x bank) similarity block cache-friendly (~120 MB at a
+        # 30k bank); partitioning `s_q` directly avoids a second negated copy of the block.
         bank_e = embs[bank_rows]
-        for c0 in range(0, int(rows_sub.size), 8192):
-            q = rows_sub[c0 : c0 + 8192]
+        n_bank = int(bank_rows.size)
+        for c0 in range(0, int(rows_sub.size), 1024):
+            q = rows_sub[c0 : c0 + 1024]
             s_q = embs[q] @ bank_e.T
-            idx = np.argpartition(-s_q, k, axis=1)[:, :k]
+            idx = np.argpartition(s_q, n_bank - k, axis=1)[:, n_bank - k :]
             nn_rows_c[q] = bank_rows[idx]
             nn_sims_c[q] = np.take_along_axis(s_q, idx, axis=1)
             has[q] = True
 
-    if added.size > 4000 or len(removed) > 4000:
+    # A bulk confirm adds thousands of voters at once; merging them is still far cheaper than a cold
+    # rebuild as long as they are a minority of the bank.
+    if added.size > max(4000, int(bank_rows.size) // 2) or len(removed) > 4000:
         has[:] = False
     else:
         if removed:
@@ -560,8 +594,9 @@ def _cached_label_neighbors(
             upd = open_rows[has[open_rows]]
             if upd.size:
                 add_e = embs[added]
-                for c0 in range(0, int(upd.size), 16384):
-                    q = upd[c0 : c0 + 16384]
+                step = max(256, min(16384, (1 << 25) // max(1, int(added.size) + k)))
+                for c0 in range(0, int(upd.size), step):
+                    q = upd[c0 : c0 + step]
                     s_new = embs[q] @ add_e.T
                     cand_r = np.concatenate([nn_rows_c[q], np.broadcast_to(added, s_new.shape)], axis=1)
                     cand_s = np.concatenate([nn_sims_c[q], s_new.astype(np.float32)], axis=1)
@@ -588,7 +623,7 @@ def recompute_active_matching(
     auto_high_threshold: float = 0.45,
     candidate_threshold: float = 0.33,
     max_anchors_per_year: int = 8,
-    anchor_top2_weight: float = 0.0,
+    anchor_top2_weight: float = 0.35,
     distant_year_sibling_penalty: float = 0.075,
     mid_year_drift_penalty: float = 0.030,
     hard_neg_min_sim: float = 0.58,
@@ -600,7 +635,7 @@ def recompute_active_matching(
     social_peer_boost: float = 0.040,
     social_cross_circle_penalty: float = 0.075,
     album_cohesion_boost: float = 0.065,
-    album_cohesion_absorb_sim: float = 0.42,
+    album_cohesion_absorb_sim: float = 0.55,
     pressure_boost: float = 0.06,
     pressure_penalty: float = 0.12,
     temporal_window_days: int = 3,
@@ -618,6 +653,15 @@ def recompute_active_matching(
     knn_gate_min_labels: int = 25,
     album_absent_sim: float = 0.40,
     album_absent_strong_margin: float = 0.05,
+    auto_band_knn_upper: float = 0.60,
+    auto_band_knn_min_sim: float = 0.52,
+    knn_promote_min_score: float | None = None,
+    album_cohesion_require_knn: bool = False,
+    anchor_outlier_min_sim: float = 0.0,
+    anchor_outlier_min_faces: int = 8,
+    anchor_det_penalty: float = 0.0,
+    knn_bank_cap_per_person: int = 0,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """
     Re-score all archive faces against all active people in <0.25s using:
@@ -629,7 +673,31 @@ def recompute_active_matching(
     5. Social Peer Co-Occurrence & Small-Photo Cross-Circle Suppression (boosts known classroom peers and
        suppresses siblings/other-classroom kids in intimate 2-8 face photos while tapering to 0 on >=9 face events)
     6. Global Photo-Level Bipartite 1-to-1 Exclusivity (1 face box = at most 1 person, 1 person = at most 1 face box)
+
+    Auto-acceptance policy (calibrated on hidden-label replays of the user's own decisions):
+    - `auto_high_threshold <= score < auto_band_knn_upper` is auto-accepted only when the labelled
+      neighbourhood agrees (`knn_trust_frac`) and its nearest labelled face is close enough to be
+      the same child (`auto_band_knn_min_sim`; a closed-set vote alone cannot spot an un-enrolled
+      look-alike); otherwise the face goes to the review queue.
+    - `album_cohesion` absorbs same-album faces only at local similarity >= `album_cohesion_absorb_sim`.
+    - kNN promotion of a candidate needs score >= `knn_promote_min_score`
+      (default `auto_high_threshold - 0.05`).
+    - Anchor scores blend the best and second-best anchor (`anchor_top2_weight`) so one atypical or
+      mislabelled anchor cannot pull in its whole neighbourhood.
+    The anchor outlier guard, det-score anchor discount and kNN voter cap are available but off: they
+    did not improve hidden-label accuracy on a real archive.
+
+    `diagnostics`, when given, is filled with per-section timings and the final score matrix
+    (offline evaluation / calibration only; it does not change any result).
     """
+    timings: dict[str, float] = {}
+    t_mark = [time.perf_counter()]
+
+    def _tick(section: str) -> None:
+        now = time.perf_counter()
+        timings[section] = timings.get(section, 0.0) + (now - t_mark[0])
+        t_mark[0] = now
+
     mat = db.load_all_faces_matrix()
     face_ids: NDArray[np.int64] = mat["face_ids"]
     photo_ids: NDArray[np.int64] = mat["photo_ids"]
@@ -647,7 +715,9 @@ def recompute_active_matching(
         return db.replace_model_assignments([], set())
 
     dim = int(embs.shape[1])
+    _tick("load_matrix")
     state = db.load_anchors_and_negatives(dim=dim)
+    _tick("load_state")
     active_people = [int(p["person_id"]) for p in state["people"]]
     if not active_people:
         return db.replace_model_assignments([], set())
@@ -718,13 +788,16 @@ def recompute_active_matching(
 
     chosen_anchor_face_ids: set[int] = set()
     anchors_by_pid: dict[int, tuple[NDArray[np.float32], NDArray[np.int32]]] = {}
+    anchor_det_pen_by_pid: dict[int, NDArray[np.float32]] = {}
 
     for pid in active_people:
         vecs: list[NDArray[np.float32]] = []
         yrs: list[int] = []
+        dets: list[float] = []
         for s_emb, s_yr in seeds_by_pid.get(pid, []):
             vecs.append(s_emb)
             yrs.append(s_yr)
+            dets.append(1.0)  # curated reference photos
 
         # Select up to `max_anchors_per_year` pose-diverse confirmed faces per year:
         person_years = sorted({yr for (p, yr) in confirmed_by_pid_year if p == pid})
@@ -737,25 +810,40 @@ def recompute_active_matching(
             items = source_map[(pid, yr)]
             sub_embs = np.stack([it[2] for it in items], axis=0)
             sub_sc = np.asarray([it[1] for it in items], dtype=np.float32)
+            cand_rel = np.arange(len(items))
+            if anchor_outlier_min_sim > 0.0 and len(items) >= anchor_outlier_min_faces:
+                # Label-consistency guard: a face that looks like none of the person's other
+                # confirmed faces that year is more likely a mislabel than a pose; never anchor on it.
+                consistent = _max_sim_to_others(sub_embs) >= anchor_outlier_min_sim
+                if np.any(consistent):
+                    cand_rel = np.where(consistent)[0]
             keep_rel = _select_diverse_indices(
-                sub_embs,
-                sub_sc,
+                sub_embs[cand_rel],
+                sub_sc[cand_rel],
                 max_items=max_anchors_per_year,
                 max_pair_sim=0.86,
             )
-            for rel_i in keep_rel:
-                f_id, _, f_emb = items[rel_i]
+            for rel_k in keep_rel:
+                f_id, det_v, f_emb = items[int(cand_rel[rel_k])]
                 chosen_anchor_face_ids.add(f_id)
                 vecs.append(f_emb)
                 yrs.append(yr)
+                dets.append(det_v)
 
         if vecs:
             anchors_by_pid[pid] = (
                 np.stack(vecs, axis=0).astype(np.float32),
                 np.asarray(yrs, dtype=np.int32),
             )
+            if anchor_det_penalty > 0.0:
+                # Blurry / small anchors are noisier: discount their similarities slightly.
+                det_arr = np.asarray(dets, dtype=np.float32)
+                anchor_det_pen_by_pid[pid] = (
+                    anchor_det_penalty * np.clip((0.80 - det_arr) / 0.25, 0.0, 1.0)
+                ).astype(np.float32)
 
     enrolled_pids = [pid for pid in active_people if pid in anchors_by_pid]
+    _tick("anchor_select")
     if not enrolled_pids:
         return db.replace_model_assignments([], chosen_anchor_face_ids)
 
@@ -807,6 +895,9 @@ def recompute_active_matching(
         for col_idx, pid, c_start, c_end in pbatch:
             _, a_years = anchors_by_pid[pid]
             raw_sims = batch_raw_sims[:, c_start:c_end]
+            det_pen = anchor_det_pen_by_pid.get(pid)
+            if det_pen is not None and np.any(det_pen > 0.0):
+                raw_sims = raw_sims - det_pen[np.newaxis, :]
 
             # Apply Year-Windowed Sibling Guard when dated anchors exist:
             dated_mask = a_years > 0
@@ -830,6 +921,7 @@ def recompute_active_matching(
                 pos_scores = _robust_anchor_score(raw_sims, anchor_top2_weight)
 
             eff_scores_by_col[:, col_idx] = pos_scores
+    _tick("anchor_score")
 
     # 2b. Temporal Cohesion: confirmed faces from the same few days (same haircut, outfit, season,
     # lighting) act as extra local anchors that are never diluted by per-year anchor caps, with a
@@ -874,13 +966,16 @@ def recompute_active_matching(
                 gap = np.abs(sorted_days[lo:hi] - d_anchor).astype(np.float32)
                 # Discount local evidence slightly with distance in days (0 d: -0.02 ... 3 d: -0.08):
                 s_eff = s_loc - 0.02 - temporal_day_decay * gap
-                np.maximum.at(best_t, w_rows, s_eff.astype(np.float32))
+                # Window rows are unique, so a gather/scatter max is exact (and much faster than ufunc.at):
+                best_t[w_rows] = np.maximum(best_t[w_rows], s_eff.astype(np.float32))
             pos_col = eff_scores_by_col[:, col_idx]
             t_mask = best_t >= temporal_min_sim
             if np.any(t_mask):
                 lifted = np.maximum(pos_col[t_mask], best_t[t_mask])
                 bonus = temporal_boost * np.clip((best_t[t_mask] - temporal_min_sim) / 0.24, 0.0, 1.0)
                 eff_scores_by_col[t_mask, col_idx] = (lifted + bonus).astype(np.float32)
+
+    _tick("temporal")
 
     # 3. Hard-Negative Lookalike Suppression (batched SGEMM across all people with negatives):
     neg_mats_by_col: list[tuple[int, int, NDArray[np.float32]]] = []
@@ -932,6 +1027,7 @@ def recompute_active_matching(
                     ] - hard_neg_weight * (neg_sims[suppress_mask] - 0.48)
 
     album_absent_by_col: dict[int, list[NDArray[np.int64]]] = defaultdict(list)
+    _tick("negatives")
 
     # 3b. Same-Album Local Outfit/Bunnysuit Cohesion & Local Negative Suppression:
     for col_idx, pid in enumerate(enrolled_pids):
@@ -990,6 +1086,8 @@ def recompute_active_matching(
 
         eff_scores_by_col[:, col_idx] = pos_scores
 
+    _tick("album")
+
     # 4. Social Peer Co-Occurrence & Small-Photo Cross-Circle Suppression:
     social = _build_social_context(state["people"], state["human"])
     pid_to_soc_idx: dict[int, int] = social["pid_to_idx"]
@@ -1047,16 +1145,22 @@ def recompute_active_matching(
                         tmp_soc[p_id].append(r_idx)
                 rows_by_social_photo = tmp_soc
 
-            enrolled_soc_indices = [pid_to_soc_idx[pid] for pid in enrolled_pids]
+            # Gather (target row -> witnesses) once in Python, then score every (row, enrolled person)
+            # pair with numpy: per pair, the strongest peer-bond witness and the strongest outsider
+            # witness among the photo's other faces (a witness never vouches for itself).
+            enrolled_soc = np.asarray([pid_to_soc_idx[pid] for pid in enrolled_pids], dtype=np.int64)
+            t_rows: list[int] = []
+            t_intim: list[float] = []
+            t_wit: list[list[tuple[int, int, float]]] = []
             for p_id, p_rows in rows_by_social_photo.items():
                 intimacy = photo_intimacy_factor(fc_by_photo[p_id])
                 if intimacy <= 0.0:
                     continue
-                witnesses: list[tuple[int | None, int, float]] = []
+                witnesses: list[tuple[int, int, float]] = []
                 conf_fids_used: set[int] = set()
                 conf_soc_used: set[int] = set()
                 for f_w, q_soc in confirmed_by_photo.get(p_id, []):
-                    witnesses.append((f_w, q_soc, 1.0))
+                    witnesses.append((-1 if f_w is None else int(f_w), q_soc, 1.0))
                     conf_soc_used.add(q_soc)
                     if f_w is not None:
                         conf_fids_used.add(f_w)
@@ -1070,34 +1174,47 @@ def recompute_active_matching(
                     witnesses.append((fid_w, q_soc, 0.80))
                 if not witnesses:
                     continue
-
                 for r_t in p_rows:
-                    fid_t = int(face_ids[r_t])
-                    if fid_t in locked_faces:
+                    if int(face_ids[r_t]) in locked_faces:
                         continue
-                    for col_p, p_soc in enumerate(enrolled_soc_indices):
-                        base_sc = float(eff_scores_by_col[r_t, col_p])
-                        best_boost_sig = 0.0
-                        worst_out_sig = 0.0
-                        for f_w, q_soc, conf_q in witnesses:
-                            if q_soc == p_soc:
-                                continue
-                            if f_w is not None and f_w == fid_t:
-                                continue
-                            b_sig = conf_q * float(peer_bond[p_soc, q_soc])
-                            if b_sig > best_boost_sig:
-                                best_boost_sig = b_sig
-                            o_sig = conf_q * float(outsider_mat[p_soc, q_soc])
-                            if o_sig > worst_out_sig:
-                                worst_out_sig = o_sig
-                        boost = (
-                            social_peer_boost * intimacy * best_boost_sig
-                            if base_sc >= 0.27
-                            else 0.0
-                        )
-                        penalty = social_cross_circle_penalty * intimacy * worst_out_sig
-                        if boost != 0.0 or penalty != 0.0:
-                            eff_scores_by_col[r_t, col_p] = np.float32(base_sc + boost - penalty)
+                    t_rows.append(int(r_t))
+                    t_intim.append(intimacy)
+                    t_wit.append(witnesses)
+
+            if t_rows:
+                n_t = len(t_rows)
+                m_w = max(len(w) for w in t_wit)
+                w_fid = np.full((n_t, m_w), -2, dtype=np.int64)
+                w_soc = np.zeros((n_t, m_w), dtype=np.int64)
+                w_conf = np.zeros((n_t, m_w), dtype=np.float64)
+                for i_t, wl in enumerate(t_wit):
+                    for j_w, (f_w, q_soc, conf_q) in enumerate(wl):
+                        w_fid[i_t, j_w] = f_w
+                        w_soc[i_t, j_w] = q_soc
+                        w_conf[i_t, j_w] = conf_q
+                rows_arr = np.asarray(t_rows, dtype=np.int64)
+                intim_arr = np.asarray(t_intim, dtype=np.float64)
+                tgt_fid = face_ids[rows_arr]
+                bond64 = peer_bond.astype(np.float64)[enrolled_soc]  # (cols, n_people)
+                out64 = outsider_mat.astype(np.float64)[enrolled_soc]
+                for c0 in range(0, n_t, 4096):
+                    sl = slice(c0, c0 + 4096)
+                    soc_c = w_soc[sl]
+                    usable = (w_fid[sl] != tgt_fid[sl, np.newaxis])[:, np.newaxis, :] & (
+                        enrolled_soc[np.newaxis, :, np.newaxis] != soc_c[:, np.newaxis, :]
+                    )
+                    conf_c = w_conf[sl][:, np.newaxis, :]
+                    b_sig = np.where(usable, conf_c * bond64[:, soc_c].transpose(1, 0, 2), 0.0).max(axis=2)
+                    o_sig = np.where(usable, conf_c * out64[:, soc_c].transpose(1, 0, 2), 0.0).max(axis=2)
+                    b_sig = np.maximum(b_sig, 0.0)
+                    o_sig = np.maximum(o_sig, 0.0)
+                    base = eff_scores_by_col[rows_arr[sl]].astype(np.float64)
+                    scale_b = (social_peer_boost * intim_arr[sl])[:, np.newaxis]
+                    scale_o = (social_cross_circle_penalty * intim_arr[sl])[:, np.newaxis]
+                    boost = np.where(base >= 0.27, scale_b * b_sig, 0.0)
+                    eff_scores_by_col[rows_arr[sl]] = ((base + boost) - scale_o * o_sig).astype(np.float32)
+
+    _tick("social")
 
     # 4b. Soft per-child pressure from the Child Clusters view (boost / penalize look-alikes):
     pressure_by_pid: dict[int, tuple[list[int], list[int]]] = defaultdict(lambda: ([], []))
@@ -1118,15 +1235,25 @@ def recompute_active_matching(
                 rows_sel = pos[ok]
                 if rows_sel.size == 0:
                     continue
-                best = np.full((n_faces,), -1.0, dtype=np.float32)
+                # Later stages only ever lower scores, so pressure can only matter for faces that can
+                # still reach the candidate threshold: skip the rest of the archive.
+                col_now = eff_scores_by_col[:, col_idx]
+                reach = candidate_threshold - (pressure_boost if is_boost else 0.0) - 1e-3
+                tgt_rows = np.where(col_now >= np.float32(reach))[0]
+                if tgt_rows.size == 0:
+                    continue
+                tgt_e = embs[tgt_rows]
+                best = np.full((int(tgt_rows.size),), -1.0, dtype=np.float32)
                 for c0 in range(0, int(rows_sel.size), 256):
                     chunk = embs[rows_sel[c0 : c0 + 256]]
-                    np.maximum(best, np.max(embs @ chunk.T, axis=1), out=best)
+                    np.maximum(best, np.max(tgt_e @ chunk.T, axis=1), out=best)
                 if is_boost:
                     w = np.clip((best - 0.40) / 0.30, 0.0, 1.0) * pressure_boost
                 else:
                     w = -np.clip((best - 0.42) / 0.30, 0.0, 1.0) * pressure_penalty
-                eff_scores_by_col[:, col_idx] += w.astype(np.float32)
+                eff_scores_by_col[tgt_rows, col_idx] += w.astype(np.float32)
+
+    _tick("pressure")
 
     # 4c. Hard eligibility: birthdays (never before birth) and class memberships (only own classes):
     rules = db.load_eligibility_rules()
@@ -1167,6 +1294,8 @@ def recompute_active_matching(
             if np.any(weak):
                 eff_scores_by_col[a_rows[weak], col_idx] = np.minimum(col_vals[weak], weak_cap)
 
+    _tick("eligibility")
+
     # 4d. Learned Label Vote (k-nearest labelled faces): every human-confirmed face of every person
     # (including `ignore` background profiles) votes on the identity of each still-open face.
     # - Veto: when the labelled neighbourhood clearly says "someone else" (or "background"), the face
@@ -1182,9 +1311,20 @@ def recompute_active_matching(
                 b_pos = int(np.searchsorted(face_ids, int(h["face_id"])))
                 if b_pos < n_faces and int(face_ids[b_pos]) == int(h["face_id"]):
                     pid_by_row[b_pos] = int(h["person_id"])
+        labelled_row = pid_by_row >= 0
+        if knn_bank_cap_per_person > 0:
+            # Thin out very large label sets (one child can hold a quarter of all labels) with a
+            # face-id hash so the bank stays stable while labels are added one at a time.
+            lab_counts = Counter(int(x) for x in pid_by_row[pid_by_row >= 0].tolist())
+            keep_frac = np.zeros((max(lab_counts, default=0) + 2,), dtype=np.float64)
+            for pid_c, cnt in lab_counts.items():
+                keep_frac[pid_c] = min(1.0, knn_bank_cap_per_person / float(cnt))
+            hashed = ((face_ids.astype(np.uint64) * np.uint64(2654435761)) % np.uint64(1 << 32)).astype(np.float64)
+            thin = (pid_by_row >= 0) & (hashed >= keep_frac[np.maximum(pid_by_row, 0)] * float(1 << 32))
+            pid_by_row = np.where(thin, -1, pid_by_row)  # thinned faces stay locked, they just don't vote
         bank_rows = np.where(pid_by_row >= 0)[0]
         open_mask = np.max(eff_scores_by_col, axis=1) >= candidate_threshold
-        open_mask &= pid_by_row < 0  # labelled faces are locked / are the voters themselves
+        open_mask &= ~labelled_row  # labelled faces are locked / are the voters themselves
         if locked_faces:
             open_mask &= ~np.isin(face_ids, np.fromiter(locked_faces, dtype=np.int64, count=len(locked_faces)))
         open_rows = np.where(open_mask & ~suppressed_auto)[0]
@@ -1272,6 +1412,7 @@ def recompute_active_matching(
                     if np.any(gate_hit):
                         eff_scores_by_col[np.ix_(q_rows, gate_cols)] = np.where(gate_hit, veto_cap, sub_g)
 
+    _tick("knn")
     neg_mat_cache: dict[int, NDArray[np.float32] | None] = {}
 
     def _knn_trusts(r_idx: int, pid: int, promote: bool) -> bool:
@@ -1317,6 +1458,7 @@ def recompute_active_matching(
         by_photo[p_id].append((score, fid, pid, r_idx, c_idx))
 
     n_enr_cols = len(enrolled_pids)
+    promote_min = auto_high_threshold - 0.05 if knn_promote_min_score is None else float(knn_promote_min_score)
     auto_assignments: list[tuple[int, int, int, AssignmentStatus, float, AssignmentSource]] = []
     for p_id, candidates in by_photo.items():
         if len(candidates) > 1:
@@ -1341,11 +1483,42 @@ def recompute_active_matching(
                     if (score - runner_up) >= 0.06:
                         src_kind = "album_cohesion"
             if knn_enabled:
-                if status == "auto_high" and src_kind != "album_cohesion" and _knn_trusts(r_idx, pid, False):
+                trusts = status == "auto_high" and _knn_trusts(r_idx, pid, False)
+                band_trusts = trusts and (
+                    score >= auto_band_knn_upper or float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+                )
+                if status == "auto_high" and not band_trusts and (
+                    score < auto_band_knn_upper
+                    or (src_kind == "album_cohesion" and album_cohesion_require_knn)
+                ):
+                    # Calibration band: human decisions at these scores are wrong ~1 in 5 times,
+                    # so only auto-accept when the labelled neighbourhood agrees; else ask.
+                    status = "candidate"
+                    src_kind = "model_match"
+                elif trusts and src_kind != "album_cohesion":
                     src_kind = "model_trusted"
-                elif status == "candidate" and _knn_trusts(r_idx, pid, True):
+                elif (
+                    status == "candidate"
+                    and score >= promote_min
+                    and float(knn_sim[r_idx]) >= auto_band_knn_min_sim
+                    and _knn_trusts(r_idx, pid, True)
+                ):
                     status = "auto_high"
                     src_kind = "model_trusted"
             auto_assignments.append((p_id, pid, fid, status, score, src_kind))
+    _tick("assign")
 
-    return db.replace_model_assignments(auto_assignments, chosen_anchor_face_ids)
+    result = db.replace_model_assignments(auto_assignments, chosen_anchor_face_ids)
+    _tick("write")
+    if diagnostics is not None:
+        diagnostics.update(
+            timings=timings,
+            face_ids=face_ids,
+            enrolled_pids=list(enrolled_pids),
+            eff_scores=eff_scores_by_col,
+            knn_top=knn_top,
+            knn_frac=knn_frac,
+            knn_sim=knn_sim,
+            assignments=auto_assignments,
+        )
+    return result
