@@ -110,19 +110,24 @@ def unpack_embeddings_f32(blobs: list[bytes], dim: int = 512) -> NDArray[np.floa
 
 def _pack_person_cluster(
     year_items: list[dict[str, Any]],
-    sims: NDArray[np.float32],
+    sub: NDArray[np.float32],
     leader_loc: int,
     member_locs: list[int],
     is_loose: bool,
     yr_key: str,
 ) -> dict[str, Any]:
-    """Serialize one per-child visual sub-cluster (faces sorted by similarity to the leader)."""
-    l_sims = sims[leader_loc]
+    """Serialize one per-child visual sub-cluster (faces sorted by similarity to the leader).
+
+    `sub` holds the L2-normalized embeddings of `year_items` (row-aligned); only O(n * dim) work is
+    done here (no pairwise matrix), so it is safe for very large per-year groups.
+    """
+    m_arr = np.asarray(member_locs, dtype=np.int64)
+    l_sims = sub[m_arr] @ sub[leader_loc]
     face_list: list[dict[str, Any]] = []
-    for m in member_locs:
+    for pos, m in enumerate(member_locs):
         it = dict(year_items[m])
         it.pop("det_score", None)
-        it["sim_to_leader"] = round(float(l_sims[m]), 4)
+        it["sim_to_leader"] = round(float(l_sims[pos]), 4)
         face_list.append(it)
     face_list.sort(key=lambda f_it: float(f_it["sim_to_leader"]), reverse=True)
     counts = {"confirmed": 0, "auto_high": 0, "candidate": 0, "none": 0}
@@ -138,10 +143,11 @@ def _pack_person_cluster(
     if is_loose:
         cohesion = 0.0
         if n_m > 1:
-            sub_s = sims[np.ix_(member_locs, member_locs)]
-            cohesion = float((float(sub_s.sum()) - n_m) / (n_m * (n_m - 1)))
+            # Mean pairwise cosine of unit vectors: (||sum||^2 - n) / (n (n - 1)).
+            tot = sub[m_arr].sum(axis=0, dtype=np.float64)
+            cohesion = float((float(tot @ tot) - n_m) / (n_m * (n_m - 1)))
     else:
-        cohesion = float(np.mean(l_sims[member_locs]))
+        cohesion = float(np.mean(l_sims))
     leader_fid = int(year_items[leader_loc]["face_id"])
     return {
         "cluster_key": f"{yr_key}-{'loose' if is_loose else leader_fid}",
@@ -2778,12 +2784,15 @@ class FacesIndexDB:
         *,
         threshold: float = 0.50,
         min_size: int = 3,
+        max_pairwise_faces: int = 4096,
     ) -> dict[str, Any]:
         """
         Group everything currently attributed to `person_id` (confirmed + auto_high + candidate, plus
         faces carrying boost/penalize pressure) into per-year visual sub-clusters using density-leader
         grouping on the cached ArcFace matrix. Faces that do not form a group of `min_size` land in a
-        per-year loose bucket.
+        per-year loose bucket. Per year, leader discovery uses at most `max_pairwise_faces` faces
+        (a `cap x cap` similarity matrix, ~64 MB at the default); the rest are attached to their
+        nearest leader in chunks, so memory no longer grows quadratically with the year's size.
         """
         thr = float(min(0.95, max(0.20, threshold)))
         min_sz = max(2, int(min_size))
@@ -2853,14 +2862,26 @@ class FacesIndexDB:
         for idx, it in enumerate(items):
             by_year.setdefault(it["year"], []).append(idx)
 
+        cap = max(16, int(max_pairwise_faces))
         clusters: list[dict[str, Any]] = []
         for yr in sorted(by_year.keys(), reverse=True):
             idxs = by_year[yr]
-            sub = c_embs[np.asarray([emb_rows[i] for i in idxs], dtype=np.int64)]
+            n_all = len(idxs)
+            sub_all = c_embs[np.asarray([emb_rows[i] for i in idxs], dtype=np.int64)]
+            det_all = np.asarray([items[i]["det_score"] for i in idxs], dtype=np.float32)
+            if n_all > cap:
+                # Leader discovery runs on a deterministic sample (best detections first, then
+                # face_id) so the pairwise matrix stays <= cap^2; every other face is attached to
+                # its nearest leader below in O(n * leaders) chunks.
+                fid_all = np.asarray([items[i]["face_id"] for i in idxs], dtype=np.int64)
+                sample = np.sort(np.lexsort((fid_all, -det_all))[:cap])
+            else:
+                sample = np.arange(n_all, dtype=np.int64)
+            sub = sub_all[sample]
             sims = sub @ sub.T
             adj = sims >= thr
-            unassigned = np.ones((len(idxs),), dtype=bool)
-            det = np.asarray([items[i]["det_score"] for i in idxs], dtype=np.float32)
+            unassigned = np.ones((len(sample),), dtype=bool)
+            det = det_all[sample]
             year_groups: list[tuple[int, NDArray[np.int64]]] = []
             loose: list[int] = []
             static_deg = adj.sum(axis=1).astype(np.float32) + 0.01 * det
@@ -2874,6 +2895,7 @@ class FacesIndexDB:
                 if members.size < min_sz:
                     continue
                 year_groups.append((leader, members.astype(np.int64)))
+            del sims, adj
             # Merge pose/lighting sub-groups whose centroids clearly look alike (average-linkage style),
             # so one look of the child does not fragment into dozens of tiny cards:
             merge_thr = min(0.95, thr + 0.12)
@@ -2901,23 +2923,28 @@ class FacesIndexDB:
                     c_new = sub[merged_m].mean(axis=0)
                     cents[ia] = c_new / max(float(np.linalg.norm(c_new)), 1e-8)
                 year_groups = [groups_m[i] for i in alive]
-            # Second pass: leftover faces from undersized groups join their best group if close enough,
-            # otherwise they land in the per-year loose bucket.
-            grouped = np.zeros((len(idxs),), dtype=bool)
+            # Map sample-local indices back to year-local ones.
+            year_groups = [(int(sample[ld]), sample[mem]) for ld, mem in year_groups]
+            # Second pass: leftover faces (undersized groups + faces outside the sample) join their
+            # best group if close enough, otherwise they land in the per-year loose bucket.
+            grouped = np.zeros((n_all,), dtype=bool)
             for _, members in year_groups:
                 grouped[members] = True
             leftovers = np.where(~grouped)[0]
             if year_groups and leftovers.size:
                 leader_arr = np.asarray([g[0] for g in year_groups], dtype=np.int64)
-                l_sims_all = sims[np.ix_(leftovers, leader_arr)]
-                best = np.argmax(l_sims_all, axis=1)
+                lead_embs = sub_all[leader_arr]
                 extra: dict[int, list[int]] = {}
-                for pos, loc in enumerate(leftovers.tolist()):
-                    b = int(best[pos])
-                    if float(l_sims_all[pos, b]) >= thr:
-                        extra.setdefault(b, []).append(int(loc))
-                    else:
-                        loose.append(int(loc))
+                for c0 in range(0, int(leftovers.size), 4096):
+                    chunk_locs = leftovers[c0 : c0 + 4096]
+                    l_sims_all = sub_all[chunk_locs] @ lead_embs.T
+                    best = np.argmax(l_sims_all, axis=1)
+                    for pos, loc in enumerate(chunk_locs.tolist()):
+                        b = int(best[pos])
+                        if float(l_sims_all[pos, b]) >= thr:
+                            extra.setdefault(b, []).append(int(loc))
+                        else:
+                            loose.append(int(loc))
                 for b, locs in extra.items():
                     ld, mem = year_groups[b]
                     year_groups[b] = (ld, np.concatenate([mem, np.asarray(locs, dtype=np.int64)]))
@@ -2928,12 +2955,12 @@ class FacesIndexDB:
             year_items = [items[i] for i in idxs]
             for leader_loc, members in year_groups:
                 clusters.append(
-                    _pack_person_cluster(year_items, sims, leader_loc, [int(m) for m in members], False, yr)
+                    _pack_person_cluster(year_items, sub_all, leader_loc, [int(m) for m in members], False, yr)
                 )
             if loose:
                 loose_sorted = sorted(set(loose))
                 clusters.append(
-                    _pack_person_cluster(year_items, sims, loose_sorted[0], loose_sorted, True, yr)
+                    _pack_person_cluster(year_items, sub_all, loose_sorted[0], loose_sorted, True, yr)
                 )
 
         return {

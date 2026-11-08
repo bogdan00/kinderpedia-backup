@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -29,6 +30,7 @@ from kinderpedia_backup.faces.models import PhotoProvenance
 from kinderpedia_backup.faces.storage import file_fingerprint
 
 DIM = 512
+MATERIALIZE_MODULE = "kinderpedia_backup.faces.index_db"
 
 
 def _vec(index: int, *, noise: float = 0.0, seed: int = 0) -> tuple[float, ...]:
@@ -563,9 +565,8 @@ class MaterializeTests(_ArchiveCase):
             for fn in ("001_leo_maya.jpg", "002_leo.jpg"):
                 ph, fid = self.face_of(db, fn, 0)
                 db.tag_single_face(photo_id=ph, face_id=fid, person_id=leo)
-            import kinderpedia_backup.faces.index_db as idx_mod
+            from kinderpedia_backup.faces.storage import link_or_copy_photo as real_link
 
-            real_link = idx_mod.link_or_copy_photo
             lock_free: list[bool] = []
 
             def probing_link(*a: Any, **kw: Any) -> bool:
@@ -583,11 +584,8 @@ class MaterializeTests(_ArchiveCase):
                 lock_free.append(bool(got and got[0]))
                 return real_link(*a, **kw)
 
-            idx_mod.link_or_copy_photo = probing_link  # type: ignore[assignment]
-            try:
+            with mock.patch(f"{MATERIALIZE_MODULE}.link_or_copy_photo", probing_link):
                 st = db.materialize_flat_folders(backup_dir=self.backup, output_dir=out, link_mode="symlink")
-            finally:
-                idx_mod.link_or_copy_photo = real_link  # type: ignore[assignment]
             self.assertEqual(st.links_created, 2)
             self.assertTrue(lock_free and all(lock_free))
 
@@ -606,6 +604,30 @@ class MaterializeTests(_ArchiveCase):
             self.assertEqual(sorted(p.name for p in (out / "Leo Renamed").iterdir()), [
                 "2025-06-01 Trip_001_leo_maya.jpg", "2025-06-01 Trip_002_leo.jpg"
             ])
+
+
+class PersonClustersCapTests(unittest.TestCase):
+    def test_capped_pairwise_still_places_every_face_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "f.sqlite") as db:
+            items = []
+            for i in range(60):
+                prov = PhotoProvenance(
+                    rel_path=f"A/Albums/2025/01/x/{i:03d}.jpg", archive_child="A", year="2025",
+                    month="01", album_leaf="x", filename=f"{i:03d}.jpg",
+                )
+                emb = _vec(i % 3, noise=0.02, seed=i)
+                items.append((prov, 100, 100, 1, 1, "d", [DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=emb)]))
+            saved = db.upsert_scanned_batch(items)
+            pid = db.ensure_person("Sofia")
+            for photo_id, (fid,) in saved:
+                db.tag_single_face(photo_id=photo_id, face_id=fid, person_id=pid)
+            full = db.get_person_face_clusters(pid)
+            capped = db.get_person_face_clusters(pid, max_pairwise_faces=16)
+            for res in (full, capped):
+                fids = [f["face_id"] for c in res["clusters"] for f in c["faces"]]
+                self.assertEqual(len(fids), 60)
+                self.assertEqual(len(set(fids)), 60)
+            self.assertEqual(len([c for c in capped["clusters"] if not c["is_loose"]]), 3)
 
 
 class UpsertBatchApiTests(unittest.TestCase):
