@@ -47,6 +47,20 @@ def _basis_vec(index: int, *, dim: int = 512, jitter: float = 0.0, jitter_idx: i
     return tuple(float(x) for x in arr.tolist())
 
 
+def _await_job_result(base_url: str, resp: requests.Response, timeout: float = 20.0) -> dict[str, Any]:
+    """`/api/materialize` & `/api/recluster` answer 202 + job id; poll `/api/jobs/<id>` for the result."""
+    assert resp.status_code == 202, resp.text
+    job_id = resp.json()["job_id"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = requests.get(f"{base_url}/api/jobs/{job_id}", timeout=5).json()
+        if job["state"] != "running":
+            assert job["state"] == "done", job
+            return dict(job["result"])
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
 class _StubRecognizer:
     """Deterministic fake recognizer keyed by filename substring for fast offline tests."""
 
@@ -752,7 +766,7 @@ class FacesPipelineTests(unittest.TestCase):
                         timeout=5,
                     )
                     r_mat.raise_for_status()
-                    self.assertEqual(r_mat.json()["links_created"], 6)
+                    self.assertEqual(_await_job_result(base_url, r_mat)["links_created"], 6)
                     self.assertEqual(len(list((out_dir / "Leo").iterdir())), 5)
                     self.assertEqual(len(list((out_dir / "Alex").iterdir())), 1)
 
@@ -1474,7 +1488,7 @@ class FacesPipelineTests(unittest.TestCase):
                         timeout=5,
                     )
                     r_mat.raise_for_status()
-                    self.assertEqual(r_mat.json()["photos_matched"], 1)
+                    self.assertEqual(_await_job_result(base_url, r_mat)["photos_matched"], 1)
                     maya_files = list((out_dir / "Maya").glob("*.jpg"))
                     self.assertEqual(len(maya_files), 1)
 
