@@ -52,9 +52,12 @@ _PEOPLE_BOXES = {
 class _ScanStub:
     """Filename-keyed recognizer whose `model_id`, box jitter and per-file dropouts are configurable."""
 
-    def __init__(self, model: str = "stub-v1", *, shift: int = 0, drop: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self, model: str = "stub-v1", *, shift: int = 0, drop: tuple[str, ...] = (), emb_seed: int = 0
+    ) -> None:
         self.model = model
         self.shift = shift
+        self.emb_seed = emb_seed
         self.drop = drop
         self.calls = 0
         self.seen: list[str] = []
@@ -76,7 +79,7 @@ class _ScanStub:
                 out.append(
                     DetectedFace(
                         box=BoundingBox(box.top + s, box.right + s, box.bottom + s, box.left + s),
-                        embedding=_vec(idx, noise=0.05, seed=len(name) + idx),
+                        embedding=_vec(idx, noise=0.05, seed=len(name) + idx + self.emb_seed),
                         confidence=0.9,
                     )
                 )
@@ -240,6 +243,22 @@ class LabelPreservingRescanTests(_ArchiveCase):
         self.assertEqual(after3["confirmed"], before["confirmed"])
         self.assertEqual(after3["face_ids"], before["face_ids"])
         self.assertEqual(summary3.labels_orphaned, 0)
+
+    def test_alignment_model_id_bump_full_rescan_preserves_labels(self) -> None:
+        """Exactly the ML stream's migration: `..._v1` rows rescanned by `..._v1_align2`."""
+        self.scan(_ScanStub("scrfd_10g_640_arcface_r50_v1"))
+        before = self._seed_labels()
+        rec = _ScanStub("scrfd_10g_640_arcface_r50_v1_align2", shift=1, emb_seed=1000)
+        summary = self.scan(rec)
+        self.assertEqual(rec.calls, 5)
+        self.assertEqual(summary.labels_orphaned, 0)
+        with FacesIndexDB(self.db_path) as db:
+            after = self._label_state(db)
+            dets = {str(r[0]) for r in db._conn.execute("SELECT detector_id FROM photos").fetchall()}
+        self.assertEqual(dets, {"scrfd_10g_640_arcface_r50_v1_align2"})
+        for key in ("confirmed", "negatives", "anchors", "pressure", "suppressed", "covers", "face_ids"):
+            self.assertEqual(after[key], before[key], key)
+        self.assertTrue(_counts_consistent(self.db_path))
 
     def test_mtime_only_change_does_not_rescan_but_content_change_does(self) -> None:
         rec = _ScanStub()
@@ -458,6 +477,8 @@ class ScanLockTests(unittest.TestCase):
                 self.assertIsNotNone(info)
                 assert info is not None
                 self.assertEqual(info["pid"], os.getpid())
+                with FacesIndexDB(meta / "faces_index.sqlite") as db:
+                    self.assertIsNotNone(db.get_scan_status())
                 with self.assertRaises(ScanLockBusyError):
                     ScanLock(meta, timeout_s=0.2).acquire()
             self.assertIsNone(read_scan_lock(meta))
@@ -628,6 +649,45 @@ class PersonClustersCapTests(unittest.TestCase):
                 self.assertEqual(len(fids), 60)
                 self.assertEqual(len(set(fids)), 60)
             self.assertEqual(len([c for c in capped["clusters"] if not c["is_loose"]]), 3)
+
+
+class BatchProposalAuditTests(unittest.TestCase):
+    def test_audit_cards_injected_and_default_decisions_follow_bands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "f.sqlite") as db:
+            items = []
+            for i in range(40):
+                prov = PhotoProvenance(
+                    rel_path=f"A/Albums/2025/01/alb{i % 7}/{i:03d}.jpg", archive_child="A", year="2025",
+                    month="01", album_leaf=f"alb{i % 7}", filename=f"{i:03d}.jpg",
+                )
+                emb = _vec(i % 5, noise=0.3, seed=i)
+                items.append((prov, 100, 100, 1, 1, "d", [DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=emb)]))
+            saved = db.upsert_scanned_batch(items)
+            pid = db.ensure_person("Theo")
+            rows: list[tuple[int, int, int, Any, float, Any]] = []
+            for k, (photo_id, (fid,)) in enumerate(saved):
+                if k < 30:
+                    rows.append((photo_id, pid, fid, "candidate", 0.30 + 0.01 * k, "model_match"))
+                else:
+                    rows.append((photo_id, pid, fid, "auto_high", 0.70, "album_cohesion"))
+            db.replace_model_assignments(rows, set())
+            trusted = {photo_id for photo_id, *_ in rows[30:]}
+
+            for mode in ("impact", "confident"):
+                base = db.get_batch_proposal(pid, batch_size=24, mode=mode, audit_per_batch=0)
+                res = db.get_batch_proposal(pid, batch_size=24, mode=mode)
+                self.assertEqual(res["batch_count"], 24)
+                audits = [c for c in res["cards"] if c["audit"]]
+                self.assertEqual(len(audits), 2)
+                self.assertEqual(res["audit_count"], 2)
+                self.assertTrue(all(c["photo_id"] in trusted and c["source"] == "album_cohesion" for c in audits))
+                main = [c["photo_id"] for c in res["cards"] if not c["audit"]]
+                self.assertEqual(main, [c["photo_id"] for c in base["cards"]][:22])
+                for c in res["cards"]:
+                    sim = c["similarity"]
+                    self.assertEqual(c["default_approved"], sim >= 0.50)
+                    want = "approved" if sim >= 0.50 else ("unsure" if sim >= 0.38 else "disproved")
+                    self.assertEqual(c["default_decision"], want)
 
 
 class UpsertBatchApiTests(unittest.TestCase):

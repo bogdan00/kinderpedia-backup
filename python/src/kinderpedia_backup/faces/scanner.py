@@ -325,250 +325,301 @@ def _run_locked_scan(
     report = RelinkReport()
 
     with FacesIndexDB(db_path) as db:
-        summary.people_seeded = enroll_avatars_and_references(
-            db,
-            recognizer,
-            backup_dir=backup_root,
-            refs_dir=refs_dir,
-        )
-        states = db.get_photo_scan_states()
-        disk_rel: dict[str, Path] = {}
-        for p in photos:
-            disk_rel["/".join(p.resolve().relative_to(backup_root).parts)] = p
-        missing: dict[str, PhotoScanState] = {r: s for r, s in states.items() if r not in disk_rel}
-
-        to_scan: list[Path] = []
-        verify: list[tuple[Path, int, PhotoScanState, int]] = []  # (path, size, prev, mtime_ns)
-        backfill: list[tuple[Path, int, PhotoScanState]] = []
-        new_files: list[tuple[Path, int, int]] = []  # (path, size, mtime_ns)
-        model_changed = 0
-        for rel_key, p in disk_rel.items():
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            prev = states.get(rel_key)
-            if prev is None:
-                new_files.append((p, int(st.st_size), int(st.st_mtime_ns)))
-            elif force or prev.detector_id != det_id or prev.file_size != st.st_size:
-                model_changed += int(prev.detector_id != det_id)
-                to_scan.append(p)
-            elif prev.mtime_ns == st.st_mtime_ns:
-                summary.photos_cached += 1
-                if not prev.content_hash:
-                    backfill.append((p, int(st.st_size), prev))
-            else:
-                verify.append((p, int(st.st_size), prev, int(st.st_mtime_ns)))
-
-        if model_changed:
-            log(
-                f"[Faces] Model changed to {det_id} for {model_changed:,} photo(s): re-detecting with "
-                "label-preserving face re-link (confirmed tags, anchors and pressure stay on their faces)."
+        finished = False
+        try:
+            _scan_body(
+                db,
+                summary=summary,
+                report=report,
+                photos=photos,
+                backup_root=backup_root,
+                thumbs_root=thumbs_root,
+                portable_json=portable_json,
+                resolver=resolver,
+                recognizer=recognizer,
+                det_id=det_id,
+                refs_dir=refs_dir,
+                eff_workers=eff_workers,
+                io_workers=io_workers,
+                auto_high_threshold=auto_high_threshold,
+                candidate_threshold=candidate_threshold,
+                batch_commit_size=batch_commit_size,
+                progress=progress,
+                force=force,
+                prune_missing=prune_missing,
             )
-
-        # Same size, new mtime: compare fingerprints instead of re-running detection.
-        fp_updates: list[tuple[int, str, int]] = []
-        if verify:
-            hashes = _hash_many([(p, sz) for p, sz, _, _ in verify], io_workers)
-            for (p, _sz, prev, mtime_ns), h in zip(verify, hashes, strict=True):
-                if h is not None and prev.content_hash and h == prev.content_hash:
-                    fp_updates.append((prev.photo_id, h, mtime_ns))
-                    summary.photos_verified += 1
-                    summary.photos_cached += 1
-                else:
-                    to_scan.append(p)
-        if backfill:
-            log(f"[Faces] Fingerprinting {len(backfill):,} previously indexed photo(s) (one-time)...")
-            hashes = _hash_many([(p, sz) for p, sz, _ in backfill], io_workers)
-            fp_updates.extend(
-                (prev.photo_id, h, prev.mtime_ns)
-                for (_, _, prev), h in zip(backfill, hashes, strict=True)
-                if h is not None
-            )
-        db.set_photo_fingerprints(fp_updates)
-
-        # Renamed / moved photos: re-key vanished rows onto new paths, keeping photo_id + labels.
-        if missing and new_files:
-            by_hash: dict[str, str] = {}
-            by_kp: dict[tuple[int, int], list[str]] = {}
-            for rel, s in missing.items():
-                if s.content_hash:
-                    by_hash.setdefault(s.content_hash, rel)
-                if s.kinderpedia_image_id is not None:
-                    by_kp.setdefault((s.kinderpedia_image_id, s.file_size), []).append(rel)
-            new_hashes = _hash_many([(p, sz) for p, sz, _ in new_files], io_workers)
-            still_new: list[tuple[Path, int, int]] = []
-            for (p, sz, mtime_ns), h in zip(new_files, new_hashes, strict=True):
-                prov = resolver.resolve(p)
-                old_rel = by_hash.get(h) if h else None
-                if old_rel is None or old_rel not in missing:
-                    old_rel = None
-                    if prov.kinderpedia_image_id is not None:
-                        cands = [
-                            r for r in by_kp.get((prov.kinderpedia_image_id, sz), []) if r in missing
-                        ]
-                        same_name = [r for r in cands if missing[r].filename == prov.filename]
-                        pick = same_name or cands
-                        old_rel = pick[0] if pick else None
-                if old_rel is None:
-                    still_new.append((p, sz, mtime_ns))
-                    continue
-                prev = missing.pop(old_rel)
-                db.rekey_photo(prev.photo_id, prov, mtime_ns=mtime_ns, content_hash=h or "")
-                summary.photos_rekeyed += 1
-                if force or prev.detector_id != det_id or prev.file_size != sz:
-                    to_scan.append(p)
-                else:
-                    summary.photos_cached += 1
-            new_files = still_new
-            if summary.photos_rekeyed:
-                log(f"[Faces] Re-keyed {summary.photos_rekeyed:,} renamed/moved photo(s) (labels kept).")
-        to_scan.extend(p for p, _, _ in new_files)
-
-        # Photos gone from disk: delete (cascade-safe) unless it looks like an unmounted/partial archive.
-        if missing:
-            n_missing = len(missing)
-            guard_ok = bool(photos) and n_missing <= max(100, int(0.10 * len(states)))
-            do_prune = prune_missing if prune_missing is not None else guard_ok
-            if do_prune and photos:
-                res = db.delete_photos([s.photo_id for s in missing.values()])
-                summary.photos_removed = int(res["photos"])
-                summary.labels_removed_with_photos = int(res["human_labels"])
-                remove_face_thumbs(thumbs_root, list(res["face_ids"]))
-                log(
-                    f"[Faces] Removed {summary.photos_removed:,} photo(s) no longer on disk "
-                    f"({res['faces']:,} faces, {summary.labels_removed_with_photos:,} human labels)."
-                )
-            else:
-                summary.photos_missing_kept = n_missing
-                log(
-                    f"[Faces] Warning: {n_missing:,} indexed photo(s) are missing on disk; kept them "
-                    "(looks like a partial/unmounted archive). Re-run with `--prune-missing` to delete."
-                )
-
-        log(
-            f"[Faces] Archive: {len(photos):,} photos ({summary.photos_cached:,} cached, "
-            f"{len(to_scan):,} to scan with {eff_workers} worker(s), model={det_id})"
-        )
-
-        if to_scan:
-            t_start = time.monotonic()
-            pending_rows: list[tuple[PhotoProvenance, int, int, int, int, str, list[DetectedFace]]] = []
-            pending_thumbs: list[list[Image.Image]] = []
-            pending_hashes: list[str] = []
-
-            def _flush_pending() -> None:
-                if not pending_rows:
-                    return
-                n_removed = len(report.removed_face_ids)
-                n_moved = len(report.moved_face_ids)
-                saved_ids = db.upsert_scanned_batch(
-                    pending_rows, content_hashes=pending_hashes, report=report
-                )
-                remove_face_thumbs(thumbs_root, report.removed_face_ids[n_removed:])
-                remove_face_thumbs(thumbs_root, report.moved_face_ids[n_moved:])
-                for (_, face_ids), thumb_list in zip(saved_ids, pending_thumbs, strict=True):
-                    for fid, t_img in zip(face_ids, thumb_list, strict=False):
-                        with contextlib.suppress(OSError):
-                            save_face_thumb_jpeg(thumbs_root, fid, t_img)
-                pending_rows.clear()
-                pending_thumbs.clear()
-                pending_hashes.clear()
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=eff_workers) as pool:
-                in_flight: set[concurrent.futures.Future[Any]] = set()
-                max_queue = eff_workers * 4
-                photo_iter = iter(to_scan)
-                done_count = 0
-
-                def _submit_next() -> bool:
-                    try:
-                        nxt = next(photo_iter)
-                    except StopIteration:
-                        return False
-                    in_flight.add(pool.submit(_inspect_single_photo, recognizer, nxt))
-                    return True
-
-                for _ in range(min(max_queue, len(to_scan))):
-                    _submit_next()
-
-                while in_flight:
-                    done_set, in_flight = concurrent.futures.wait(
-                        in_flight,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    for fut in done_set:
-                        _submit_next()
-                        done_count += 1
-                        try:
-                            p_path, w, h, fsize, mtime_ns, faces, thumbs, c_hash = fut.result()
-                            prov = resolver.resolve(p_path, width=w, height=h)
-                            pending_rows.append((prov, w, h, fsize, mtime_ns, det_id, faces))
-                            pending_thumbs.append(thumbs)
-                            pending_hashes.append(c_hash)
-                            summary.photos_scanned += 1
-                        except Exception as exc:
-                            summary.photos_failed += 1
-                            log(f"[Faces] Warning: skipped unreadable image ({exc})")
-
-                        if len(pending_rows) >= batch_commit_size:
-                            _flush_pending()
-                            if done_count % 5000 < batch_commit_size and done_count >= 5000:
-                                recompute_active_matching(
-                                    db,
-                                    auto_high_threshold=auto_high_threshold,
-                                    candidate_threshold=candidate_threshold,
-                                )
-
-                        if progress is not None and progress.enabled:
-                            elapsed = max(0.001, time.monotonic() - t_start)
-                            rate = done_count / elapsed
-                            rem_s = int((len(to_scan) - done_count) / max(rate, 0.01))
-                            progress.render_line(
-                                f"  [Scan] {done_count:,}/{len(to_scan):,} "
-                                f"({100.0 * done_count / len(to_scan):.1f}%) | "
-                                f"{rate:.1f} img/s | ETA {rem_s // 60}m{rem_s % 60:02d}s"
-                            )
-                        elif done_count % 1000 == 0 or done_count == len(to_scan):
-                            elapsed = max(0.001, time.monotonic() - t_start)
-                            rate = done_count / elapsed
-                            rem_s = int((len(to_scan) - done_count) / max(rate, 0.01))
-                            log(
-                                f"[Faces] Progress: {done_count:,}/{len(to_scan):,} "
-                                f"({100.0 * done_count / len(to_scan):.1f}%) | "
-                                f"{rate:.1f} img/s | ETA {rem_s // 60}m{rem_s % 60:02d}s"
-                            )
-
-                _flush_pending()
-            if progress is not None:
-                progress.close()
-
-        summary.faces_relinked = report.faces_relinked
-        summary.faces_removed = report.faces_removed
-        summary.labels_orphaned = report.labels_orphaned
-        if report.faces_relinked or report.faces_removed:
-            log(
-                f"[Faces] Re-link: {report.faces_relinked:,} face(s) kept their id, "
-                f"{report.faces_new:,} new, {report.faces_removed:,} removed"
-                + (
-                    f" — {report.labels_orphaned:,} human label(s) lost their face box "
-                    "(kept as photo-level tags; see meta.orphaned_face_labels_total)"
-                    if report.labels_orphaned
-                    else ""
-                )
-            )
-
-        log("[Faces] Building per-(classroom, year) recurring child clusters...")
-        summary.clusters_created = rebuild_yearly_clusters(db)
-        log("[Faces] Running active-learning multi-anchor matcher (with sibling guard & hard negatives)...")
-        summary.auto_high_matches, summary.candidate_matches = recompute_active_matching(
-            db,
-            auto_high_threshold=auto_high_threshold,
-            candidate_threshold=candidate_threshold,
-        )
-        overview = db.get_archive_overview()
-        summary.faces_total = int(overview["faces_total"])
-        db.export_portable_index(portable_json)
-        db.bump_data_version(scan_finished=True)
-
+            finished = True
+        finally:
+            # Signal other processes (a running `faces ui`) even when the scan was interrupted
+            # after committing batches; `last_scan_at` only on a complete run.
+            with contextlib.suppress(Exception):
+                db.bump_data_version(scan_finished=finished)
     return summary
+
+
+def _scan_body(
+    db: FacesIndexDB,
+    *,
+    summary: ScanSummary,
+    report: RelinkReport,
+    photos: list[Path],
+    backup_root: Path,
+    thumbs_root: Path,
+    portable_json: Path,
+    resolver: ProvenanceResolver,
+    recognizer: FaceRecognizer,
+    det_id: str,
+    refs_dir: Path | None,
+    eff_workers: int,
+    io_workers: int,
+    auto_high_threshold: float,
+    candidate_threshold: float,
+    batch_commit_size: int,
+    progress: LiveProgress | None,
+    force: bool,
+    prune_missing: bool | None,
+) -> None:
+    summary.people_seeded = enroll_avatars_and_references(
+        db,
+        recognizer,
+        backup_dir=backup_root,
+        refs_dir=refs_dir,
+    )
+    states = db.get_photo_scan_states()
+    disk_rel: dict[str, Path] = {}
+    for p in photos:
+        disk_rel["/".join(p.resolve().relative_to(backup_root).parts)] = p
+    missing: dict[str, PhotoScanState] = {r: s for r, s in states.items() if r not in disk_rel}
+
+    to_scan: list[Path] = []
+    verify: list[tuple[Path, int, PhotoScanState, int]] = []  # (path, size, prev, mtime_ns)
+    backfill: list[tuple[Path, int, PhotoScanState]] = []
+    new_files: list[tuple[Path, int, int]] = []  # (path, size, mtime_ns)
+    model_changed = 0
+    for rel_key, p in disk_rel.items():
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        prev = states.get(rel_key)
+        if prev is None:
+            new_files.append((p, int(st.st_size), int(st.st_mtime_ns)))
+        elif force or prev.detector_id != det_id or prev.file_size != st.st_size:
+            model_changed += int(prev.detector_id != det_id)
+            to_scan.append(p)
+        elif prev.mtime_ns == st.st_mtime_ns:
+            summary.photos_cached += 1
+            if not prev.content_hash:
+                backfill.append((p, int(st.st_size), prev))
+        else:
+            verify.append((p, int(st.st_size), prev, int(st.st_mtime_ns)))
+
+    if model_changed:
+        log(
+            f"[Faces] Model changed to {det_id} for {model_changed:,} photo(s): re-detecting with "
+            "label-preserving face re-link (confirmed tags, anchors and pressure stay on their faces)."
+        )
+
+    # Same size, new mtime: compare fingerprints instead of re-running detection.
+    fp_updates: list[tuple[int, str, int]] = []
+    if verify:
+        hashes = _hash_many([(p, sz) for p, sz, _, _ in verify], io_workers)
+        for (p, _sz, prev, mtime_ns), h in zip(verify, hashes, strict=True):
+            if h is not None and prev.content_hash and h == prev.content_hash:
+                fp_updates.append((prev.photo_id, h, mtime_ns))
+                summary.photos_verified += 1
+                summary.photos_cached += 1
+            else:
+                to_scan.append(p)
+    if backfill:
+        log(f"[Faces] Fingerprinting {len(backfill):,} previously indexed photo(s) (one-time)...")
+        hashes = _hash_many([(p, sz) for p, sz, _ in backfill], io_workers)
+        fp_updates.extend(
+            (prev.photo_id, h, prev.mtime_ns)
+            for (_, _, prev), h in zip(backfill, hashes, strict=True)
+            if h is not None
+        )
+    db.set_photo_fingerprints(fp_updates)
+
+    # Renamed / moved photos: re-key vanished rows onto new paths, keeping photo_id + labels.
+    if missing and new_files:
+        by_hash: dict[str, str] = {}
+        by_kp: dict[tuple[int, int], list[str]] = {}
+        for rel, s in missing.items():
+            if s.content_hash:
+                by_hash.setdefault(s.content_hash, rel)
+            if s.kinderpedia_image_id is not None:
+                by_kp.setdefault((s.kinderpedia_image_id, s.file_size), []).append(rel)
+        new_hashes = _hash_many([(p, sz) for p, sz, _ in new_files], io_workers)
+        still_new: list[tuple[Path, int, int]] = []
+        for (p, sz, mtime_ns), h in zip(new_files, new_hashes, strict=True):
+            prov = resolver.resolve(p)
+            old_rel = by_hash.get(h) if h else None
+            if old_rel is None or old_rel not in missing:
+                old_rel = None
+                if prov.kinderpedia_image_id is not None:
+                    cands = [
+                        r for r in by_kp.get((prov.kinderpedia_image_id, sz), []) if r in missing
+                    ]
+                    same_name = [r for r in cands if missing[r].filename == prov.filename]
+                    pick = same_name or cands
+                    old_rel = pick[0] if pick else None
+            if old_rel is None:
+                still_new.append((p, sz, mtime_ns))
+                continue
+            prev = missing.pop(old_rel)
+            db.rekey_photo(prev.photo_id, prov, mtime_ns=mtime_ns, content_hash=h or "")
+            summary.photos_rekeyed += 1
+            if force or prev.detector_id != det_id or prev.file_size != sz:
+                to_scan.append(p)
+            else:
+                summary.photos_cached += 1
+        new_files = still_new
+        if summary.photos_rekeyed:
+            log(f"[Faces] Re-keyed {summary.photos_rekeyed:,} renamed/moved photo(s) (labels kept).")
+    to_scan.extend(p for p, _, _ in new_files)
+
+    # Photos gone from disk: delete (cascade-safe) unless it looks like an unmounted/partial archive.
+    if missing:
+        n_missing = len(missing)
+        guard_ok = bool(photos) and n_missing <= max(100, int(0.10 * len(states)))
+        do_prune = prune_missing if prune_missing is not None else guard_ok
+        if do_prune and photos:
+            res = db.delete_photos([s.photo_id for s in missing.values()])
+            summary.photos_removed = int(res["photos"])
+            summary.labels_removed_with_photos = int(res["human_labels"])
+            remove_face_thumbs(thumbs_root, list(res["face_ids"]))
+            log(
+                f"[Faces] Removed {summary.photos_removed:,} photo(s) no longer on disk "
+                f"({res['faces']:,} faces, {summary.labels_removed_with_photos:,} human labels)."
+            )
+        else:
+            summary.photos_missing_kept = n_missing
+            log(
+                f"[Faces] Warning: {n_missing:,} indexed photo(s) are missing on disk; kept them "
+                "(looks like a partial/unmounted archive). Re-run with `--prune-missing` to delete."
+            )
+
+    log(
+        f"[Faces] Archive: {len(photos):,} photos ({summary.photos_cached:,} cached, "
+        f"{len(to_scan):,} to scan with {eff_workers} worker(s), model={det_id})"
+    )
+
+    if to_scan:
+        t_start = time.monotonic()
+        pending_rows: list[tuple[PhotoProvenance, int, int, int, int, str, list[DetectedFace]]] = []
+        pending_thumbs: list[list[Image.Image]] = []
+        pending_hashes: list[str] = []
+
+        def _flush_pending() -> None:
+            if not pending_rows:
+                return
+            n_removed = len(report.removed_face_ids)
+            n_moved = len(report.moved_face_ids)
+            saved_ids = db.upsert_scanned_batch(
+                pending_rows, content_hashes=pending_hashes, report=report
+            )
+            remove_face_thumbs(thumbs_root, report.removed_face_ids[n_removed:])
+            remove_face_thumbs(thumbs_root, report.moved_face_ids[n_moved:])
+            for (_, face_ids), thumb_list in zip(saved_ids, pending_thumbs, strict=True):
+                for fid, t_img in zip(face_ids, thumb_list, strict=False):
+                    with contextlib.suppress(OSError):
+                        save_face_thumb_jpeg(thumbs_root, fid, t_img)
+            pending_rows.clear()
+            pending_thumbs.clear()
+            pending_hashes.clear()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=eff_workers) as pool:
+            in_flight: set[concurrent.futures.Future[Any]] = set()
+            max_queue = eff_workers * 4
+            photo_iter = iter(to_scan)
+            done_count = 0
+
+            def _submit_next() -> bool:
+                try:
+                    nxt = next(photo_iter)
+                except StopIteration:
+                    return False
+                in_flight.add(pool.submit(_inspect_single_photo, recognizer, nxt))
+                return True
+
+            for _ in range(min(max_queue, len(to_scan))):
+                _submit_next()
+
+            while in_flight:
+                done_set, in_flight = concurrent.futures.wait(
+                    in_flight,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done_set:
+                    _submit_next()
+                    done_count += 1
+                    try:
+                        p_path, w, h, fsize, mtime_ns, faces, thumbs, c_hash = fut.result()
+                        prov = resolver.resolve(p_path, width=w, height=h)
+                        pending_rows.append((prov, w, h, fsize, mtime_ns, det_id, faces))
+                        pending_thumbs.append(thumbs)
+                        pending_hashes.append(c_hash)
+                        summary.photos_scanned += 1
+                    except Exception as exc:
+                        summary.photos_failed += 1
+                        log(f"[Faces] Warning: skipped unreadable image ({exc})")
+
+                    if len(pending_rows) >= batch_commit_size:
+                        _flush_pending()
+                        if done_count % 5000 < batch_commit_size and done_count >= 5000:
+                            recompute_active_matching(
+                                db,
+                                auto_high_threshold=auto_high_threshold,
+                                candidate_threshold=candidate_threshold,
+                            )
+
+                    if progress is not None and progress.enabled:
+                        elapsed = max(0.001, time.monotonic() - t_start)
+                        rate = done_count / elapsed
+                        rem_s = int((len(to_scan) - done_count) / max(rate, 0.01))
+                        progress.render_line(
+                            f"  [Scan] {done_count:,}/{len(to_scan):,} "
+                            f"({100.0 * done_count / len(to_scan):.1f}%) | "
+                            f"{rate:.1f} img/s | ETA {rem_s // 60}m{rem_s % 60:02d}s"
+                        )
+                    elif done_count % 1000 == 0 or done_count == len(to_scan):
+                        elapsed = max(0.001, time.monotonic() - t_start)
+                        rate = done_count / elapsed
+                        rem_s = int((len(to_scan) - done_count) / max(rate, 0.01))
+                        log(
+                            f"[Faces] Progress: {done_count:,}/{len(to_scan):,} "
+                            f"({100.0 * done_count / len(to_scan):.1f}%) | "
+                            f"{rate:.1f} img/s | ETA {rem_s // 60}m{rem_s % 60:02d}s"
+                        )
+
+            _flush_pending()
+        if progress is not None:
+            progress.close()
+
+    summary.faces_relinked = report.faces_relinked
+    summary.faces_removed = report.faces_removed
+    summary.labels_orphaned = report.labels_orphaned
+    if report.faces_relinked or report.faces_removed:
+        log(
+            f"[Faces] Re-link: {report.faces_relinked:,} face(s) kept their id, "
+            f"{report.faces_new:,} new, {report.faces_removed:,} removed"
+            + (
+                f" — {report.labels_orphaned:,} human label(s) lost their face box "
+                "(kept as photo-level tags; see meta.orphaned_face_labels_total)"
+                if report.labels_orphaned
+                else ""
+            )
+        )
+
+    log("[Faces] Building per-(classroom, year) recurring child clusters...")
+    summary.clusters_created = rebuild_yearly_clusters(db)
+    log("[Faces] Running active-learning multi-anchor matcher (with sibling guard & hard negatives)...")
+    summary.auto_high_matches, summary.candidate_matches = recompute_active_matching(
+        db,
+        auto_high_threshold=auto_high_threshold,
+        candidate_threshold=candidate_threshold,
+    )
+    overview = db.get_archive_overview()
+    summary.faces_total = int(overview["faces_total"])
+    db.export_portable_index(portable_json)

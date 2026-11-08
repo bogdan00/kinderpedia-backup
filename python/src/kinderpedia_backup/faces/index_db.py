@@ -6,6 +6,7 @@ import contextlib
 import csv
 import io
 import json
+import random
 import sqlite3
 import threading
 from datetime import date, datetime, timezone
@@ -18,6 +19,7 @@ from numpy.typing import NDArray
 from ..security import ensure_within_directory, write_json_atomic
 from ..sync.naming import sanitize_name
 from .db.relink import StoredFace, match_faces
+from .db.scan_lock import read_scan_lock
 from .db.schema import apply_migrations, read_schema_version
 from .models import (
     AssignmentSource,
@@ -731,6 +733,10 @@ class FacesIndexDB:
                 )
             row = self._conn.execute("SELECT value FROM meta WHERE key = 'data_version'").fetchone()
         return int(row["value"])
+
+    def get_scan_status(self) -> dict[str, Any] | None:
+        """Live `faces scan` lock info (`pid`, `host`, `started_at`, `heartbeat_at`) or None."""
+        return read_scan_lock(self.db_path.parent)
 
     def get_schema_version(self) -> int:
         with self._lock:
@@ -3070,9 +3076,11 @@ class FacesIndexDB:
         person_id: int,
         *,
         batch_size: int = 24,
-        default_approve_min_sim: float = 0.38,
+        default_approve_min_sim: float = 0.50,
         max_per_album: int = 2,
         mode: str = "impact",
+        audit_per_batch: int | None = None,
+        ambiguous_min_sim: float = 0.38,
     ) -> dict[str, Any]:
         """
         Fetch the next active-learning batch of unconfirmed matches (excluding matches already trusted).
@@ -3080,6 +3088,15 @@ class FacesIndexDB:
           the most OTHER open faces of this child (same-album look-alikes and close look-alikes
           anywhere), weighted by how uncertain each face is.
         - `mode="confident"`: highest-similarity first, diversified across albums.
+
+        Card defaults: `default_approved` is only true at `similarity >= default_approve_min_sim`
+        (0.50 — below that historic batch decisions show ~20 % errors), and `default_decision` is
+        `"approved"` / `"unsure"` (ambiguous band `ambiguous_min_sim..default_approve_min_sim`,
+        opt-in) / `"disproved"`.
+        Audit sampling: when the person has trusted auto rows (`album_cohesion` / `model_trusted`,
+        normally never reviewed), ~2 random ones per 24 cards (`audit_per_batch`, default
+        `round(batch_size / 12)`) are inserted at random positions with `"audit": true`, so drift of
+        the unreviewed channels is observable; the impact-ordered cards keep their relative order.
         """
         fetch_pool = 4000 if mode == "impact" else min(600, max(batch_size * 10, 96))
         with self._lock:
@@ -3102,10 +3119,42 @@ class FacesIndexDB:
             ).fetchone()
             remaining = int(total_row["n"]) if total_row else 0
 
+            n_audit_want = (
+                max(0, int(audit_per_batch))
+                if audit_per_batch is not None
+                else max(0, round(batch_size / 12))
+            )
+            n_audit_want = min(n_audit_want, max(0, batch_size - 1))
+            audit_rows: list[sqlite3.Row] = []
+            if n_audit_want > 0 and int(person_row["cohesion_count"] or 0) > 0:
+                audit_rows = self._conn.execute(
+                    """
+                    WITH pick AS (
+                        SELECT photo_id, face_id, status, source, similarity
+                        FROM assignments
+                        WHERE person_id = ?
+                          AND status = 'auto_high'
+                          AND source IN ('album_cohesion', 'model_trusted')
+                        ORDER BY RANDOM()
+                        LIMIT ?
+                    )
+                    SELECT
+                        tc.photo_id, tc.face_id, tc.status, tc.source, tc.similarity,
+                        p.rel_path, p.archive_child, p.year, p.album_leaf, p.album_title,
+                        p.album_date, p.filename, p.best_live_url, p.face_count,
+                        f.det_score, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left
+                    FROM pick tc
+                    JOIN photos p ON p.photo_id = tc.photo_id
+                    LEFT JOIN faces f ON f.face_id = tc.face_id
+                    """,
+                    (person_id, n_audit_want),
+                ).fetchall()
+            main_size = max(1, batch_size - len(audit_rows))
+
             pool_rows = self._conn.execute(
                 """
                 WITH top_cand AS (
-                    SELECT photo_id, face_id, status, similarity
+                    SELECT photo_id, face_id, status, source, similarity
                     FROM assignments
                     WHERE person_id = ?
                       AND status IN ('auto_high', 'candidate')
@@ -3117,6 +3166,7 @@ class FacesIndexDB:
                     tc.photo_id,
                     tc.face_id,
                     tc.status,
+                    tc.source,
                     tc.similarity,
                     p.rel_path,
                     p.archive_child,
@@ -3144,7 +3194,7 @@ class FacesIndexDB:
         overflow_rows: list[sqlite3.Row] = []
         seen_per_album: dict[tuple[str, str], int] = {}
         if mode == "impact" and pool_rows:
-            rows, impact_by_photo = self._select_impactful_rows(pool_rows, batch_size)
+            rows, impact_by_photo = self._select_impactful_rows(pool_rows, main_size)
             pool_rows = []
         with self._lock:
             # Pass 1: diversify across distinct albums (up to `max_per_album` per album) so confirming
@@ -3152,13 +3202,21 @@ class FacesIndexDB:
             for r_cand in pool_rows:
                 akey = (str(r_cand["archive_child"]), str(r_cand["album_leaf"]))
                 cur_n = seen_per_album.get(akey, 0)
-                if cur_n < max_per_album and len(rows) < batch_size:
+                if cur_n < max_per_album and len(rows) < main_size:
                     rows.append(r_cand)
                     seen_per_album[akey] = cur_n + 1
                 else:
                     overflow_rows.append(r_cand)
-            if len(rows) < batch_size and overflow_rows:
-                rows.extend(overflow_rows[: batch_size - len(rows)])
+            if len(rows) < main_size and overflow_rows:
+                rows.extend(overflow_rows[: main_size - len(rows)])
+            audit_photo_ids: set[int] = set()
+            if audit_rows:
+                rng = random.Random()
+                merged: list[sqlite3.Row] = list(rows)
+                for a_row in audit_rows:
+                    merged.insert(rng.randint(0, len(merged)), a_row)
+                    audit_photo_ids.add(int(a_row["photo_id"]))
+                rows = merged
 
             companions_by_photo: dict[int, list[str]] = {}
             if rows:
@@ -3194,8 +3252,17 @@ class FacesIndexDB:
                     "photo_id": pid_val,
                     "face_id": int(r["face_id"]) if r["face_id"] is not None else None,
                     "status": str(r["status"]),
+                    "source": str(r["source"] or ""),
                     "similarity": round(sim, 4),
                     "default_approved": sim >= default_approve_min_sim,
+                    "default_decision": (
+                        "approved"
+                        if sim >= default_approve_min_sim
+                        else "unsure"
+                        if sim >= ambiguous_min_sim
+                        else "disproved"
+                    ),
+                    "audit": pid_val in audit_photo_ids,
                     "archive_child": str(r["archive_child"]),
                     "year": str(r["year"]),
                     "album_leaf": str(r["album_leaf"]),
@@ -3225,6 +3292,7 @@ class FacesIndexDB:
             "remaining_unreviewed": remaining,
             "album_cohesion_count": int(person_row["cohesion_count"] or 0),
             "batch_count": len(cards),
+            "audit_count": sum(1 for c in cards if c["audit"]),
             "mode": mode,
             "top_peers": top_peers,
             "cards": cards,
