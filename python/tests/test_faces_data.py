@@ -554,6 +554,60 @@ class ClaimPrimitiveTests(unittest.TestCase):
             db.close()
 
 
+class MaterializeTests(_ArchiveCase):
+    def test_fs_pass_runs_without_db_lock_and_prunes_dangling_and_orphan_folders(self) -> None:
+        self.scan(_ScanStub())
+        out = self.backup / "ByChild"
+        with FacesIndexDB(self.db_path) as db:
+            leo = db.ensure_person("Leo")
+            for fn in ("001_leo_maya.jpg", "002_leo.jpg"):
+                ph, fid = self.face_of(db, fn, 0)
+                db.tag_single_face(photo_id=ph, face_id=fid, person_id=leo)
+            import kinderpedia_backup.faces.index_db as idx_mod
+
+            real_link = idx_mod.link_or_copy_photo
+            lock_free: list[bool] = []
+
+            def probing_link(*a: Any, **kw: Any) -> bool:
+                got: list[bool] = []
+
+                def probe() -> None:
+                    ok = db._lock.acquire(timeout=1.0)
+                    if ok:
+                        db._lock.release()
+                    got.append(ok)
+
+                t = threading.Thread(target=probe)
+                t.start()
+                t.join()
+                lock_free.append(bool(got and got[0]))
+                return real_link(*a, **kw)
+
+            idx_mod.link_or_copy_photo = probing_link  # type: ignore[assignment]
+            try:
+                st = db.materialize_flat_folders(backup_dir=self.backup, output_dir=out, link_mode="symlink")
+            finally:
+                idx_mod.link_or_copy_photo = real_link  # type: ignore[assignment]
+            self.assertEqual(st.links_created, 2)
+            self.assertTrue(lock_free and all(lock_free))
+
+            # A dangling symlink inside a live folder is pruned; a renamed person leaves an orphan folder.
+            (out / "Leo" / "stale.jpg").symlink_to(self.backup / "nowhere.jpg")
+            keep = out / "Leo Old" / "own-copy.jpg"
+            keep.parent.mkdir()
+            keep.write_bytes(b"user file")  # a plain copy we did not create: must survive
+            (out / "Leo Old" / "link.jpg").symlink_to(self.album / "002_leo.jpg")
+            db.update_person(leo, display_name="Leo Renamed")
+            st2 = db.materialize_flat_folders(backup_dir=self.backup, output_dir=out, link_mode="symlink")
+            self.assertEqual(st2.links_created, 2)
+            self.assertFalse((out / "Leo").exists())  # orphan folder emptied (symlinks) and removed
+            self.assertTrue(keep.is_file())
+            self.assertFalse((out / "Leo Old" / "link.jpg").is_symlink())
+            self.assertEqual(sorted(p.name for p in (out / "Leo Renamed").iterdir()), [
+                "2025-06-01 Trip_001_leo_maya.jpg", "2025-06-01 Trip_002_leo.jpg"
+            ])
+
+
 class UpsertBatchApiTests(unittest.TestCase):
     def test_upsert_without_hashes_still_works_and_returns_face_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "f.sqlite") as db:

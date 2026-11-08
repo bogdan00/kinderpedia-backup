@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
 import json
@@ -154,6 +155,39 @@ def _pack_person_cluster(
         "pressure": {"boost": boost_n, "penalize": pen_n},
         "faces": face_list,
     }
+
+
+def _prune_orphan_person_folders(out_root: Path, backup_root: Path, live_folders: set[str]) -> int:
+    """
+    Remove links from `ByChild/<folder>` directories that no longer belong to any materialized
+    person (renamed / merged / deleted). Only entries we could have created are removed — symlinks
+    and regular files that are hardlinked elsewhere (`st_nlink > 1`, i.e. the archive still has the
+    photo); plain copies and sub-directories are left alone. Empty folders are removed. Never runs
+    when `out_root` is (or contains) the backup root. Returns the number of entries removed.
+    """
+    if out_root == backup_root or out_root in backup_root.parents:
+        return 0
+    removed = 0
+    for folder in list(out_root.iterdir()):
+        if folder.name.startswith(".") or folder.is_symlink() or not folder.is_dir():
+            continue
+        if folder.name in live_folders:
+            continue
+        for entry in list(folder.iterdir()):
+            try:
+                if entry.is_symlink() or (
+                    not entry.name.startswith(".") and entry.is_file() and entry.stat().st_nlink > 1
+                ):
+                    ensure_within_directory(out_root, entry.parent)
+                    entry.unlink()
+                    removed += 1
+                elif entry.name == ".DS_Store":
+                    entry.unlink()
+            except OSError:
+                continue
+        with contextlib.suppress(OSError):
+            folder.rmdir()
+    return removed
 
 
 class FacesIndexDB:
@@ -3756,10 +3790,16 @@ class FacesIndexDB:
         """
         Populate flat per-person folders `ByChild/<Person>/<YYYY-MM-DD Title>_001_<id>.jpg`
         using zero-space hardlinks (or symlinks/copies), pruning stale links when disproved.
+
+        Rows are read under `_lock`; all filesystem work then runs WITHOUT the DB lock so the UI
+        keeps serving requests (this may copy gigabytes with `link_mode="copy"`). With `prune=True`
+        stale entries (incl. dangling symlinks) are removed from each person folder, and on a full run
+        (no `person_filter`) folders of people that no longer exist (renamed / merged / deleted) are
+        emptied of links we could have created (symlinks, or files that are hardlinked elsewhere) and
+        removed when empty — always strictly inside `output_dir`, never in the backup itself.
         """
         backup_root = backup_dir.resolve()
         out_root = output_dir.resolve()
-        out_root.mkdir(parents=True, exist_ok=True)
 
         s_tuple = (
             ("confirmed", "auto_high", "candidate")
@@ -3767,6 +3807,7 @@ class FacesIndexDB:
             else ("confirmed", "auto_high", "auto_high")
         )
 
+        plan: list[tuple[str, list[tuple[int, str, str, str]]]] = []
         with self._lock:
             if person_filter:
                 people_rows = self._conn.execute(
@@ -3777,16 +3818,7 @@ class FacesIndexDB:
                 people_rows = self._conn.execute(
                     "SELECT person_id, display_name FROM people WHERE role IN ('family', 'classmate')"
                 ).fetchall()
-
-            stats = OrganizeStats(reference_profiles=len(people_rows))
-            matched_photo_ids: set[int] = set()
-
             for p_row in people_rows:
-                pid = int(p_row["person_id"])
-                folder_name = sanitize_name(str(p_row["display_name"]), max_len=60)
-                person_dir = ensure_within_directory(out_root, out_root / folder_name)
-                person_dir.mkdir(parents=True, exist_ok=True)
-
                 rows = self._conn.execute(
                     """
                     SELECT p.photo_id, p.rel_path, p.album_leaf, p.filename
@@ -3795,36 +3827,62 @@ class FacesIndexDB:
                     WHERE a.person_id = ? AND a.status IN (?, ?, ?)
                     ORDER BY p.album_date ASC, p.album_leaf ASC, p.filename ASC
                     """,
-                    (pid, *s_tuple),
+                    (int(p_row["person_id"]), *s_tuple),
                 ).fetchall()
+                plan.append(
+                    (
+                        str(p_row["display_name"]),
+                        [
+                            (int(r["photo_id"]), str(r["rel_path"]), str(r["album_leaf"]), str(r["filename"]))
+                            for r in rows
+                        ],
+                    )
+                )
 
-                expected_filenames: set[str] = set()
-                for r in rows:
-                    src = ensure_within_directory(backup_root, backup_root / str(r["rel_path"]))
-                    if not src.is_file():
+        # ---- filesystem pass (no DB lock held) ----
+        out_root.mkdir(parents=True, exist_ok=True)
+        stats = OrganizeStats(reference_profiles=len(plan))
+        matched_photo_ids: set[int] = set()
+        live_folders: set[str] = set()
+        for display_name, rows_t in plan:
+            folder_name = sanitize_name(display_name, max_len=60)
+            live_folders.add(folder_name)
+            person_dir = ensure_within_directory(out_root, out_root / folder_name)
+            person_dir.mkdir(parents=True, exist_ok=True)
+
+            expected_filenames: set[str] = set()
+            for photo_id, rel_path, album_leaf, filename in rows_t:
+                src = ensure_within_directory(backup_root, backup_root / rel_path)
+                if not src.is_file():
+                    continue
+                matched_photo_ids.add(photo_id)
+                album_prefix = sanitize_name(album_leaf, max_len=80)
+                base_target = f"{album_prefix}_{filename}"
+                target_name = base_target
+                if target_name in expected_filenames:
+                    stem, dot, ext = base_target.rpartition(".")
+                    target_name = f"{stem}_p{photo_id}{dot}{ext}" if dot else f"{base_target}_p{photo_id}"
+                expected_filenames.add(target_name)
+
+                dst = ensure_within_directory(person_dir, person_dir / target_name)
+                if dst.is_symlink() and not dst.exists():
+                    dst.unlink()  # dangling symlink (photo moved): recreate below
+                if link_or_copy_photo(src, dst, root_dir=out_root, mode=link_mode):
+                    stats.links_created += 1
+                else:
+                    stats.links_skipped_existing += 1
+
+            if prune and person_dir.is_dir():
+                for existing_entry in list(person_dir.iterdir()):
+                    if existing_entry.name.startswith("."):
                         continue
-                    matched_photo_ids.add(int(r["photo_id"]))
-                    album_prefix = sanitize_name(str(r["album_leaf"]), max_len=80)
-                    base_target = f"{album_prefix}_{r['filename']}"
-                    target_name = base_target
-                    if target_name in expected_filenames:
-                        stem, dot, ext = base_target.rpartition(".")
-                        target_name = f"{stem}_p{r['photo_id']}{dot}{ext}" if dot else f"{base_target}_p{r['photo_id']}"
-                    expected_filenames.add(target_name)
+                    is_link = existing_entry.is_symlink()
+                    if (is_link or existing_entry.is_file()) and existing_entry.name not in expected_filenames:
+                        existing_entry.unlink()
+                        stats.links_pruned += 1
 
-                    dst = ensure_within_directory(person_dir, person_dir / target_name)
-                    if link_or_copy_photo(src, dst, root_dir=out_root, mode=link_mode):
-                        stats.links_created += 1
-                    else:
-                        stats.links_skipped_existing += 1
+        if prune and not person_filter:
+            stats.links_pruned += _prune_orphan_person_folders(out_root, backup_root, live_folders)
 
-                if prune and person_dir.is_dir():
-                    for existing_entry in list(person_dir.iterdir()):
-                        if existing_entry.name.startswith("."):
-                            continue
-                        if existing_entry.is_file() and existing_entry.name not in expected_filenames:
-                            existing_entry.unlink()
-                            stats.links_pruned += 1
-
-            stats.photos_matched = len(matched_photo_ids)
-            return stats
+        stats.photos_matched = len(matched_photo_ids)
+        return stats
