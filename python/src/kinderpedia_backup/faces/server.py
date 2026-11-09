@@ -1184,9 +1184,9 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/albums":
-            child = (qs.get("child") or [None])[0]
-            yr = (qs.get("year") or [None])[0]
-            query = (qs.get("q") or [None])[0]
+            child = (qs.get("child") or [""])[0].strip() or None
+            yr = (qs.get("year") or [""])[0].strip() or None
+            query = (qs.get("q") or [""])[0].strip() or None
             lim = int((qs.get("limit") or ["48"])[0])
             off = int((qs.get("offset") or ["0"])[0])
             self._send_json(
@@ -1201,8 +1201,8 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/albums/detail":
-            key = (qs.get("key") or [None])[0]
-            ph_str = (qs.get("photo_id") or [None])[0]
+            key = (qs.get("key") or [""])[0].strip() or None
+            ph_str = (qs.get("photo_id") or [""])[0].strip()
             ph_id = int(ph_str) if ph_str and ph_str.isdigit() else None
             self._send_json(self.ctx.db.get_album_detail(album_key=key, photo_id=ph_id))
             return
@@ -1578,11 +1578,11 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid album_key."}, status=HTTPStatus.BAD_REQUEST)
                 return
             pid_raw = body.get("person_id")
-            pid = int(pid_raw) if pid_raw is not None and str(pid_raw).isdigit() else None
+            target_pid: int | None = int(pid_raw) if pid_raw is not None and str(pid_raw).isdigit() else None
             res = self.ctx.db.approve_album_matches(
                 archive_child=parts[0],
                 album_leaf=parts[1],
-                person_id=pid,
+                person_id=target_pid,
             )
             ov = self.ctx.db.get_archive_overview()
             self.ctx.schedule_rematch()
