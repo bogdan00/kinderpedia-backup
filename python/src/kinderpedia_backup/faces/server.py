@@ -29,6 +29,33 @@ from .scanner import ensure_face_thumb_on_disk, face_thumb_path
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 
+# --- Static assets (`GET /assets/**`) -------------------------------------------------------------
+#: Servable asset types; anything else under the web dir (index.html, tests/, ...) is not an asset.
+_WEB_ASSET_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+
+
+def _resolve_web_asset(rel: str) -> Path | None:
+    """Map `/assets/<rel>` to a file inside the web dir, or None (-> 404).
+
+    Rejects absolute paths, `..`/empty/hidden segments, backslashes, the JS unit tests, unknown types,
+    and anything whose resolved path (after following symlinks) escapes the web dir."""
+    if not rel or "\\" in rel or "\x00" in rel or rel.startswith("/"):
+        return None
+    parts = rel.split("/")
+    if any(not p or p in (".", "..") or p.startswith(".") for p in parts) or parts[0] == "tests":
+        return None
+    root = _WEB_DIR.resolve()
+    try:
+        target = (root / rel).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not target.is_relative_to(root) or not target.is_file() or target.suffix not in _WEB_ASSET_TYPES:
+        return None
+    return target
+
+
+# --------------------------------------------------------------------------------------------------
+
 #: Faces shipped per child-cluster card in `GET /api/people/<pid>/clusters`; the rest is fetched on demand.
 CHILD_CLUSTER_FACES_PREVIEW = 12
 #: Distinct (person, threshold, min_size, data version) child-cluster results kept in memory.
@@ -931,17 +958,15 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(injected.encode("utf-8"), content_type="text/html; charset=utf-8")
             return
 
-        if path == "/assets/styles.css":
+        if path.startswith("/assets/"):
+            asset = _resolve_web_asset(urllib.parse.unquote(path[len("/assets/") :]))
+            if asset is None:
+                self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                return
             self._send_bytes(
-                (_WEB_DIR / "styles.css").read_bytes(),
-                content_type="text/css; charset=utf-8",
-            )
-            return
-
-        if path == "/assets/app.js":
-            self._send_bytes(
-                (_WEB_DIR / "app.js").read_bytes(),
-                content_type="application/javascript; charset=utf-8",
+                asset.read_bytes(),
+                content_type=_WEB_ASSET_TYPES[asset.suffix],
+                cache_control="no-store",
             )
             return
 

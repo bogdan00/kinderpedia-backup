@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import os
@@ -352,6 +353,61 @@ class FacesServerTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    # ------------------------------------------------------------------ static assets
+    def _raw_get(self, path: str) -> tuple[int, dict[str, str], bytes]:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path)  # raw: no client-side dot-segment normalisation
+            resp = conn.getresponse()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+        finally:
+            conn.close()
+
+    def test_static_assets_nested_mime_and_confinement(self) -> None:
+        for path in ("/assets/app.js", "/assets/views/batch.js", "/assets/util/dom.js"):
+            status, hdrs, body = self._raw_get(path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(hdrs["content-type"], "text/javascript; charset=utf-8", path)
+            self.assertEqual(hdrs["cache-control"], "no-store", path)
+            self.assertTrue(body)
+        status, hdrs, _ = self._raw_get("/assets/styles.css")
+        self.assertEqual((status, hdrs["content-type"]), (200, "text/css; charset=utf-8"))
+        status, _, body = self._raw_get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'<script type="module" src="/assets/app.js"></script>', body)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            web = Path(tmp) / "web"
+            (web / "views").mkdir(parents=True)
+            (web / "views" / "ok.js").write_text("export {};", encoding="utf-8")
+            (web / "tests").mkdir()
+            (web / "tests" / "x.js").write_text("//", encoding="utf-8")
+            (web / "index.html").write_text("<html></html>", encoding="utf-8")
+            (Path(tmp) / "secret.js").write_text("SECRET", encoding="utf-8")
+            with contextlib.suppress(OSError):  # symlinks need extra privileges on Windows
+                (web / "escape.js").symlink_to(Path(tmp) / "secret.js")
+                (web / "linkdir").symlink_to(Path(tmp), target_is_directory=True)
+            with mock.patch("kinderpedia_backup.faces.server._WEB_DIR", web):
+                self.assertEqual(self._raw_get("/assets/views/ok.js")[0], 200)
+                for bad in (
+                    "/assets/../secret.js",
+                    "/assets/views/../../secret.js",
+                    "/assets/%2e%2e/secret.js",
+                    "/assets/views/%2e%2e%2f%2e%2e%2fsecret.js",
+                    "/assets//etc/passwd",
+                    "/assets/%2Fetc%2Fpasswd",
+                    "/assets/escape.js",
+                    "/assets/linkdir/secret.js",
+                    "/assets/tests/x.js",
+                    "/assets/index.html",
+                    "/assets/views/missing.js",
+                    "/assets/views",
+                    "/assets/",
+                ):
+                    status, _, body = self._raw_get(bad)
+                    self.assertEqual(status, 404, bad)
+                    self.assertNotIn(b"SECRET", body)
+
     def test_external_changes_deferred_while_scan_lock_held(self) -> None:
         self.assertTrue(self.ctx.wait_for_rematch(timeout=15))
         self.db.load_all_faces_matrix()
@@ -479,7 +535,7 @@ function cleanup() {
     rmSync(profile, { recursive: true, force: true });
   } catch (_e) {}
 }
-const hardTimer = setTimeout(() => fail("timeout"), 75000);
+const hardTimer = setTimeout(() => fail("timeout"), 150000);
 
 const browserWs = await new Promise((resolve, reject) => {
   let buf = "";
@@ -526,7 +582,8 @@ async function waitFor(expr, label, timeoutMs = 20000) {
     if (await evaluate(expr)) return;
     await new Promise((r) => setTimeout(r, 100));
   }
-  fail(`waiting for ${label}: ${expr}`);
+  const toast = await evaluate(`(document.getElementById("toast") || {}).textContent || ""`);
+  fail(`waiting for ${label}: ${expr} (last toast: ${toast})`);
 }
 
 await send("Runtime.enable");
@@ -558,6 +615,79 @@ if (!(await evaluate(`/Submit Batch/.test(document.getElementById("btnSubmitBatc
   fail("submit label not updated");
 }
 
+// Page helpers: record every fetch (url/method/JSON body) and read card / gallery state.
+await evaluate(String.raw`(() => {
+  window.__kpCalls = [];
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    let body = null;
+    try {
+      body = init && init.body ? JSON.parse(init.body) : null;
+    } catch (_e) {}
+    window.__kpCalls.push({ url: String(input), method: (init && init.method) || "GET", body });
+    return origFetch.apply(this, arguments);
+  };
+  window.__kpLastCall = (urlPart, method) =>
+    window.__kpCalls.filter((c) => c.url.includes(urlPart) && c.method === method).slice(-1)[0] || null;
+  window.__kpToasts = [];
+  const toastEl = document.getElementById("toast");
+  new MutationObserver(() => window.__kpToasts.push(toastEl.textContent || "")).observe(toastEl, {
+    childList: true,
+    characterData: true,
+    subtree: true,
+  });
+  // Toasts since mark i (background re-match toasts may replace ours at any time, so search the log).
+  window.__kpToastSince = (i, re) => window.__kpToasts.slice(i).find((t) => re.test(t)) || "";
+  window.__kpIdle = () => document.getElementById("topProgressBar").hidden;
+  window.__kpCard = (idx) => document.querySelector('#batchGrid .face-card[data-idx="' + idx + '"]');
+  window.__kpModalOpen = () =>
+    !document.getElementById("photoModal").hidden && !!document.querySelector("#modalFacesList .modal-face-row");
+  window.__kpGal = () => {
+    const span = document.querySelector("#galleryPagination span");
+    const m = span && span.textContent.match(/(\d+)\D+(\d+) of (\d+)/);
+    return m ? { first: Number(m[1]), last: Number(m[2]), total: Number(m[3]) } : null;
+  };
+  return true;
+})()`);
+
+// 2b) Reassign from the batch grid -> picker -> POST /api/faces/tag; the card flips to "↪ Theo ✓" in place.
+const lastIdx = nCards - 1;
+let toastMark = await evaluate(`window.__kpToasts.length`);
+await evaluate(`document.querySelector('#batchGrid .btn-card-reassign[data-idx="${lastIdx}"]').click(), true`);
+await waitFor(`!document.getElementById("reassignModal").hidden && !!document.querySelector('#reassignChips [data-name="Theo"]')`, "batch reassign picker");
+await evaluate(`document.querySelector('#reassignChips [data-name="Theo"]').click(), true`);
+await waitFor(`window.__kpCard(${lastIdx}).classList.contains("state-reassigned") && /Theo ✓/.test(window.__kpCard(${lastIdx}).textContent)`, "batch card reassigned");
+await waitFor(`document.getElementById("reassignModal").hidden`, "reassign picker closed");
+const batchReassign = await evaluate(`window.__kpLastCall("/api/faces/tag", "POST")`);
+const batchReassignToast = await evaluate(`window.__kpToastSince(${toastMark}, /^Reassigned to Theo/)`);
+if (!batchReassign || !/^Reassigned to Theo/.test(batchReassignToast)) fail(`batch reassign: ${JSON.stringify(batchReassign)} / ${batchReassignToast}`);
+
+// 2c) Lightbox untag / tag of a batch card's face keeps the grid card AND the lightbox strip in sync.
+if (nCards > 2) {
+  const fid1 = await evaluate(`Number(document.querySelector('#batchGrid .btn-card-zoom[data-idx="1"]').dataset.face)`);
+  await evaluate(`document.querySelector('#batchGrid .btn-card-zoom[data-idx="1"]').click(), true`);
+  await waitFor(`window.__kpModalOpen() && !!document.querySelector('#modalFacesList .modal-face-row[data-fid="${fid1}"] .btn-modal-untag')`, "batch lightbox");
+  toastMark = await evaluate(`window.__kpToasts.length`);
+  await evaluate(`document.querySelector('#modalFacesList .modal-face-row[data-fid="${fid1}"] .btn-modal-untag').click(), true`);
+  await waitFor(
+    `window.__kpCard(1).classList.contains("state-disproved") && document.querySelector('#modalClusterThumbs [data-cidx="1"]').classList.contains("state-disproved")`,
+    "untag synced to batch card + strip"
+  );
+  await waitFor(`!!window.__kpToastSince(${toastMark}, /Removed tag/)`, "untag toast");
+  await evaluate(`(() => {
+    const row = document.querySelector('#modalFacesList .modal-face-row[data-fid="${fid1}"]');
+    row.querySelector(".modal-face-input").value = "Leo";
+    row.querySelector('button[type="submit"]').click();
+    return true;
+  })()`);
+  await waitFor(
+    `window.__kpCard(1).classList.contains("state-approved") && document.querySelector('#modalClusterThumbs [data-cidx="1"]').classList.contains("state-approved")`,
+    "tag synced to batch card + strip"
+  );
+  await evaluate(`document.getElementById("btnCloseModal").click(), true`);
+  await waitFor(`document.getElementById("photoModal").hidden`, "lightbox closed");
+}
+
 // 3) Submit -> toast + next batch (or the empty state) without JS errors.
 await evaluate(`document.getElementById("btnSubmitBatch").click(), true`);
 await waitFor(`/Saved:/.test(document.getElementById("toast").textContent || "")`, "submit toast");
@@ -584,22 +714,118 @@ if (hasToggle) {
   );
 }
 
+// 6) Gallery ("Human Confirmed Only" so background re-matches never reshuffle the page under us).
+await evaluate(`document.querySelector('.tab-btn[data-mode="gallery"]').click(), true`);
+await waitFor(`document.querySelectorAll("#galleryGrid .face-card").length > 0`, "gallery cards");
+await evaluate(`(() => {
+  const sel = document.getElementById("galleryStatusFilter");
+  sel.value = "confirmed";
+  sel.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+})()`);
+await waitFor(
+  `window.__kpIdle() && /status=confirmed/.test((window.__kpLastCall("/api/gallery", "GET") || {}).url || "") && window.__kpGal() && window.__kpGal().total > 96 && window.__kpGal().first === 1`,
+  "confirmed gallery, 2+ pages"
+);
+let gal = await evaluate(`window.__kpGal()`);
+
+// 6a) Reassign from the gallery goes through the same API call/payload and UI path as from the batch grid.
+const galFace = await evaluate(`Number(document.querySelector("#galleryGrid .face-card").dataset.face)`);
+const galPhoto = await evaluate(`Number(document.querySelector("#galleryGrid .face-card").dataset.photo)`);
+toastMark = await evaluate(`window.__kpToasts.length`);
+await evaluate(`document.querySelector("#galleryGrid .btn-gal-reassign").click(), true`);
+await waitFor(`!document.getElementById("reassignModal").hidden && !!document.querySelector('#reassignChips [data-name="Theo"]')`, "gallery reassign picker");
+await evaluate(`document.querySelector('#reassignChips [data-name="Theo"]').click(), true`);
+await waitFor(`window.__kpGal() && window.__kpGal().total === ${gal.total - 1}`, "gallery reloaded after reassign");
+const galReassign = await evaluate(`window.__kpLastCall("/api/faces/tag", "POST")`);
+const galReassignToast = await evaluate(`window.__kpToastSince(${toastMark}, /^Reassigned to Theo/)`);
+const shape = (c) => ({ url: c.url, method: c.method, keys: Object.keys(c.body).sort(), person_id: c.body.person_id, replace_person_id: c.body.replace_person_id, status: c.body.status });
+if (JSON.stringify(shape(galReassign)) !== JSON.stringify(shape(batchReassign))) {
+  fail(`batch vs gallery reassign differ: ${JSON.stringify(batchReassign)} vs ${JSON.stringify(galReassign)}`);
+}
+if (galReassign.body.face_id !== galFace || galReassign.body.photo_id !== galPhoto) fail(`gallery reassign targeted the wrong face: ${JSON.stringify(galReassign)}`);
+if (galReassignToast !== batchReassignToast) fail(`reassign toasts differ: ${batchReassignToast} vs ${galReassignToast}`);
+gal = await evaluate(`window.__kpGal()`);
+
+// 6b) Lightbox untag from the gallery -> closing the lightbox refreshes the gallery (item gone, total - 1).
+const galFace2 = await evaluate(`Number(document.querySelector("#galleryGrid .face-card").dataset.face)`);
+await evaluate(`document.querySelector("#galleryGrid .face-card").click(), true`);
+await waitFor(`window.__kpModalOpen() && !!document.querySelector('#modalFacesList .modal-face-row[data-fid="${galFace2}"] .btn-modal-untag')`, "gallery lightbox");
+toastMark = await evaluate(`window.__kpToasts.length`);
+await evaluate(`document.querySelector('#modalFacesList .modal-face-row[data-fid="${galFace2}"] .btn-modal-untag').click(), true`);
+await waitFor(`!!window.__kpToastSince(${toastMark}, /Removed tag/)`, "gallery untag toast");
+await evaluate(`document.getElementById("btnCloseModal").click(), true`);
+await waitFor(
+  `document.getElementById("photoModal").hidden && window.__kpGal() && window.__kpGal().total === ${gal.total - 1} && !document.querySelector('#galleryGrid .face-card[data-face="${galFace2}"]')`,
+  "gallery refreshed after lightbox untag"
+);
+gal = await evaluate(`window.__kpGal()`);
+if (gal.total <= 96) fail(`need a 2nd gallery page for the clamp check, total=${gal.total}`);
+
+// 6c) Offset clamp: empty the last page via "✗ remove" -> the gallery falls back to the previous page.
+await evaluate(`document.querySelector('#galleryPagination [data-gal-page="next"]').click(), true`);
+await waitFor(`window.__kpGal() && window.__kpGal().first === 97`, "gallery page 2");
+for (let guard = 0; guard < 10; guard++) {
+  await waitFor(`window.__kpIdle()`, "gallery idle");
+  const before = await evaluate(`window.__kpGal()`);
+  if (before.first !== 97) break;
+  await evaluate(`document.querySelector("#galleryGrid .btn-gal-remove").click(), true`);
+  await waitFor(`(() => { const g = window.__kpGal(); return g && g.total === ${before.total - 1}; })()`, "gallery removal");
+}
+await waitFor(
+  `(() => { const g = window.__kpGal(); return g && g.first === 1 && g.last === g.total && document.querySelectorAll("#galleryGrid .face-card").length === g.total; })()`,
+  "gallery offset clamped to the last non-empty page"
+);
+if (await evaluate(`!!document.querySelector("#galleryGrid .empty-state")`)) fail("gallery dead-ended on an empty page");
+
+// 7) Other surfaces: lightbox keyboard (→ / T / Esc), rename dialog, classes matrix, unnamed clusters.
+await evaluate(`document.querySelector("#galleryGrid .face-card").click(), true`);
+await waitFor(`window.__kpModalOpen() && /^Gallery Photo 1 of/.test(document.getElementById("modalClusterPos").textContent)`, "gallery lightbox 1");
+const key = (k) => evaluate(`window.dispatchEvent(new KeyboardEvent("keydown", { key: "${k}", bubbles: true })), true`);
+await key("ArrowRight");
+await waitFor(`/^Gallery Photo 2 of/.test(document.getElementById("modalClusterPos").textContent) && window.__kpIdle()`, "lightbox → next");
+await key("t");
+await waitFor(`document.getElementById("photoStage").classList.contains("is-drawing") && !document.getElementById("photoDrawBanner").hidden`, "draw mode on");
+await key("Escape");
+await waitFor(`!document.getElementById("photoStage").classList.contains("is-drawing")`, "draw mode off");
+await key("Escape");
+await waitFor(`document.getElementById("photoModal").hidden`, "lightbox closed by Esc");
+await evaluate(`document.querySelector("#rosterList .roster-edit-btn").click(), true`);
+await waitFor(`!document.getElementById("renamePersonModal").hidden && document.getElementById("renamePersonInput").value.length > 0`, "rename dialog");
+await key("Escape");
+await waitFor(`document.getElementById("renamePersonModal").hidden`, "rename dialog closed");
+await evaluate(`document.getElementById("btnOpenClasses").click(), true`);
+await waitFor(`!document.getElementById("classesModal").hidden && !/Loading/.test(document.getElementById("classesMatrixWrap").textContent)`, "classes dialog");
+await evaluate(`document.getElementById("btnCloseClasses").click(), true`);
+await waitFor(`document.getElementById("classesModal").hidden`, "classes dialog closed");
+await evaluate(`document.getElementById("btnDiscoverClusters").click(), true`);
+await waitFor(`!document.getElementById("viewClusters").hidden && !!document.querySelector("#clustersGrid .cluster-card, #clustersGrid .empty-state")`, "unnamed clusters view");
+
 if (exceptions.length) fail(`uncaught page exceptions: ${JSON.stringify(exceptions.slice(0, 3))}`);
 clearTimeout(hardTimer);
-console.log(`SMOKE OK (cards=${nCards}, expanded=${hasToggle})`);
+console.log(`SMOKE OK (cards=${nCards}, expanded=${hasToggle}, gallery=${JSON.stringify(gal)})`);
 ws.close();
 cleanup();
 process.exit(0);
 '''
 
 
-@unittest.skipUnless(
-    _find_chrome() and shutil.which("node") and not os.environ.get("KP_SKIP_BROWSER_TESTS"),
-    "needs a local Chrome/Chromium + node (set KP_SKIP_BROWSER_TESTS=1 to skip)",
-)
 class FacesUiBrowserSmokeTests(unittest.TestCase):
-    """Drive the real `app.js` in headless Chrome: batch -> card toggle in place -> submit -> next batch,
-    audit badge, recluster job completion via SSE, child-cluster "Show all" expansion."""
+    """Drive the real ES-module UI in headless Chrome: batch -> card toggle in place -> reassign -> lightbox
+    untag/tag synced to the card + strip -> submit -> next batch, audit badge, recluster job completion via
+    SSE, child-cluster "Show all" expansion, gallery reassign (same API payload/UI as from the batch),
+    lightbox untag refreshing the gallery, and the gallery offset clamp after emptying the last page.
+
+    Skips when Chrome/node are missing (or `KP_SKIP_BROWSER_TESTS=1`), unless `KP_REQUIRE_BROWSER_TESTS=1`
+    (set in CI), which turns a missing browser/node into a failure."""
+
+    def setUp(self) -> None:
+        missing = [name for name, ok in (("Chrome/Chromium", _find_chrome()), ("node", shutil.which("node"))) if not ok]
+        if os.environ.get("KP_REQUIRE_BROWSER_TESTS"):
+            if missing:
+                self.fail(f"KP_REQUIRE_BROWSER_TESTS=1 but {', '.join(missing)} not found")
+        elif missing or os.environ.get("KP_SKIP_BROWSER_TESTS"):
+            self.skipTest("needs a local Chrome/Chromium + node (set KP_SKIP_BROWSER_TESTS=1 to skip)")
 
     def test_ui_smoke_in_headless_chrome(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -608,7 +834,12 @@ class FacesUiBrowserSmokeTests(unittest.TestCase):
             script.write_text(_JS_SMOKE, encoding="utf-8")
             db = FacesIndexDB(backup_dir / "Metadata" / "faces_index.sqlite")
             try:
-                _seed(db)
+                seed = _seed(db, n_tight=110)
+                db.ensure_person("Theo", role="classmate")  # reassign target
+                # 100 extra confirmed faces: the confirmed gallery spans 2 pages (96 per page).
+                for photo_id, face_ids in seed["saved"][1:101]:
+                    db.tag_single_face(photo_id=photo_id, face_id=face_ids[0], person_id=seed["leo"])
+                recompute_active_matching(db)
                 orig_batch = db.get_batch_proposal
 
                 def batch_with_audit(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -639,7 +870,7 @@ class FacesUiBrowserSmokeTests(unittest.TestCase):
                             ],
                             capture_output=True,
                             text=True,
-                            timeout=100,
+                            timeout=180,
                         )
                     self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-4000:]}")
                     self.assertIn("SMOKE OK", proc.stdout)
