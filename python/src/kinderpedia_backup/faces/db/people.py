@@ -625,6 +625,7 @@ class PeopleMixin(DBCore):
                     p.archive_hint,
                     p.cover_face_id,
                     p.birth_date,
+                    p.gender,
                     COALESCE(c.confirmed_count, 0) AS confirmed_count,
                     COALESCE(c.auto_high_count, 0) AS auto_high_count,
                     COALESCE(c.album_cohesion_count, 0) AS album_cohesion_count,
@@ -692,7 +693,20 @@ class PeopleMixin(DBCore):
                         "unsure_count": int(r["unsure_count"] or 0),
                         "rejected_count": int(r["rejected_count"] or 0),
                         "birth_date": str(r["birth_date"] or ""),
+                        "gender": str(r["gender"] or "unknown"),
                         "class_ids": class_ids_by_pid.get(pid, []),
                     }
                 )
             return result
+
+    def set_person_gender(self, person_id: int, gender: str) -> None:
+        """Set gender tag ('girl', 'boy', 'adult_female', 'adult_male', 'unknown') for a person."""
+        clean = gender.lower().strip()
+        if clean not in ("girl", "boy", "adult_female", "adult_male", "unknown"):
+            clean = "unknown"
+        with self._lock:
+            self._conn.execute(
+                "UPDATE people SET gender = ? WHERE person_id = ?",
+                (clean, person_id),
+            )
+            self._conn.commit()

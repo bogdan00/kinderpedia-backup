@@ -188,6 +188,34 @@ export function renderAlbumDetail() {
     approveBtn.textContent = `✓ Approve ${plural(detail.auto_count, "Auto-Match")}`;
   }
 
+  // Appearance / clothing cards
+  const appWrap = el("albumAppearancesBar");
+  if (appWrap) {
+    const apps = detail.appearances || [];
+    appWrap.hidden = apps.length === 0;
+    if (apps.length > 0) {
+      setHtml(
+        appWrap,
+        html`
+          <div class="album-appearances-list">
+            ${apps.map(
+              (a) => html`
+                <div class="album-outfit-chip" title="Verified clothing signature for ${a.person_name} in this album">
+                  <span class="outfit-icon">👕</span>
+                  <div class="outfit-info">
+                    <strong>${a.person_name} (${a.apparent_gender}):</strong>
+                    <span>${a.clothing_summary}</span>
+                    ${a.distinctive_features ? html`<small>· ${a.distinctive_features}</small>` : ""}
+                  </div>
+                </div>
+              `
+            )}
+          </div>
+        `
+      );
+    }
+  }
+
   // Filter chips by person
   const personChipsWrap = el("albumPersonFilterBar");
   if (personChipsWrap) {
@@ -403,6 +431,42 @@ export function bindAlbumsEvents() {
       index: Number.isFinite(pIdx) ? pIdx : 0,
     };
     openPhotoModal(photoId, faceId, true);
+  });
+
+  // Run VLM clothing and gender check on current album
+  on("btnVlmAnalyzeAlbum", "click", (ev, btn) => {
+    const detail = state.currentAlbumDetail;
+    if (!detail || !detail.album_key) return;
+
+    runBusy(
+      btn,
+      async () => {
+        const res = await post("/api/vlm/analyze-album", { album_key: detail.album_key });
+        showToast(`✨ VLM check running in background for "${detail.album_title}"…`);
+        if (res && res.job_id) {
+          // Poll briefly or let SSE job_complete update
+          await api(`/api/jobs/${res.job_id}`);
+        }
+        const updated = await api(`/api/albums/detail?key=${encodeURIComponent(detail.album_key)}`);
+        state.currentAlbumDetail = updated;
+        renderAlbumDetail();
+        showToast(`✓ VLM analysis complete for "${detail.album_title}"!`);
+      },
+      { busyText: "Checking VLM…", context: "Run VLM Album Analysis" }
+    );
+  });
+
+  // Run Batch VLM assistant across albums with candidates
+  on("btnBatchVlmAssistant", "click", (ev, btn) => {
+    runBusy(
+      btn,
+      async () => {
+        const child = state.albumFilters.child || "";
+        await post("/api/vlm/batch-analyze", { archive_child: child, limit: 30 });
+        showToast("✨ Batch VLM assistant started in background! Check top progress bar.");
+      },
+      { busyText: "Starting…", context: "Start Batch VLM Assistant" }
+    );
   });
 
   // Approve all auto-matches in current album

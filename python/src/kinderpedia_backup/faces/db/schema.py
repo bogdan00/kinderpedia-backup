@@ -66,6 +66,7 @@ BASE_TABLES: tuple[str, ...] = (
         display_name TEXT UNIQUE NOT NULL COLLATE NOCASE,
         role TEXT NOT NULL DEFAULT 'classmate',
         archive_hint TEXT NOT NULL DEFAULT '',
+        gender TEXT NOT NULL DEFAULT 'unknown',
         cover_face_id INTEGER,
         created_at TEXT NOT NULL
     )
@@ -160,6 +161,24 @@ BASE_TABLES: tuple[str, ...] = (
         PRIMARY KEY (class_id, person_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS album_appearances (
+        archive_child TEXT NOT NULL,
+        album_leaf TEXT NOT NULL,
+        person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
+        sample_photo_id INTEGER NOT NULL,
+        sample_face_id INTEGER,
+        clothing_summary TEXT NOT NULL DEFAULT '',
+        top_color TEXT NOT NULL DEFAULT '',
+        bottom_color TEXT NOT NULL DEFAULT '',
+        distinctive_features TEXT NOT NULL DEFAULT '',
+        apparent_gender TEXT NOT NULL DEFAULT 'unknown',
+        verified_faces_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (archive_child, album_leaf, person_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_album_appearances_album ON album_appearances(archive_child, album_leaf)",
     "CREATE INDEX IF NOT EXISTS idx_class_members_person ON class_members(person_id)",
     """
     CREATE TABLE IF NOT EXISTS person_face_pressure (
@@ -442,6 +461,35 @@ def _m7_album_index(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m8_vlm_clothing_and_gender(conn: sqlite3.Connection) -> None:
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(people)").fetchall()]
+    if "gender" not in cols:
+        conn.execute("ALTER TABLE people ADD COLUMN gender TEXT NOT NULL DEFAULT 'unknown'")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS album_appearances (
+            archive_child TEXT NOT NULL,
+            album_leaf TEXT NOT NULL,
+            person_id INTEGER NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
+            sample_photo_id INTEGER NOT NULL,
+            sample_face_id INTEGER,
+            clothing_summary TEXT NOT NULL DEFAULT '',
+            top_color TEXT NOT NULL DEFAULT '',
+            bottom_color TEXT NOT NULL DEFAULT '',
+            distinctive_features TEXT NOT NULL DEFAULT '',
+            apparent_gender TEXT NOT NULL DEFAULT 'unknown',
+            verified_faces_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (archive_child, album_leaf, person_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_album_appearances_album ON album_appearances(archive_child, album_leaf)"
+    )
+
+
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -452,6 +500,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (5, "enum_validation_triggers", _m5_enum_validation),
     (6, "label_keeps", _m6_label_keeps),
     (7, "album_index", _m7_album_index),
+    (8, "vlm_clothing_and_gender", _m8_vlm_clothing_and_gender),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

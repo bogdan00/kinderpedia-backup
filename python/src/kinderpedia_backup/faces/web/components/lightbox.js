@@ -147,6 +147,7 @@ function sideFaceHtml(f, selP) {
         <input type="text" class="modal-face-input" data-fid="${f.face_id}" list="knownPeopleDatalist" placeholder="Name this child…" value="${f.person_name || ""}" />
         <div class="modal-face-btn-row">
           <button type="submit" class="btn btn-tonal btn-sm">Save Tag ✓</button>
+          <button type="button" class="btn btn-ghost btn-sm btn-modal-vlm-inspect" data-fid="${f.face_id}" title="Ask VLM to inspect this face and its outfit">✨ VLM</button>
           ${(hasTag || f.is_manual) &&
           html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Remove Tag</button>`}
           ${unsure &&
@@ -298,6 +299,31 @@ export function bindLightbox() {
     });
   });
   delegate(list, "click", ".btn-modal-untag", (_ev, btn) => untagFromRow(btn, Number(btn.getAttribute("data-fid"))));
+  delegate(list, "click", ".btn-modal-vlm-inspect", async (_ev, btn) => {
+    const fid = Number(btn.getAttribute("data-fid"));
+    const face = modalFace(fid);
+    const photo = state.modalPhoto;
+    if (!photo || !face) return;
+    runBusy(
+      btn,
+      async () => {
+        const box = [face.bbox_left, face.bbox_top, face.bbox_right, face.bbox_bottom];
+        const res = await post("/api/vlm/inspect-face", {
+          photo_id: photo.photo_id,
+          face_id: fid,
+          box,
+          person_name: face.person_name || "",
+        });
+        if (res && res.signature) {
+          const s = res.signature;
+          showToast(`✨ VLM: ${s.apparent_gender} wearing ${s.clothing_summary}`);
+        } else {
+          showToast("✨ VLM: could not extract clothing signature.");
+        }
+      },
+      { busyText: "…", context: "Inspect Face with VLM" }
+    );
+  });
   delegate(list, "click", ".btn-modal-unsure", (_ev, btn) => {
     const personId = Number(btn.getAttribute("data-pid"));
     if (!personId) return;

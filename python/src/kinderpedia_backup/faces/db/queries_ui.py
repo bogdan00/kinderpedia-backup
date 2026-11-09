@@ -1325,6 +1325,7 @@ class QueriesUIMixin(ClustersMixin):
             "candidate_count": candidate_count,
             "unassigned_count": unassigned_count,
             "people": sorted_people,
+            "appearances": self.get_album_appearances(archive_child, album_leaf),
             "photos": photos,
         }
 
@@ -1367,3 +1368,92 @@ class QueriesUIMixin(ClustersMixin):
             "archive_child": archive_child,
             "album_leaf": album_leaf,
         }
+
+    def record_album_appearance(
+        self,
+        archive_child: str,
+        album_leaf: str,
+        person_id: int,
+        sample_photo_id: int,
+        sample_face_id: int | None,
+        clothing_summary: str,
+        top_color: str = "",
+        bottom_color: str = "",
+        distinctive_features: str = "",
+        apparent_gender: str = "unknown",
+        verified_count: int = 0,
+    ) -> None:
+        """Cache the detected clothing & appearance signature for a child in a specific album."""
+        now = _now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO album_appearances (
+                    archive_child, album_leaf, person_id, sample_photo_id, sample_face_id,
+                    clothing_summary, top_color, bottom_color, distinctive_features,
+                    apparent_gender, verified_faces_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(archive_child, album_leaf, person_id) DO UPDATE SET
+                    sample_photo_id = excluded.sample_photo_id,
+                    sample_face_id = excluded.sample_face_id,
+                    clothing_summary = excluded.clothing_summary,
+                    top_color = excluded.top_color,
+                    bottom_color = excluded.bottom_color,
+                    distinctive_features = excluded.distinctive_features,
+                    apparent_gender = excluded.apparent_gender,
+                    verified_faces_count = excluded.verified_faces_count,
+                    created_at = excluded.created_at
+                """,
+                (
+                    archive_child,
+                    album_leaf,
+                    person_id,
+                    sample_photo_id,
+                    sample_face_id,
+                    clothing_summary,
+                    top_color,
+                    bottom_color,
+                    distinctive_features,
+                    apparent_gender,
+                    verified_count,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    def get_album_appearances(
+        self,
+        archive_child: str,
+        album_leaf: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch cached appearance signatures for an album."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    aa.*, pe.display_name AS person_name
+                FROM album_appearances aa
+                JOIN people pe ON pe.person_id = aa.person_id
+                WHERE aa.archive_child = ? AND aa.album_leaf = ?
+                ORDER BY pe.display_name ASC
+                """,
+                (archive_child, album_leaf),
+            ).fetchall()
+            return [
+                {
+                    "archive_child": str(r["archive_child"]),
+                    "album_leaf": str(r["album_leaf"]),
+                    "person_id": int(r["person_id"]),
+                    "person_name": str(r["person_name"]),
+                    "sample_photo_id": int(r["sample_photo_id"]),
+                    "sample_face_id": int(r["sample_face_id"]) if r["sample_face_id"] is not None else None,
+                    "clothing_summary": str(r["clothing_summary"]),
+                    "top_color": str(r["top_color"]),
+                    "bottom_color": str(r["bottom_color"]),
+                    "distinctive_features": str(r["distinctive_features"]),
+                    "apparent_gender": str(r["apparent_gender"]),
+                    "verified_faces_count": int(r["verified_faces_count"]),
+                    "created_at": str(r["created_at"]),
+                }
+                for r in rows
+            ]

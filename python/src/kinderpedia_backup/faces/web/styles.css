@@ -2802,3 +2802,54 @@ input:disabled {
   color: var(--ink-muted);
 }
 
+/* VLM Clothing Continuity & Gender Styles */
+.album-appearances-bar {
+  margin-bottom: 14px;
+}
+.album-appearances-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.album-outfit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #fdf4ff;
+  border: 1px solid #f0abfc;
+  color: #86198f;
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.album-outfit-chip .outfit-icon {
+  font-size: 16px;
+}
+.album-outfit-chip .outfit-info strong {
+  font-weight: 700;
+  margin-right: 4px;
+}
+.album-outfit-chip .outfit-info small {
+  color: #a21caf;
+  margin-left: 4px;
+}
+.roster-gender {
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+.outfit-pill {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  background: rgba(134, 25, 143, 0.9);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  z-index: 2;
+}
+
+

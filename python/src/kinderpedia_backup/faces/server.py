@@ -26,6 +26,7 @@ from .index_db import FacesIndexDB
 from .matcher import rebuild_yearly_clusters, recompute_active_matching
 from .models import AssignmentStatus, BoundingBox, LinkMode, PersonRole
 from .scanner import ensure_face_thumb_on_disk, face_thumb_path
+from .vlm import analyze_album_continuity, get_vlm_provider
 
 _WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -135,6 +136,7 @@ class _AppContext:
         self._last_bg_error = ""
         self._warming = bool(warm_cache_on_start)
         self._sync_op = ""
+        self.vlm = get_vlm_provider()
 
         # Long-running jobs (`/api/recluster`, `/api/materialize`) run on their own threads:
         self._jobs: dict[str, dict[str, Any]] = {}
@@ -465,6 +467,62 @@ class _AppContext:
                 if rem <= 0:
                     return self._job_public_locked(info)
                 self._bg_cond.wait(timeout=rem)
+
+    def run_vlm_album_job(
+        self,
+        archive_child: str,
+        album_leaf: str,
+        *,
+        person_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Job body for `/api/vlm/analyze-album`: verify clothing continuity and genders."""
+        res = analyze_album_continuity(
+            self.db,
+            self.vlm,
+            archive_child,
+            album_leaf,
+            self.backup_root,
+            target_person_id=person_id,
+        )
+        if res.get("verified_count", 0) > 0 or res.get("gender_rejected_count", 0) > 0:
+            self.note_data_changed()
+            self.schedule_rematch(delay=0.1)
+        return res
+
+    def run_vlm_batch_job(
+        self,
+        *,
+        archive_child: str | None = None,
+        limit: int = 40,
+    ) -> dict[str, Any]:
+        """Job body for `/api/vlm/batch-analyze`: run VLM assistant across albums with open candidates."""
+        albums_res = self.db.list_albums(archive_child=archive_child, limit=limit)
+        albums_list = albums_res.get("albums", [])
+        results = []
+        total_verified = 0
+        total_rejected = 0
+        for alb in albums_list:
+            if alb.get("candidate_count", 0) == 0:
+                continue
+            r = analyze_album_continuity(
+                self.db,
+                self.vlm,
+                str(alb["archive_child"]),
+                str(alb["album_leaf"]),
+                self.backup_root,
+            )
+            results.append(r)
+            total_verified += int(r.get("verified_count", 0))
+            total_rejected += int(r.get("gender_rejected_count", 0))
+        if total_verified > 0 or total_rejected > 0:
+            self.note_data_changed()
+            self.schedule_rematch(delay=0.1)
+        return {
+            "albums_processed": len(results),
+            "total_verified": total_verified,
+            "total_gender_rejected": total_rejected,
+            "results": results,
+        }
 
     def run_recluster_job(self) -> dict[str, Any]:
         """Job body for `/api/recluster`: rebuild yearly clusters + full rematch under `_rematch_lock`."""
@@ -1183,6 +1241,15 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"jobs": self.ctx.list_jobs()})
             return
 
+        if path == "/api/vlm/status":
+            self._send_json(
+                {
+                    "available": self.ctx.vlm.is_available(),
+                    "provider": self.ctx.vlm.__class__.__name__,
+                }
+            )
+            return
+
         if path == "/api/albums":
             child = (qs.get("child") or [""])[0].strip() or None
             yr = (qs.get("year") or [""])[0].strip() or None
@@ -1587,6 +1654,61 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             ov = self.ctx.db.get_archive_overview()
             self.ctx.schedule_rematch()
             self._send_json({**res, "overview": ov, "rematch_scheduled": True})
+            return
+
+        if path == "/api/vlm/analyze-album":
+            key = str(body.get("album_key") or "").strip()
+            parts = key.split("/", 1)
+            if len(parts) != 2:
+                self._send_json({"error": "Invalid album_key."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            pid_raw = body.get("person_id")
+            vlm_pid: int | None = int(pid_raw) if pid_raw is not None and str(pid_raw).isdigit() else None
+            job_info = self.ctx.start_job(
+                "vlm_album",
+                lambda: self.ctx.run_vlm_album_job(parts[0], parts[1], person_id=vlm_pid),
+                label=f"VLM clothing check for {key}",
+            )
+            self._send_json(job_info)
+            return
+
+        if path == "/api/vlm/batch-analyze":
+            arch_child = str(body.get("archive_child") or "").strip() or None
+            lim = int(body.get("limit") or 30)
+            job_info = self.ctx.start_job(
+                "vlm_batch",
+                lambda: self.ctx.run_vlm_batch_job(archive_child=arch_child, limit=lim),
+                label=f"Batch VLM assistant ({lim} albums)",
+            )
+            self._send_json(job_info)
+            return
+
+        if path == "/api/vlm/inspect-face":
+            ph_id = int(body.get("photo_id") or 0)
+            f_box = body.get("box") or [0, 0, 100, 100]
+            pname = str(body.get("person_name") or "")
+            target_g = str(body.get("gender") or "unknown")
+            rel_p = self.ctx.db.get_photo_rel_path(ph_id)
+            if not rel_p:
+                self._send_json({"error": "Photo not found."}, status=HTTPStatus.NOT_FOUND)
+                return
+            img_path = self.ctx.backup_root / rel_p
+            sig = self.ctx.vlm.extract_clothing(
+                image_path=img_path,
+                face_box=f_box,
+                person_name=pname or "Child",
+                target_gender=target_g,
+            )
+            self._send_json({"signature": sig.to_dict() if sig else None})
+            return
+
+        if path.startswith("/api/people/") and path.endswith("/gender"):
+            pid = int(path[len("/api/people/") : -len("/gender")])
+            gender_val = str(body.get("gender") or "unknown").strip().lower()
+            self.ctx.db.set_person_gender(pid, gender_val)
+            ov = self.ctx.db.get_archive_overview()
+            self.ctx.schedule_rematch(delay=0.1)
+            self._send_json({"ok": True, "person_id": pid, "gender": gender_val, "overview": ov})
             return
 
         if path.startswith("/api/people/") and path.endswith("/cluster-action"):

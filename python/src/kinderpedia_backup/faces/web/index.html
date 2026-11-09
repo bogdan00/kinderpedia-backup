@@ -252,6 +252,7 @@
           <div class="album-list-meta-bar">
             <span class="albums-count-label" id="albumsCountLabel">Loading albums…</span>
             <div class="album-pagination-btns">
+              <button type="button" class="btn btn-ghost btn-sm" id="btnBatchVlmAssistant" title="Run background VLM clothing continuity across albums with unverified candidate faces">✨ Batch VLM Assistant</button>
               <button type="button" class="btn btn-secondary btn-sm" id="btnAlbumsPrev" disabled>← Prev</button>
               <button type="button" class="btn btn-secondary btn-sm" id="btnAlbumsNext">Next →</button>
             </div>
@@ -272,11 +273,16 @@
               <div class="album-detail-meta" id="albumDetailMeta"></div>
             </div>
             <div class="album-detail-actions">
+              <button type="button" class="btn btn-secondary btn-sm" id="btnVlmAnalyzeAlbum" title="Run multimodal VLM to check clothing continuity across photos and filter gender mismatches">
+                ✨ VLM Clothing Check
+              </button>
               <button type="button" class="btn btn-primary btn-sm" id="btnApproveAlbum" hidden>
                 ✓ Approve Auto Matches
               </button>
             </div>
           </div>
+
+          <div class="album-appearances-bar" id="albumAppearancesBar" hidden></div>
 
           <div class="album-person-filter-bar" id="albumPersonFilterBar"></div>
 
@@ -387,6 +393,16 @@
             <option value="family">Family Child</option>
             <option value="educator">Educator</option>
             <option value="ignore">Ignored / Muted</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>Gender</span>
+          <select id="renamePersonGenderSelect" class="input-select">
+            <option value="unknown">Unspecified / Unknown</option>
+            <option value="girl">Girl 👧</option>
+            <option value="boy">Boy 👦</option>
+            <option value="adult_female">Adult (Female) 👩</option>
+            <option value="adult_male">Adult (Male) 👨</option>
           </select>
         </label>
         <div class="form-field">

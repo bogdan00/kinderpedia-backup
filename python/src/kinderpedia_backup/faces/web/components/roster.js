@@ -46,6 +46,10 @@ function rosterItemHtml(p, groupKey, classNameById) {
       <div class="roster-meta">
         <div class="roster-name">${p.display_name}</div>
         <div class="roster-counts">${p.confirmed_count} confirmed · ${p.total_included_count} total${
+          p.gender && p.gender !== "unknown"
+            ? html` · <span class="roster-gender" title="Gender: ${p.gender}">${p.gender === "girl" ? "👧 girl" : p.gender === "boy" ? "👦 boy" : p.gender}</span>`
+            : ""
+        }${
           p.birth_date && html` · <span class="roster-birth" title="Birthday — no tags before this date">🎂 ${p.birth_date}</span>`
         }</div>
         ${classNames && html`<div class="roster-classes" title="Classes: ${classNames}">🏫 ${classNames}</div>`}
@@ -86,6 +90,8 @@ export function openRenameModal(personId) {
   const inp = el("renamePersonInput");
   inp.value = target.display_name;
   el("renamePersonRoleSelect").value = target.role || "classmate";
+  const genderSel = el("renamePersonGenderSelect");
+  if (genderSel) genderSel.value = target.gender || "unknown";
   el("renamePersonBirthInput").value = target.birth_date || "";
   el("renamePersonModal").hidden = false;
   setTimeout(() => {
@@ -186,6 +192,11 @@ function submitRename() {
       const body = { display_name: newName, role: el("renamePersonRoleSelect").value || target.role };
       if (birthChanged) body.birth_date = newBirth;
       const res = await post(`/api/people/${target.person_id}`, body, "PATCH");
+      const genderSel = el("renamePersonGenderSelect");
+      const newGender = genderSel ? genderSel.value : null;
+      if (newGender && newGender !== (target.gender || "unknown")) {
+        await post(`/api/people/${target.person_id}/gender`, { gender: newGender });
+      }
       closeRenameModal();
       const updatedName = (res.person && res.person.display_name) || newName;
       state.batchCards = renamePersonInCards(state.batchCards, target.person_id, oldName, updatedName);

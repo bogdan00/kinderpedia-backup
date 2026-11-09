@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 !python/.env.example
+.local/
 *session*.json
 *adaptive_rate*.json
 *face_scan_cache*.json
