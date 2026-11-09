@@ -21,6 +21,7 @@ export function getModalNavItems(ctx) {
   if (ctx.type === "cluster") return ctx.faces || [];
   if (ctx.type === "batch") return state.batchCards;
   if (ctx.type === "gallery") return ctx.items || [];
+  if (ctx.type === "album") return ctx.photos || [];
   return [];
 }
 
@@ -181,6 +182,7 @@ export function renderModalNavControls() {
   el("btnClusterNext").disabled = items.length <= 1;
   const isCluster = ctx.type === "cluster";
   const isBatch = ctx.type === "batch";
+  const isAlbum = ctx.type === "album";
   const isChildCluster = ctx.type === "gallery" && Boolean(ctx.ccKey);
   el("btnClusterExcludeFace").hidden = !isCluster;
   el("modalClusterAssignForm").hidden = !isCluster;
@@ -190,6 +192,10 @@ export function renderModalNavControls() {
   if (isCluster) {
     el("modalClusterPos").textContent = `${ctx.index + 1} / ${items.length} photos in cluster${dedupeNavNote(ctx)}`;
     el("modalClusterTitle").textContent = `${ctx.archiveChild} · ${ctx.year} (${ctx.photoCount} photos)`;
+  } else if (isAlbum) {
+    const label = `Album Photo ${ctx.index + 1} of ${items.length}`;
+    el("modalClusterPos").textContent = label;
+    el("modalClusterTitle").textContent = ctx.albumTitle || label;
   } else {
     const label = `${isBatch ? "Batch Photo" : ctx.navLabel || "Gallery Photo"} ${pos}`;
     el("modalClusterPos").textContent = `${label}${dedupeNavNote(ctx)}`;

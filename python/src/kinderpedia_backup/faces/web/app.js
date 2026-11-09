@@ -16,6 +16,7 @@ import { bindChildClusters } from "./views/childClusters.js";
 import { bindClasses } from "./views/classes.js";
 import { bindClusters, loadClusters } from "./views/clusters.js";
 import { bindGallery } from "./views/gallery.js";
+import { bindAlbumsEvents } from "./views/albums.js";
 import { bindOverview } from "./views/overview.js";
 
 for (const bind of [
@@ -27,6 +28,7 @@ for (const bind of [
   bindChildClusters,
   bindClusters,
   bindGallery,
+  bindAlbumsEvents,
   bindClasses,
   bindReassignModal,
   bindLightbox,

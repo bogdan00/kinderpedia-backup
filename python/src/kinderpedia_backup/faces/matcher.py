@@ -1454,9 +1454,16 @@ def recompute_active_matching(
             band_trusts = trusts and (
                 score >= auto_band_knn_upper or float(knn_sim[r_idx]) >= auto_band_knn_min_sim
             )
-            if status == "auto_high" and not band_trusts and score < auto_band_knn_upper:
+            if (
+                status == "auto_high"
+                and not band_trusts
+                and score < auto_band_knn_upper
+                and src_kind != "album_cohesion"
+            ):
                 # Calibration band: human decisions at these scores are wrong ~1 in 5 times,
                 # so only auto-accept when the labelled neighbourhood agrees; else ask.
+                # (Same-album burst absorption is preserved: matching a confirmed face from the
+                # exact same album with >= 0.55 similarity and >= 0.06 margin is trusted.)
                 status = "candidate"
                 src_kind = "model_match"
             elif trusts and src_kind != "album_cohesion":

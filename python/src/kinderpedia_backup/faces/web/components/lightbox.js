@@ -309,6 +309,16 @@ export function bindLightbox() {
   });
 
   on("btnCloseModal", "click", (_ev, btn) => runBusy(btn, () => closePhotoModal(), { context: "Close modal" }));
+  on("btnModalOpenAlbum", "click", async () => {
+    const curPhoto = state.modalPhoto;
+    if (!curPhoto) return;
+    const albumKey = `${curPhoto.archive_child}/${curPhoto.album_leaf}`;
+    await closePhotoModal();
+    const { switchMode } = await import("../router.js");
+    const { openAlbumByKey } = await import("../views/albums.js");
+    await switchMode("albums");
+    await openAlbumByKey(albumKey);
+  });
   on("photoModal", "click", (ev, modal) => {
     if (ev.target === modal) closePhotoModal();
   });

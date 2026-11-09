@@ -353,6 +353,44 @@ class FacesServerTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    # ------------------------------------------------------------------ Album Browser
+    def test_albums_api(self) -> None:
+        r = requests.get(f"{self.base}/api/albums", timeout=5)
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertIn("albums", data)
+        self.assertIn("total", data)
+        self.assertGreater(data["total"], 0)
+        self.assertTrue(len(data["albums"]) > 0)
+        first = data["albums"][0]
+        self.assertIn("album_key", first)
+        self.assertIn("photo_count", first)
+        self.assertIn("face_count", first)
+
+        r_det = requests.get(f"{self.base}/api/albums/detail?key={first['album_key']}", timeout=5)
+        self.assertEqual(r_det.status_code, 200)
+        det = r_det.json()
+        self.assertEqual(det["album_key"], first["album_key"])
+        self.assertIn("photos", det)
+        self.assertIn("people", det)
+        self.assertEqual(len(det["photos"]), first["photo_count"])
+
+        ph_id = det["photos"][0]["photo_id"]
+        r_ph = requests.get(f"{self.base}/api/albums/detail?photo_id={ph_id}", timeout=5)
+        self.assertEqual(r_ph.status_code, 200)
+        self.assertEqual(r_ph.json()["album_key"], first["album_key"])
+
+        r_app = requests.post(
+            f"{self.base}/api/albums/approve-all",
+            json={"album_key": first["album_key"]},
+            headers=HDR,
+            timeout=5,
+        )
+        self.assertEqual(r_app.status_code, 200)
+        app_data = r_app.json()
+        self.assertIn("approved_count", app_data)
+        self.assertTrue(app_data["rematch_scheduled"])
+
     # ------------------------------------------------------------------ static assets
     def _raw_get(self, path: str) -> tuple[int, dict[str, str], bytes]:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -800,6 +838,8 @@ await evaluate(`document.getElementById("btnCloseClasses").click(), true`);
 await waitFor(`document.getElementById("classesModal").hidden`, "classes dialog closed");
 await evaluate(`document.getElementById("btnDiscoverClusters").click(), true`);
 await waitFor(`!document.getElementById("viewClusters").hidden && !!document.querySelector("#clustersGrid .cluster-card, #clustersGrid .empty-state")`, "unnamed clusters view");
+await evaluate(`document.getElementById("tabAlbums").click(), true`);
+await waitFor(`!document.getElementById("viewAlbums").hidden && !document.getElementById("albumListView").hidden`, "album browser view");
 
 if (exceptions.length) fail(`uncaught page exceptions: ${JSON.stringify(exceptions.slice(0, 3))}`);
 clearTimeout(hardTimer);

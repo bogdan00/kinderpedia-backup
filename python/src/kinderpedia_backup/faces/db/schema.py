@@ -436,6 +436,12 @@ def _m6_label_keeps(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m7_album_index(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photos_child_album ON photos(archive_child, album_leaf)"
+    )
+
+
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None]]
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -445,6 +451,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     (4, "content_hash_and_face_refs", _m4_content_hash_and_face_refs),
     (5, "enum_validation_triggers", _m5_enum_validation),
     (6, "label_keeps", _m6_label_keeps),
+    (7, "album_index", _m7_album_index),
 )
 
 SCHEMA_VERSION = MIGRATIONS[-1][0]

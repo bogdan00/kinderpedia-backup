@@ -1,12 +1,19 @@
 // View switching: selected child + active mode -> which view loads.
 import { emit, state } from "./state.js";
 import { el } from "./util/dom.js";
+import { loadAlbums } from "./views/albums.js";
 import { loadBatchForSelected } from "./views/batch.js";
 import { loadChildClusters } from "./views/childClusters.js";
 import { loadClusters } from "./views/clusters.js";
 import { loadGallery } from "./views/gallery.js";
 
-const VIEW_IDS = { batch: "viewBatch", childclusters: "viewChildClusters", clusters: "viewClusters", gallery: "viewGallery" };
+const VIEW_IDS = {
+  batch: "viewBatch",
+  childclusters: "viewChildClusters",
+  clusters: "viewClusters",
+  gallery: "viewGallery",
+  albums: "viewAlbums",
+};
 
 export function syncModeTabs() {
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.getAttribute("data-mode") === state.mode));
@@ -17,6 +24,7 @@ export async function loadActiveView() {
   if (state.mode === "batch") await loadBatchForSelected();
   else if (state.mode === "childclusters") await loadChildClusters();
   else if (state.mode === "clusters") await loadClusters();
+  else if (state.mode === "albums") await loadAlbums();
   else await loadGallery();
 }
 

@@ -1183,6 +1183,30 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"jobs": self.ctx.list_jobs()})
             return
 
+        if path == "/api/albums":
+            child = (qs.get("child") or [None])[0]
+            yr = (qs.get("year") or [None])[0]
+            query = (qs.get("q") or [None])[0]
+            lim = int((qs.get("limit") or ["48"])[0])
+            off = int((qs.get("offset") or ["0"])[0])
+            self._send_json(
+                self.ctx.db.list_albums(
+                    archive_child=child,
+                    year=yr,
+                    search=query,
+                    limit=lim,
+                    offset=off,
+                )
+            )
+            return
+
+        if path == "/api/albums/detail":
+            key = (qs.get("key") or [None])[0]
+            ph_str = (qs.get("photo_id") or [None])[0]
+            ph_id = int(ph_str) if ph_str and ph_str.isdigit() else None
+            self._send_json(self.ctx.db.get_album_detail(album_key=key, photo_id=ph_id))
+            return
+
         if path.startswith("/api/jobs/"):
             job = self.ctx.get_job(path[len("/api/jobs/") :])
             if job is None:
@@ -1546,6 +1570,24 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_json({**kept, "overview": ov, "rematch_scheduled": True})
             return
         # --- end suspicious labels ----------------------------------------------------------------
+
+        if path == "/api/albums/approve-all":
+            key = str(body.get("album_key") or "").strip()
+            parts = key.split("/", 1)
+            if len(parts) != 2:
+                self._send_json({"error": "Invalid album_key."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            pid_raw = body.get("person_id")
+            pid = int(pid_raw) if pid_raw is not None and str(pid_raw).isdigit() else None
+            res = self.ctx.db.approve_album_matches(
+                archive_child=parts[0],
+                album_leaf=parts[1],
+                person_id=pid,
+            )
+            ov = self.ctx.db.get_archive_overview()
+            self.ctx.schedule_rematch()
+            self._send_json({**res, "overview": ov, "rematch_scheduled": True})
+            return
 
         if path.startswith("/api/people/") and path.endswith("/cluster-action"):
             pid = int(path[len("/api/people/") : -len("/cluster-action")])

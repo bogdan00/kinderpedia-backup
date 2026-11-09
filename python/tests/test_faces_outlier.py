@@ -289,9 +289,9 @@ class LabelGuardTests(unittest.TestCase):
             self.assertEqual(diag["flagged_labels"], set())
 
     def test_label_keeps_schema(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertGreaterEqual(SCHEMA_VERSION, 6)
         with tempfile.TemporaryDirectory() as tmp, FacesIndexDB(Path(tmp) / "faces_index.sqlite") as db:
-            self.assertEqual(db.get_schema_version(), 6)
+            self.assertEqual(db.get_schema_version(), SCHEMA_VERSION)
             cols = {str(r[1]) for r in db._conn.execute("PRAGMA table_info(label_keeps)")}
             self.assertEqual(cols, {"face_id", "person_id", "kept_at"})
 

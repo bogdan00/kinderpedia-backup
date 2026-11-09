@@ -74,6 +74,9 @@
           <button type="button" class="tab-btn" data-mode="gallery" id="tabGallery">
             Confirmed Gallery &amp; Export
           </button>
+          <button type="button" class="tab-btn" data-mode="albums" id="tabAlbums">
+            Album Browser
+          </button>
           <button type="button" class="btn btn-ghost btn-sm" id="btnRecluster" title="Re-cluster &amp; re-match newly scanned photos">
             ↻ Refresh Scan
           </button>
@@ -219,6 +222,67 @@
         <div class="cards-grid" id="galleryGrid"></div>
         <div class="pagination-bar" id="galleryPagination"></div>
       </section>
+
+      <!-- VIEW 5: Album Browser — Spot-check matches & browse chronologically -->
+      <section class="view-panel" id="viewAlbums" hidden>
+        <!-- Level 1: Albums List -->
+        <div id="albumListView">
+          <div class="filter-bar">
+            <div class="filter-title">
+              <h2>Album Browser</h2>
+              <p>Explore classroom albums chronologically, spot-check auto-matches, and verify group photos.</p>
+            </div>
+            <div class="filter-controls">
+              <input
+                type="search"
+                class="input-search"
+                id="albumSearchInput"
+                placeholder="Search album title…"
+                aria-label="Search album title"
+              />
+              <select id="albumChildFilter" class="input-select" aria-label="Archive child filter">
+                <option value="">All Children</option>
+              </select>
+              <select id="albumYearFilter" class="input-select" aria-label="Year filter">
+                <option value="">All Years</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="album-list-meta-bar">
+            <span class="albums-count-label" id="albumsCountLabel">Loading albums…</span>
+            <div class="album-pagination-btns">
+              <button type="button" class="btn btn-secondary btn-sm" id="btnAlbumsPrev" disabled>← Prev</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="btnAlbumsNext">Next →</button>
+            </div>
+          </div>
+
+          <div class="albums-grid" id="albumsGrid"></div>
+          <div class="empty-state" id="albumsEmptyState" hidden>No albums match the selected filters.</div>
+        </div>
+
+        <!-- Level 2: Album Detail & Photos Grid -->
+        <div id="albumDetailView" hidden>
+          <div class="album-detail-header">
+            <div class="album-detail-nav">
+              <button type="button" class="btn btn-ghost btn-sm" id="btnBackToAlbums">← Back to Albums</button>
+            </div>
+            <div class="album-detail-info">
+              <h2 id="albumDetailTitle">Album Photos</h2>
+              <div class="album-detail-meta" id="albumDetailMeta"></div>
+            </div>
+            <div class="album-detail-actions">
+              <button type="button" class="btn btn-primary btn-sm" id="btnApproveAlbum" hidden>
+                ✓ Approve Auto Matches
+              </button>
+            </div>
+          </div>
+
+          <div class="album-person-filter-bar" id="albumPersonFilterBar"></div>
+
+          <div class="album-photos-grid" id="albumPhotosGrid"></div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -228,7 +292,10 @@
       <div class="modal-header">
         <div>
           <div class="modal-kicker" id="modalMetaLine"></div>
-          <h3 id="modalAlbumTitle">Classroom Photo</h3>
+          <div class="modal-title-row">
+            <h3 id="modalAlbumTitle">Classroom Photo</h3>
+            <button type="button" class="btn btn-ghost btn-xs" id="btnModalOpenAlbum" title="Browse this album">📁 View Album</button>
+          </div>
         </div>
         <div class="modal-header-actions">
           <div class="modal-cluster-nav" id="modalClusterNav" hidden>

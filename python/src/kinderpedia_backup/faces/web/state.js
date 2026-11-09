@@ -38,6 +38,16 @@ export const state = {
   classesMatrix: null,
   classesMembers: new Map(), // class_id -> Set(person_id) (local working copy)
   classesDirty: new Set(), // class_ids with unsaved membership edits
+  albums: [],
+  albumsTotal: 0,
+  albumsOffset: 0,
+  albumsLimit: 48,
+  selectedAlbumKey: null,
+  currentAlbumDetail: null,
+  albumFilterChild: "",
+  albumFilterYear: "",
+  albumSearchQuery: "",
+  albumPersonFilter: null,
 };
 
 // ---------------------------------------------------------------- pub/sub

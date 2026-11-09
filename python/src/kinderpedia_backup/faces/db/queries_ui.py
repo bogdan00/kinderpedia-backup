@@ -15,6 +15,7 @@ from ..models import (
     BoundingBox,
 )
 from .clusters import ClustersMixin
+from .codec import _now_iso
 
 
 def _pack_person_cluster(
@@ -950,3 +951,419 @@ class QueriesUIMixin(ClustersMixin):
                 (photo_id,),
             ).fetchone()
         return str(row["rel_path"]) if row is not None else None
+
+    # ------------------------------------------------------------------ Album Browser
+    def list_albums(
+        self,
+        *,
+        archive_child: str | None = None,
+        year: str | None = None,
+        search: str | None = None,
+        limit: int = 48,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List albums matching optional filters, with photo count, face count, and label stats."""
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        child_clean = str(archive_child or "").strip() or None
+        year_clean = str(year or "").strip() or None
+        search_clean = str(search or "").strip() or None
+
+        with self._lock:
+            avail_children_rows = self._conn.execute(
+                """
+                SELECT DISTINCT archive_child
+                FROM photos
+                WHERE archive_child != '' AND archive_child NOT LIKE 'wt-%'
+                  AND archive_child NOT IN ('bookmarklet', 'kinderpedia-backup')
+                ORDER BY archive_child ASC
+                """
+            ).fetchall()
+            available_children = [str(r[0]) for r in avail_children_rows]
+
+            avail_years_rows = self._conn.execute(
+                """
+                SELECT DISTINCT year
+                FROM photos
+                WHERE year GLOB '[0-9][0-9][0-9][0-9]'
+                ORDER BY year DESC
+                """
+            ).fetchall()
+            available_years = [str(r[0]) for r in avail_years_rows]
+
+            search_pat = f"%{search_clean}%" if search_clean else None
+            filter_params = (
+                child_clean,
+                child_clean,
+                year_clean,
+                year_clean,
+                search_pat,
+                search_pat,
+                search_pat,
+            )
+
+            count_sql = """
+                SELECT COUNT(DISTINCT p.archive_child || '/' || p.album_leaf)
+                FROM photos p
+                WHERE p.year GLOB '[0-9][0-9][0-9][0-9]'
+                  AND (? IS NULL OR p.archive_child = ?)
+                  AND (? IS NULL OR p.year = ?)
+                  AND (? IS NULL OR p.album_title LIKE ? OR p.album_leaf LIKE ?)
+            """
+            total = int(self._conn.execute(count_sql, filter_params).fetchone()[0])
+
+            albums_sql = """
+                SELECT
+                    p.archive_child,
+                    p.year,
+                    p.month,
+                    p.album_leaf,
+                    p.album_title,
+                    MIN(p.album_date) AS min_date,
+                    COUNT(p.photo_id) AS photo_count,
+                    SUM(p.face_count) AS total_faces,
+                    MIN(p.photo_id) AS cover_photo_id
+                FROM photos p
+                WHERE p.year GLOB '[0-9][0-9][0-9][0-9]'
+                  AND (? IS NULL OR p.archive_child = ?)
+                  AND (? IS NULL OR p.year = ?)
+                  AND (? IS NULL OR p.album_title LIKE ? OR p.album_leaf LIKE ?)
+                GROUP BY p.archive_child, p.album_leaf
+                ORDER BY p.year DESC, p.month DESC, min_date DESC, p.album_leaf ASC
+                LIMIT ? OFFSET ?
+            """
+            paged_params = [*filter_params, limit, offset]
+            alb_rows = self._conn.execute(albums_sql, paged_params).fetchall()
+            if not alb_rows:
+                return {
+                    "albums": [],
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "available_children": available_children,
+                    "available_years": available_years,
+                }
+
+            keys = [(str(r["archive_child"]), str(r["album_leaf"])) for r in alb_rows]
+            placeholders = ", ".join(["(?, ?)"] * len(keys))
+            key_params: list[str] = [val for k in keys for val in k]
+
+            status_sql = f"""
+                SELECT
+                    p.archive_child,
+                    p.album_leaf,
+                    COUNT(DISTINCT f.face_id) AS total_faces,
+                    COUNT(DISTINCT CASE WHEN a.status = 'confirmed' THEN f.face_id END) AS confirmed_count,
+                    COUNT(DISTINCT CASE WHEN a.status = 'auto_high' THEN f.face_id END) AS auto_count,
+                    COUNT(DISTINCT CASE WHEN a.status = 'candidate' THEN f.face_id END) AS candidate_count
+                FROM photos p
+                JOIN faces f ON f.photo_id = p.photo_id
+                LEFT JOIN assignments a ON a.face_id = f.face_id AND a.status IN ('confirmed', 'auto_high', 'candidate')
+                WHERE (p.archive_child, p.album_leaf) IN ({placeholders})
+                GROUP BY p.archive_child, p.album_leaf
+            """  # noqa: S608 - safe placeholder tuple expansion
+            status_map: dict[tuple[str, str], dict[str, int]] = {}
+            for sr in self._conn.execute(status_sql, key_params).fetchall():
+                t_faces = int(sr["total_faces"] or 0)
+                conf = int(sr["confirmed_count"] or 0)
+                auto = int(sr["auto_count"] or 0)
+                cand = int(sr["candidate_count"] or 0)
+                unass = max(0, t_faces - conf - auto - cand)
+                status_map[(str(sr["archive_child"]), str(sr["album_leaf"]))] = {
+                    "confirmed": conf,
+                    "auto": auto,
+                    "candidate": cand,
+                    "unassigned": unass,
+                }
+
+            people_sql = f"""
+                SELECT
+                    p.archive_child,
+                    p.album_leaf,
+                    pe.person_id,
+                    pe.display_name,
+                    COUNT(DISTINCT a.face_id) AS cnt,
+                    COUNT(DISTINCT CASE WHEN a.status = 'confirmed' THEN a.face_id END) AS confirmed_cnt
+                FROM photos p
+                JOIN assignments a ON a.photo_id = p.photo_id AND a.status IN ('confirmed', 'auto_high') AND a.face_id IS NOT NULL
+                JOIN people pe ON pe.person_id = a.person_id
+                WHERE (p.archive_child, p.album_leaf) IN ({placeholders})
+                  AND pe.role != 'ignore'
+                GROUP BY p.archive_child, p.album_leaf, pe.person_id
+                ORDER BY p.archive_child, p.album_leaf, cnt DESC
+            """  # noqa: S608 - safe placeholder tuple expansion
+            people_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for pr in self._conn.execute(people_sql, key_params).fetchall():
+                k = (str(pr["archive_child"]), str(pr["album_leaf"]))
+                people_map.setdefault(k, []).append(
+                    {
+                        "person_id": int(pr["person_id"]),
+                        "name": str(pr["display_name"]),
+                        "count": int(pr["cnt"]),
+                        "confirmed_count": int(pr["confirmed_cnt"]),
+                    }
+                )
+
+            albums = []
+            for r in alb_rows:
+                ach = str(r["archive_child"])
+                leaf = str(r["album_leaf"])
+                k = (ach, leaf)
+                s = status_map.get(k, {"confirmed": 0, "auto": 0, "candidate": 0, "unassigned": 0})
+                albums.append(
+                    {
+                        "album_key": f"{ach}/{leaf}",
+                        "archive_child": ach,
+                        "year": str(r["year"]),
+                        "month": str(r["month"] or ""),
+                        "album_leaf": leaf,
+                        "album_title": str(r["album_title"] or leaf),
+                        "album_date": str(r["min_date"] or ""),
+                        "photo_count": int(r["photo_count"]),
+                        "face_count": int(r["total_faces"] or 0),
+                        "cover_photo_id": int(r["cover_photo_id"]),
+                        "confirmed_count": s["confirmed"],
+                        "auto_count": s["auto"],
+                        "candidate_count": s["candidate"],
+                        "unassigned_count": s["unassigned"],
+                        "top_people": people_map.get(k, [])[:6],
+                    }
+                )
+
+            return {
+                "albums": albums,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "available_children": available_children,
+                "available_years": available_years,
+            }
+
+    def get_album_detail(
+        self,
+        *,
+        album_key: str | None = None,
+        photo_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch all photos and faces in an album, with metadata and current assignments."""
+        with self._lock:
+            if photo_id is not None:
+                p_row = self._conn.execute(
+                    "SELECT archive_child, album_leaf FROM photos WHERE photo_id = ?",
+                    (photo_id,),
+                ).fetchone()
+                if p_row is None:
+                    raise KeyError(f"Photo {photo_id} not found.")
+                archive_child = str(p_row["archive_child"])
+                album_leaf = str(p_row["album_leaf"])
+            elif album_key:
+                parts = album_key.split("/", 1)
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid album key: {album_key!r}")
+                archive_child, album_leaf = parts[0], parts[1]
+            else:
+                raise ValueError("Must provide either album_key or photo_id.")
+
+            meta_row = self._conn.execute(
+                """
+                SELECT
+                    archive_child, year, month, album_leaf, album_title,
+                    MIN(album_date) AS min_date, MAX(album_date) AS max_date,
+                    COUNT(photo_id) AS photo_count, SUM(face_count) AS total_faces
+                FROM photos
+                WHERE archive_child = ? AND album_leaf = ?
+                GROUP BY archive_child, album_leaf
+                """,
+                (archive_child, album_leaf),
+            ).fetchone()
+            if meta_row is None:
+                raise KeyError(f"Album {archive_child}/{album_leaf} not found.")
+
+            photos_rows = self._conn.execute(
+                """
+                SELECT
+                    photo_id, rel_path, filename, seq_in_album, width, height, album_date,
+                    face_count, best_live_url, download_url
+                FROM photos
+                WHERE archive_child = ? AND album_leaf = ?
+                ORDER BY seq_in_album ASC, photo_id ASC
+                """,
+                (archive_child, album_leaf),
+            ).fetchall()
+
+            faces_rows = self._conn.execute(
+                """
+                WITH album_photos AS (
+                    SELECT photo_id FROM photos WHERE archive_child = ? AND album_leaf = ?
+                ),
+                best_face_assign AS (
+                    SELECT
+                        a.face_id, a.person_id, a.status, a.similarity, pe.display_name,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY a.face_id
+                            ORDER BY CASE a.status WHEN 'confirmed' THEN 0 WHEN 'auto_high' THEN 1 ELSE 2 END ASC,
+                                     a.updated_at DESC, a.person_id ASC
+                        ) AS rn
+                    FROM assignments a
+                    JOIN people pe ON pe.person_id = a.person_id
+                    WHERE a.photo_id IN (SELECT photo_id FROM album_photos)
+                      AND a.face_id IS NOT NULL
+                      AND a.status IN ('confirmed', 'auto_high', 'candidate')
+                      AND pe.role != 'ignore'
+                )
+                SELECT
+                    f.face_id, f.photo_id, f.face_idx, f.det_score,
+                    f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left,
+                    f.is_manual,
+                    bfa.person_id, bfa.status, bfa.similarity, bfa.display_name AS person_name
+                FROM faces f
+                JOIN album_photos ap ON ap.photo_id = f.photo_id
+                LEFT JOIN best_face_assign bfa ON bfa.face_id = f.face_id AND bfa.rn = 1
+                ORDER BY f.photo_id ASC, f.bbox_left ASC
+                """,
+                (archive_child, album_leaf),
+            ).fetchall()
+
+        faces_by_photo: dict[int, list[dict[str, Any]]] = {}
+        person_counts: dict[int, dict[str, Any]] = {}
+        confirmed_count = 0
+        auto_count = 0
+        candidate_count = 0
+
+        for fr in faces_rows:
+            fid = int(fr["face_id"])
+            ph_id = int(fr["photo_id"])
+            pid = fr["person_id"]
+            pname = fr["person_name"]
+            st = fr["status"]
+            sim = float(fr["similarity"]) if fr["similarity"] is not None else None
+
+            face_obj = {
+                "face_id": fid,
+                "photo_id": ph_id,
+                "face_idx": int(fr["face_idx"]),
+                "det_score": float(fr["det_score"] or 0.0),
+                "bbox_top": int(fr["bbox_top"]),
+                "bbox_right": int(fr["bbox_right"]),
+                "bbox_bottom": int(fr["bbox_bottom"]),
+                "bbox_left": int(fr["bbox_left"]),
+                "is_manual": bool(fr["is_manual"]),
+                "person_id": int(pid) if pid is not None else None,
+                "person_name": str(pname) if pname is not None else None,
+                "status": str(st) if st is not None else None,
+                "similarity": sim,
+            }
+            faces_by_photo.setdefault(ph_id, []).append(face_obj)
+
+            if st == "confirmed":
+                confirmed_count += 1
+            elif st == "auto_high":
+                auto_count += 1
+            elif st == "candidate":
+                candidate_count += 1
+
+            if pid is not None and pname is not None:
+                pid_int = int(pid)
+                if pid_int not in person_counts:
+                    person_counts[pid_int] = {
+                        "person_id": pid_int,
+                        "display_name": str(pname),
+                        "total_count": 0,
+                        "confirmed_count": 0,
+                        "auto_count": 0,
+                        "candidate_count": 0,
+                    }
+                entry = person_counts[pid_int]
+                entry["total_count"] += 1
+                if st == "confirmed":
+                    entry["confirmed_count"] += 1
+                elif st == "auto_high":
+                    entry["auto_count"] += 1
+                elif st == "candidate":
+                    entry["candidate_count"] += 1
+
+        total_faces = len(faces_rows)
+        unassigned_count = max(0, total_faces - confirmed_count - auto_count - candidate_count)
+
+        photos = []
+        for pr in photos_rows:
+            ph_id = int(pr["photo_id"])
+            photos.append(
+                {
+                    "photo_id": ph_id,
+                    "rel_path": str(pr["rel_path"]),
+                    "filename": str(pr["filename"]),
+                    "seq_in_album": int(pr["seq_in_album"] or 0),
+                    "album_date": str(pr["album_date"] or ""),
+                    "width": int(pr["width"] or 0),
+                    "height": int(pr["height"] or 0),
+                    "face_count": int(pr["face_count"] or 0),
+                    "best_live_url": str(pr["best_live_url"] or "") or None,
+                    "download_url": str(pr["download_url"] or "") or None,
+                    "faces": faces_by_photo.get(ph_id, []),
+                }
+            )
+
+        sorted_people = sorted(
+            person_counts.values(),
+            key=lambda x: (x["total_count"], x["confirmed_count"]),
+            reverse=True,
+        )
+
+        return {
+            "album_key": f"{archive_child}/{album_leaf}",
+            "archive_child": archive_child,
+            "album_leaf": album_leaf,
+            "album_title": str(meta_row["album_title"] or album_leaf),
+            "year": str(meta_row["year"]),
+            "month": str(meta_row["month"] or ""),
+            "album_date": str(meta_row["min_date"] or ""),
+            "photo_count": len(photos),
+            "face_count": total_faces,
+            "confirmed_count": confirmed_count,
+            "auto_count": auto_count,
+            "candidate_count": candidate_count,
+            "unassigned_count": unassigned_count,
+            "people": sorted_people,
+            "photos": photos,
+        }
+
+    def approve_album_matches(
+        self,
+        archive_child: str,
+        album_leaf: str,
+        *,
+        person_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Approve all model-matched ('auto_high') faces in an album, claiming them as confirmed."""
+        now = _now_iso()
+        with self._lock:
+            q = """
+                SELECT a.photo_id, a.face_id, a.person_id
+                FROM assignments a
+                JOIN photos p ON p.photo_id = a.photo_id
+                WHERE p.archive_child = ? AND p.album_leaf = ?
+                  AND a.status = 'auto_high'
+                  AND a.face_id IS NOT NULL
+                  AND (? IS NULL OR a.person_id = ?)
+            """
+            rows = self._conn.execute(q, (archive_child, album_leaf, person_id, person_id)).fetchall()
+            approved_count = 0
+            for r in rows:
+                res = self._claim_face_locked(
+                    int(r["face_id"]),
+                    int(r["person_id"]),
+                    source="batch_approve",
+                    now=now,
+                    explicit=False,
+                    photo_id=int(r["photo_id"]),
+                )
+                if res["claimed"]:
+                    approved_count += 1
+            if approved_count > 0:
+                self._conn.commit()
+        return {
+            "approved_count": approved_count,
+            "archive_child": archive_child,
+            "album_leaf": album_leaf,
+        }
