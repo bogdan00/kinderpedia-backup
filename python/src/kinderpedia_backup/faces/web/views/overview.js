@@ -19,7 +19,14 @@ export function renderOverview() {
   if (!ov) return;
   el("coverageText").textContent = `${ov.coverage_pct}%`;
   el("coverageFill").style.width = `${Math.min(100, ov.coverage_pct)}%`;
-  el("coverageSub").textContent = `${ov.faces_categorized.toLocaleString()} / ${ov.faces_total.toLocaleString()} faces across ${ov.photos_total.toLocaleString()} photos`;
+  const known = ov.faces_known != null ? ov.faces_known : ov.faces_categorized;
+  const ignored = ov.faces_ignored != null ? ov.faces_ignored : 0;
+  const subDetail = ignored > 0 ? ` (${known.toLocaleString()} tagged · ${ignored.toLocaleString()} ignored)` : "";
+  el("coverageSub").textContent = `${ov.faces_categorized.toLocaleString()} / ${ov.faces_total.toLocaleString()} faces triaged${subDetail}`;
+  const meterEl = el("coverageMeter");
+  if (meterEl) {
+    meterEl.title = `Triage progress: ${ov.faces_categorized.toLocaleString()} of ${ov.faces_total.toLocaleString()} faces settled (${known.toLocaleString()} confirmed/auto-tagged, ${ignored.toLocaleString()} ignored) across ${ov.photos_total.toLocaleString()} photos`;
+  }
   el("unassignedBadge").textContent = String(ov.unassigned_clusters);
   const classesBadge = el("classesBadge");
   if (classesBadge) classesBadge.textContent = String((ov.classes || []).length);

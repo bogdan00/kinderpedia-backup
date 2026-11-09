@@ -298,12 +298,14 @@ class QueriesUIMixin(ClustersMixin):
                 }
                 self._photo_summary_cache = photo_summary
 
-            cat_faces = self._conn.execute(
+            counts_row = self._conn.execute(
                 """
-                SELECT COALESCE(SUM(c.categorized_face_count), 0) AS n
+                SELECT
+                    COALESCE(SUM(c.categorized_face_count), 0) AS total_triaged,
+                    COALESCE(SUM(CASE WHEN pe.role != 'ignore' THEN c.categorized_face_count ELSE 0 END), 0) AS known,
+                    COALESCE(SUM(CASE WHEN pe.role = 'ignore' THEN c.categorized_face_count ELSE 0 END), 0) AS ignored
                 FROM person_assignment_counts c
                 JOIN people pe ON pe.person_id = c.person_id
-                WHERE pe.role != 'ignore'
                 """
             ).fetchone()
             unassigned_clusters = self._conn.execute(
@@ -319,12 +321,16 @@ class QueriesUIMixin(ClustersMixin):
 
         photos_total = int(photo_summary["photos_total"])
         faces_total = int(photo_summary["faces_total"])
-        faces_categorized = int(cat_faces["n"]) if cat_faces else 0
+        faces_triaged = int(counts_row["total_triaged"]) if counts_row else 0
+        faces_known = int(counts_row["known"]) if counts_row else 0
+        faces_ignored = int(counts_row["ignored"]) if counts_row else 0
         return {
             "photos_total": photos_total,
             "faces_total": faces_total,
-            "faces_categorized": faces_categorized,
-            "coverage_pct": round((100.0 * faces_categorized / faces_total), 1) if faces_total > 0 else 0.0,
+            "faces_categorized": faces_triaged,
+            "faces_known": faces_known,
+            "faces_ignored": faces_ignored,
+            "coverage_pct": round((100.0 * faces_triaged / faces_total), 1) if faces_total > 0 else 0.0,
             "years": list(photo_summary["years"]),
             "archive_children": list(photo_summary["archive_children"]),
             "unassigned_clusters": int(unassigned_clusters["n"]) if unassigned_clusters else 0,
