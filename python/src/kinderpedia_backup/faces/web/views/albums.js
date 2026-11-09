@@ -1,6 +1,6 @@
 // Mode 5: Album Browser — navigate chronological albums, spot-check matches photo-by-photo,
 // filter photos within an album by child, and approve album matches in bulk.
-import { api, post } from "../api.js";
+import { api, post, startBackgroundJob } from "../api.js";
 import { openPhotoModal } from "../components/lightbox.js";
 import { showToast } from "../components/toasts.js";
 import { state, subscribe } from "../state.js";
@@ -433,6 +433,173 @@ export function bindAlbumsEvents() {
     openPhotoModal(photoId, faceId, true);
   });
 
+let albumVlmPoller = null;
+let batchVlmPoller = null;
+
+function renderLogsList(containerEl, logs) {
+  if (!containerEl) return;
+  const list = Array.isArray(logs) ? logs : [];
+  if (!list.length) {
+    containerEl.innerHTML = "";
+    return;
+  }
+  containerEl.innerHTML = list
+    .map((l, idx) => {
+      const isLatest = idx === list.length - 1;
+      const t = l && l.time ? new Date(l.time * 1000).toLocaleTimeString() : "";
+      const msg = typeof l === "string" ? l : (l && l.message ? l.message : "");
+      return `<div class="vlm-log-entry ${isLatest ? "latest" : ""}"><span class="vlm-log-time">${t}</span><span>${msg}</span></div>`;
+    })
+    .join("");
+  containerEl.scrollTop = containerEl.scrollHeight;
+}
+
+function pollAlbumVlmJob(jobId, albumKey, albumTitle) {
+  if (albumVlmPoller) clearInterval(albumVlmPoller);
+
+  const panel = el("albumVlmActivity");
+  const msgEl = el("albumVlmMsg");
+  const fillEl = el("albumVlmProgressFill");
+  const elapsedEl = el("albumVlmElapsed");
+  const logsEl = el("albumVlmLogs");
+
+  if (panel) {
+    panel.hidden = false;
+    panel.classList.remove("is-done", "is-error");
+    if (msgEl) msgEl.textContent = "Starting VLM clothing & gender check…";
+    if (fillEl) fillEl.style.width = "5%";
+    if (elapsedEl) elapsedEl.textContent = "0s";
+    if (logsEl) logsEl.innerHTML = "";
+  }
+
+  const t0 = Date.now();
+
+  albumVlmPoller = setInterval(async () => {
+    try {
+      const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (elapsedEl) elapsedEl.textContent = `${secs}s`;
+
+      if (!job) return;
+
+      if (msgEl && job.message) msgEl.textContent = job.message;
+      if (fillEl && job.progress != null) {
+        fillEl.style.width = `${Math.round(job.progress * 100)}%`;
+      }
+      if (logsEl && Array.isArray(job.logs)) {
+        renderLogsList(logsEl, job.logs);
+      }
+
+      if (job.state === "done") {
+        clearInterval(albumVlmPoller);
+        albumVlmPoller = null;
+        if (panel) panel.classList.add("is-done");
+        if (fillEl) fillEl.style.width = "100%";
+        const res = job.result || {};
+        const verified = res.verified_count || 0;
+        const rejected = res.gender_rejected_count || 0;
+        const summary = `✓ Done in ${secs}s! ${plural(verified, "match")} verified, ${plural(rejected, "gender mismatch", "gender mismatches")} rejected.`;
+        if (msgEl) msgEl.textContent = summary;
+        showToast(summary, "info");
+
+        // Refresh current album detail
+        try {
+          const updated = await api(`/api/albums/detail?key=${encodeURIComponent(albumKey)}`);
+          state.currentAlbumDetail = updated;
+          renderAlbumDetail();
+        } catch (_e) {}
+      } else if (job.state === "error") {
+        clearInterval(albumVlmPoller);
+        albumVlmPoller = null;
+        if (panel) panel.classList.add("is-error");
+        if (msgEl) msgEl.textContent = `⚠ VLM analysis failed: ${job.error || "Unknown error"}`;
+        showToast(`VLM analysis failed: ${job.error || "Unknown error"}`, "error");
+      }
+    } catch (_e) {}
+  }, 900);
+}
+
+function pollBatchVlmJob(jobId) {
+  if (batchVlmPoller) clearInterval(batchVlmPoller);
+
+  const panel = el("batchVlmActivity");
+  const msgEl = el("batchVlmMsg");
+  const fillEl = el("batchVlmProgressFill");
+  const elapsedEl = el("batchVlmElapsed");
+  const logsEl = el("batchVlmLogs");
+
+  if (panel) {
+    panel.hidden = false;
+    panel.classList.remove("is-done", "is-error");
+    if (msgEl) msgEl.textContent = "Starting Batch VLM Assistant across albums…";
+    if (fillEl) fillEl.style.width = "3%";
+    if (elapsedEl) elapsedEl.textContent = "0s";
+    if (logsEl) logsEl.innerHTML = "";
+  }
+
+  const t0 = Date.now();
+
+  batchVlmPoller = setInterval(async () => {
+    try {
+      const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      if (elapsedEl) elapsedEl.textContent = `${secs}s`;
+
+      if (!job) return;
+
+      if (msgEl && job.message) msgEl.textContent = job.message;
+      if (fillEl && job.progress != null) {
+        fillEl.style.width = `${Math.round(job.progress * 100)}%`;
+      }
+      if (logsEl && Array.isArray(job.logs)) {
+        renderLogsList(logsEl, job.logs);
+      }
+
+      if (job.state === "done") {
+        clearInterval(batchVlmPoller);
+        batchVlmPoller = null;
+        if (panel) panel.classList.add("is-done");
+        if (fillEl) fillEl.style.width = "100%";
+        const res = job.result || {};
+        const albs = res.albums_processed || 0;
+        const verified = res.total_verified || 0;
+        const rejected = res.total_gender_rejected || 0;
+        const summary = `✓ Batch Assistant complete in ${secs}s! Processed ${plural(albs, "album")}: ${plural(verified, "candidate")} verified, ${plural(rejected, "gender mismatch", "gender mismatches")} rejected.`;
+        if (msgEl) msgEl.textContent = summary;
+        showToast(summary, "info");
+
+        // Refresh albums listing
+        loadAlbums();
+      } else if (job.state === "error") {
+        clearInterval(batchVlmPoller);
+        batchVlmPoller = null;
+        if (panel) panel.classList.add("is-error");
+        if (msgEl) msgEl.textContent = `⚠ Batch VLM failed: ${job.error || "Unknown error"}`;
+        showToast(`Batch VLM failed: ${job.error || "Unknown error"}`, "error");
+      }
+    } catch (_e) {}
+  }, 1200);
+}
+
+  // Dismiss buttons for VLM activity panels
+  on("btnDismissAlbumVlmActivity", "click", () => {
+    const p = el("albumVlmActivity");
+    if (p) p.hidden = true;
+    if (albumVlmPoller) {
+      clearInterval(albumVlmPoller);
+      albumVlmPoller = null;
+    }
+  });
+
+  on("btnDismissBatchVlmActivity", "click", () => {
+    const p = el("batchVlmActivity");
+    if (p) p.hidden = true;
+    if (batchVlmPoller) {
+      clearInterval(batchVlmPoller);
+      batchVlmPoller = null;
+    }
+  });
+
   // Run VLM clothing and gender check on current album
   on("btnVlmAnalyzeAlbum", "click", (ev, btn) => {
     const detail = state.currentAlbumDetail;
@@ -441,18 +608,13 @@ export function bindAlbumsEvents() {
     runBusy(
       btn,
       async () => {
-        const res = await post("/api/vlm/analyze-album", { album_key: detail.album_key });
-        showToast(`✨ VLM check running in background for "${detail.album_title}"…`);
-        if (res && res.job_id) {
-          // Poll briefly or let SSE job_complete update
-          await api(`/api/jobs/${res.job_id}`);
+        const { job } = await startBackgroundJob("/api/vlm/analyze-album", { album_key: detail.album_key });
+        showToast(`✨ VLM analysis started for "${detail.album_title}"…`);
+        if (job && job.job_id) {
+          pollAlbumVlmJob(job.job_id, detail.album_key, detail.album_title);
         }
-        const updated = await api(`/api/albums/detail?key=${encodeURIComponent(detail.album_key)}`);
-        state.currentAlbumDetail = updated;
-        renderAlbumDetail();
-        showToast(`✓ VLM analysis complete for "${detail.album_title}"!`);
       },
-      { busyText: "Checking VLM…", context: "Run VLM Album Analysis" }
+      { busyText: "Starting VLM…", context: "Run VLM Album Analysis" }
     );
   });
 
@@ -461,9 +623,12 @@ export function bindAlbumsEvents() {
     runBusy(
       btn,
       async () => {
-        const child = state.albumFilters.child || "";
-        await post("/api/vlm/batch-analyze", { archive_child: child, limit: 30 });
-        showToast("✨ Batch VLM assistant started in background! Check top progress bar.");
+        const child = state.albumFilterChild || "";
+        const { job } = await startBackgroundJob("/api/vlm/batch-analyze", { archive_child: child, limit: 30 });
+        showToast("✨ Batch VLM assistant started! Live progress shown below.");
+        if (job && job.job_id) {
+          pollBatchVlmJob(job.job_id);
+        }
       },
       { busyText: "Starting…", context: "Start Batch VLM Assistant" }
     );

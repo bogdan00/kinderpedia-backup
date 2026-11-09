@@ -67,6 +67,8 @@ _FINISHED_JOBS_KEEP = 20
 _JOB_LABELS = {
     "recluster": "Rebuilding clusters & re-matching…",
     "materialize": "Syncing ByChild/ folders…",
+    "vlm_album": "VLM clothing continuity check…",
+    "vlm_batch": "Batch VLM assistant across albums…",
 }
 
 
@@ -379,7 +381,13 @@ class _AppContext:
     # Background jobs (recluster / materialize): 202 + job id, SSE `job_status` / `job_complete`
     # ------------------------------------------------------------------
 
-    def start_job(self, kind: str, fn: Callable[[], dict[str, Any]], *, label: str | None = None) -> dict[str, Any]:
+    def start_job(
+        self,
+        kind: str,
+        fn: Callable[..., dict[str, Any]],
+        *,
+        label: str | None = None,
+    ) -> dict[str, Any]:
         """Run `fn` on a dedicated thread; raise `JobConflictError` if a `kind` job is already running."""
         eff_label = label or _JOB_LABELS.get(kind, kind)
         with self._bg_cond:
@@ -395,6 +403,9 @@ class _AppContext:
                 "kind": kind,
                 "label": eff_label,
                 "state": "running",
+                "message": eff_label,
+                "progress": 0.0,
+                "logs": [{"time": time.time(), "message": eff_label}],
                 "started_at": time.time(),
                 "finished_at": None,
                 "elapsed_ms": None,
@@ -417,11 +428,43 @@ class _AppContext:
         self._emit_status()
         return public
 
-    def _run_job(self, job_id: str, fn: Callable[[], dict[str, Any]]) -> None:
+    def update_job_progress(
+        self,
+        job_id: str,
+        message: str,
+        *,
+        progress: float | None = None,
+        step: int | None = None,
+        total_steps: int | None = None,
+    ) -> None:
+        """Update live progress and step logs for a running background job, broadcasting via SSE."""
+        with self._bg_cond:
+            info = self._jobs.get(job_id)
+            if info is None or info.get("state") != "running":
+                return
+            info["message"] = message
+            if progress is not None:
+                info["progress"] = min(1.0, max(0.0, round(float(progress), 3)))
+            if step is not None:
+                info["step"] = step
+            if total_steps is not None:
+                info["total_steps"] = total_steps
+            logs = info.setdefault("logs", [])
+            logs.append({"time": time.time(), "message": message})
+            if len(logs) > 60:
+                del logs[: len(logs) - 60]
+            public = self._job_public_locked(info, with_result=False)
+        self.broadcast_sse("job_status", public)
+        self._emit_status()
+
+    def _run_job(self, job_id: str, fn: Callable[..., dict[str, Any]]) -> None:
+        import inspect
+
         result: dict[str, Any] | None = None
         error = ""
         try:
-            result = fn()
+            sig = inspect.signature(fn)
+            result = fn(job_id) if len(sig.parameters) > 0 else fn()
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             if _is_db_locked_error(exc):
@@ -434,6 +477,15 @@ class _AppContext:
             info["state"] = "error" if error else "done"
             info["error"] = error
             info["result"] = result
+            info["progress"] = 1.0 if not error else info.get("progress", 0.0)
+            if error:
+                info["message"] = f"Failed: {error}"
+            elif result and isinstance(result, dict) and "message" in result:
+                info["message"] = str(result["message"])
+            else:
+                info["message"] = "Completed successfully."
+            logs = info.setdefault("logs", [])
+            logs.append({"time": time.time(), "message": info["message"]})
             info["finished_at"] = time.time()
             info["elapsed_ms"] = round((time.monotonic() - float(info["_t0"])) * 1000.0, 1)
             if self._active_jobs.get(str(info["kind"])) == job_id:
@@ -473,9 +525,15 @@ class _AppContext:
         archive_child: str,
         album_leaf: str,
         *,
+        job_id: str | None = None,
         person_id: int | None = None,
     ) -> dict[str, Any]:
         """Job body for `/api/vlm/analyze-album`: verify clothing continuity and genders."""
+        def on_prog(msg: str, p: float | None = None) -> None:
+            if job_id:
+                self.update_job_progress(job_id, msg, progress=p)
+
+        on_prog("Starting clothing & gender verification…", 0.05)
         res = analyze_album_continuity(
             self.db,
             self.vlm,
@@ -483,6 +541,7 @@ class _AppContext:
             album_leaf,
             self.backup_root,
             target_person_id=person_id,
+            on_progress=on_prog,
         )
         if res.get("verified_count", 0) > 0 or res.get("gender_rejected_count", 0) > 0:
             self.note_data_changed()
@@ -492,28 +551,58 @@ class _AppContext:
     def run_vlm_batch_job(
         self,
         *,
+        job_id: str | None = None,
         archive_child: str | None = None,
         limit: int = 40,
     ) -> dict[str, Any]:
         """Job body for `/api/vlm/batch-analyze`: run VLM assistant across albums with open candidates."""
+        def on_prog(msg: str, p: float | None = None) -> None:
+            if job_id:
+                self.update_job_progress(job_id, msg, progress=p)
+
+        on_prog("Querying albums with candidate faces…", 0.02)
         albums_res = self.db.list_albums(archive_child=archive_child, limit=limit)
-        albums_list = albums_res.get("albums", [])
+        albums_list = [a for a in albums_res.get("albums", []) if a.get("candidate_count", 0) > 0]
+        total_albs = len(albums_list)
+        if not total_albs:
+            msg = "No albums with candidate faces found."
+            on_prog(msg, 1.0)
+            return {
+                "albums_processed": 0,
+                "total_verified": 0,
+                "total_gender_rejected": 0,
+                "results": [],
+                "message": msg,
+            }
+
         results = []
         total_verified = 0
         total_rejected = 0
-        for alb in albums_list:
-            if alb.get("candidate_count", 0) == 0:
-                continue
+        for i, alb in enumerate(albums_list):
+            title = alb.get("album_title") or alb.get("album_leaf")
+            base_p = i / total_albs
+            step_slice = 1.0 / total_albs
+            on_prog(f"[{i + 1}/{total_albs}] '{title}' ({alb.get('candidate_count')} candidates)…", base_p)
+            def _make_progress_cb(alb_idx: int, b_p: float, s_s: float) -> Callable[[str, float | None], None]:
+                def _cb(m: str, p: float | None = None) -> None:
+                    on_prog(f"[{alb_idx + 1}/{total_albs}] {m}", b_p + (p or 0.5) * s_s * 0.9)
+
+                return _cb
+
             r = analyze_album_continuity(
                 self.db,
                 self.vlm,
                 str(alb["archive_child"]),
                 str(alb["album_leaf"]),
                 self.backup_root,
+                on_progress=_make_progress_cb(i, base_p, step_slice),
             )
             results.append(r)
             total_verified += int(r.get("verified_count", 0))
             total_rejected += int(r.get("gender_rejected_count", 0))
+
+        summary = f"Batch complete: processed {len(results)} albums, verified {total_verified} faces, rejected {total_rejected} gender mismatches."
+        on_prog(summary, 1.0)
         if total_verified > 0 or total_rejected > 0:
             self.note_data_changed()
             self.schedule_rematch(delay=0.1)
@@ -522,6 +611,7 @@ class _AppContext:
             "total_verified": total_verified,
             "total_gender_rejected": total_rejected,
             "results": results,
+            "message": summary,
         }
 
     def run_recluster_job(self) -> dict[str, Any]:
@@ -1666,7 +1756,7 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             vlm_pid: int | None = int(pid_raw) if pid_raw is not None and str(pid_raw).isdigit() else None
             job_info = self.ctx.start_job(
                 "vlm_album",
-                lambda: self.ctx.run_vlm_album_job(parts[0], parts[1], person_id=vlm_pid),
+                lambda jid: self.ctx.run_vlm_album_job(parts[0], parts[1], job_id=jid, person_id=vlm_pid),
                 label=f"VLM clothing check for {key}",
             )
             self._send_json(job_info)
@@ -1677,7 +1767,7 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             lim = int(body.get("limit") or 30)
             job_info = self.ctx.start_job(
                 "vlm_batch",
-                lambda: self.ctx.run_vlm_batch_job(archive_child=arch_child, limit=lim),
+                lambda jid: self.ctx.run_vlm_batch_job(job_id=jid, archive_child=arch_child, limit=lim),
                 label=f"Batch VLM assistant ({lim} albums)",
             )
             self._send_json(job_info)

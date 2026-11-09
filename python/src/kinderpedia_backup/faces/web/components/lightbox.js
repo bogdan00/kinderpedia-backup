@@ -133,6 +133,31 @@ function unsureTargetFor(f, selP) {
   return null;
 }
 
+const vlmInspectionCache = new Map();
+
+function vlmInspectionHtml(fid) {
+  const sig = vlmInspectionCache.get(fid);
+  if (!sig) return "";
+  if (sig.loading) {
+    return html`<div class="modal-vlm-inspection-card loading"><span class="vlm-activity-spinner">⚡</span> Analyzing face, gender & outfit with VLM…</div>`;
+  }
+  if (sig.error) {
+    return html`<div class="modal-vlm-inspection-card error"><span>⚠ ${sig.error}</span></div>`;
+  }
+  const gender = sig.apparent_gender || "unknown";
+  return html`
+    <div class="modal-vlm-inspection-card">
+      <div class="vlm-card-top">
+        <span class="vlm-pill gender-${gender}">${gender}</span>
+        <span class="vlm-confidence">✓ verified</span>
+      </div>
+      <div class="vlm-card-summary"><strong>👕 Outfit:</strong> ${sig.clothing_summary}</div>
+      ${sig.distinctive_features ? html`<div class="vlm-card-sub"><strong>🔍 Details:</strong> ${sig.distinctive_features}</div>` : ""}
+      ${sig.top_color ? html`<div class="vlm-card-sub"><strong>Colors:</strong> ${sig.top_color}${sig.bottom_color ? ` / ${sig.bottom_color}` : ""}</div>` : ""}
+    </div>
+  `;
+}
+
 function sideFaceHtml(f, selP) {
   const hasTag = f.person_id != null;
   const unsure = unsureTargetFor(f, selP);
@@ -152,6 +177,9 @@ function sideFaceHtml(f, selP) {
           html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Remove Tag</button>`}
           ${unsure &&
           html`<button type="button" class="btn btn-ghost btn-sm btn-modal-unsure ${hasTag ? "btn-modal-unsure-compact" : ""}" data-fid="${f.face_id}" data-pid="${unsure.person_id}" title="Mark as I'm not sure for ${unsure.display_name}">${hasTag ? "?" : "? Not sure"}</button>`}
+        </div>
+        <div class="vlm-inspect-slot" data-vlm-slot="${f.face_id}">
+          ${vlmInspectionHtml(f.face_id)}
         </div>
       </div>
     </form>`;
@@ -304,21 +332,36 @@ export function bindLightbox() {
     const face = modalFace(fid);
     const photo = state.modalPhoto;
     if (!photo || !face) return;
+
+    const slot = list.querySelector(`.vlm-inspect-slot[data-vlm-slot="${fid}"]`);
+    vlmInspectionCache.set(fid, { loading: true });
+    if (slot) setHtml(slot, vlmInspectionHtml(fid));
+
     runBusy(
       btn,
       async () => {
-        const box = [face.bbox_left, face.bbox_top, face.bbox_right, face.bbox_bottom];
-        const res = await post("/api/vlm/inspect-face", {
-          photo_id: photo.photo_id,
-          face_id: fid,
-          box,
-          person_name: face.person_name || "",
-        });
-        if (res && res.signature) {
-          const s = res.signature;
-          showToast(`✨ VLM: ${s.apparent_gender} wearing ${s.clothing_summary}`);
-        } else {
-          showToast("✨ VLM: could not extract clothing signature.");
+        try {
+          const box = [face.bbox_left, face.bbox_top, face.bbox_right, face.bbox_bottom];
+          const res = await post("/api/vlm/inspect-face", {
+            photo_id: photo.photo_id,
+            face_id: fid,
+            box,
+            person_name: face.person_name || "",
+          });
+          if (res && res.signature) {
+            vlmInspectionCache.set(fid, res.signature);
+            if (slot) setHtml(slot, vlmInspectionHtml(fid));
+            showToast(`✨ VLM: ${res.signature.apparent_gender} wearing ${res.signature.clothing_summary}`);
+          } else {
+            vlmInspectionCache.set(fid, { error: "Could not extract clothing signature." });
+            if (slot) setHtml(slot, vlmInspectionHtml(fid));
+            showToast("✨ VLM: could not extract clothing signature.");
+          }
+        } catch (err) {
+          const errMsg = err && err.message ? err.message : "VLM inspection failed";
+          vlmInspectionCache.set(fid, { error: errMsg });
+          if (slot) setHtml(slot, vlmInspectionHtml(fid));
+          showToast(`⚠ VLM: ${errMsg}`, "error");
         }
       },
       { busyText: "…", context: "Inspect Face with VLM" }

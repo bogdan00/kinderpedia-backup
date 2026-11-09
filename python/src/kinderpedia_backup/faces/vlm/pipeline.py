@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ def analyze_album_continuity(
     backup_dir: Path,
     *,
     target_person_id: int | None = None,
+    on_progress: Callable[[str, float | None], None] | None = None,
 ) -> dict[str, Any]:
     """Execute clothing continuity & gender verification across an album.
 
@@ -28,21 +30,30 @@ def analyze_album_continuity(
     3. Prunes gender-conflicting labels and upgrades outfit-matched candidates.
     """
     if not vlm.is_available():
+        msg = "VLM provider is not available."
+        if on_progress:
+            on_progress(msg, 1.0)
         return {
             "ok": False,
-            "error": "VLM provider is not available.",
+            "error": msg,
             "album_key": f"{archive_child}/{album_leaf}",
         }
+
+    if on_progress:
+        on_progress(f"Reading album metadata for '{album_leaf}'...", 0.05)
 
     detail = db.get_album_detail(album_key=f"{archive_child}/{album_leaf}")
     photos = detail.get("photos", [])
     if not photos:
+        msg = "Album has no photos."
+        if on_progress:
+            on_progress(msg, 1.0)
         return {
             "ok": True,
             "album_key": f"{archive_child}/{album_leaf}",
             "verified_count": 0,
             "gender_rejected_count": 0,
-            "message": "Album has no photos.",
+            "message": msg,
         }
 
     # Map photo_id -> rel_path
@@ -82,17 +93,21 @@ def analyze_album_continuity(
     # Exclude ignore profiles
     target_pids = [pid for pid in target_pids if people_map.get(pid, {}).get("role") != "ignore"]
 
+    if on_progress:
+        on_progress(f"Found {len(photos)} photos, checking {len(target_pids)} confirmed child/children...", 0.15)
+
     verified_count = 0
     gender_rejected_count = 0
     signatures_recorded = 0
     results_detail: list[dict[str, Any]] = []
 
-    for pid in target_pids:
+    for i, pid in enumerate(target_pids):
         p_info = people_map.get(pid)
         if not p_info:
             continue
         pname = str(p_info["display_name"])
         target_gender = str(p_info.get("gender") or "unknown")
+        base_pct = 0.2 + (i / max(1, len(target_pids))) * 0.7
 
         # 1. Obtain clothing signature (cached or fresh)
         existing_apps = [a for a in detail.get("appearances", []) if a["person_id"] == pid]
@@ -107,11 +122,15 @@ def analyze_album_continuity(
                 distinctive_features=app.get("distinctive_features", ""),
                 apparent_gender=app.get("apparent_gender", "unknown"),
             )
+            if on_progress:
+                on_progress(f"Using known outfit for {pname}: {sig.clothing_summary}", base_pct)
         elif pid in confirmed_by_person:
             # Pick best sample confirmed face
             sample = confirmed_by_person[pid][0]
             img_path = backup_dir / sample["rel_path"]
             if img_path.is_file():
+                if on_progress:
+                    on_progress(f"Extracting outfit for {pname} from photo #{sample['photo_id']}...", base_pct)
                 sig = vlm.extract_clothing(
                     image_path=img_path,
                     face_box=sample["box"],
@@ -133,6 +152,8 @@ def analyze_album_continuity(
                         verified_count=1,
                     )
                     signatures_recorded += 1
+                    if on_progress:
+                        on_progress(f"Identified {pname} ({sig.apparent_gender}): {sig.clothing_summary}", base_pct + 0.1)
 
         if not sig:
             continue
@@ -140,6 +161,8 @@ def analyze_album_continuity(
         # 2. Check candidate faces for this person
         person_cands = candidates_by_person.get(pid, [])
         if not person_cands:
+            if on_progress:
+                on_progress(f"No candidate faces to verify for {pname} in this album.", base_pct + 0.2)
             continue
 
         cand_payload = [
@@ -152,6 +175,9 @@ def analyze_album_continuity(
             for c in person_cands
             if (backup_dir / c["rel_path"]).is_file()
         ]
+
+        if on_progress:
+            on_progress(f"Verifying {len(cand_payload)} candidate(s) for {pname} against outfit...", base_pct + 0.15)
 
         verifications = vlm.batch_verify_album_candidates(
             candidates=cand_payload,
@@ -195,6 +221,8 @@ def analyze_album_continuity(
                     source="reassigned",
                 )
                 gender_rejected_count += 1
+                if on_progress:
+                    on_progress(f"Face #{fid}: gender conflict rejected ({notes or 'wrong gender'})", base_pct + 0.25)
             elif is_match and conf >= 0.75 and target_photo_id is not None:
                 # Upgrade to confirmed / auto_high with album cohesion source
                 db.tag_single_face(
@@ -205,6 +233,14 @@ def analyze_album_continuity(
                     source="album_cohesion",
                 )
                 verified_count += 1
+                if on_progress:
+                    on_progress(f"Face #{fid}: outfit match confirmed ({round(conf * 100)}%) - {notes or 'clothing match'}", base_pct + 0.25)
+            elif on_progress:
+                on_progress(f"Face #{fid}: no match / inconclusive ({notes or 'outfit differs'})", base_pct + 0.25)
+
+    summary_msg = f"Finished album check: {verified_count} verified, {gender_rejected_count} rejected."
+    if on_progress:
+        on_progress(summary_msg, 1.0)
 
     return {
         "ok": True,

@@ -258,6 +258,23 @@
             </div>
           </div>
 
+          <!-- Batch VLM Activity Banner -->
+          <div class="vlm-activity-panel" id="batchVlmActivity" hidden>
+            <div class="vlm-activity-header">
+              <span class="vlm-activity-spinner">⚡</span>
+              <strong class="vlm-activity-title">Batch VLM Assistant</strong>
+              <span class="vlm-activity-elapsed" id="batchVlmElapsed"></span>
+              <button type="button" class="btn-close-vlm-activity" id="btnDismissBatchVlmActivity" title="Dismiss">×</button>
+            </div>
+            <div class="vlm-activity-body">
+              <div class="vlm-activity-msg" id="batchVlmMsg">Starting batch assistant across albums…</div>
+              <div class="vlm-activity-progress-bar">
+                <div class="vlm-activity-progress-fill" id="batchVlmProgressFill" style="width: 0%"></div>
+              </div>
+              <div class="vlm-activity-logs" id="batchVlmLogs"></div>
+            </div>
+          </div>
+
           <div class="albums-grid" id="albumsGrid"></div>
           <div class="empty-state" id="albumsEmptyState" hidden>No albums match the selected filters.</div>
         </div>
@@ -279,6 +296,23 @@
               <button type="button" class="btn btn-primary btn-sm" id="btnApproveAlbum" hidden>
                 ✓ Approve Auto Matches
               </button>
+            </div>
+          </div>
+
+          <!-- Single Album VLM Activity Banner -->
+          <div class="vlm-activity-panel" id="albumVlmActivity" hidden>
+            <div class="vlm-activity-header">
+              <span class="vlm-activity-spinner">⚡</span>
+              <strong class="vlm-activity-title">VLM Clothing & Gender Check</strong>
+              <span class="vlm-activity-elapsed" id="albumVlmElapsed"></span>
+              <button type="button" class="btn-close-vlm-activity" id="btnDismissAlbumVlmActivity" title="Dismiss">×</button>
+            </div>
+            <div class="vlm-activity-body">
+              <div class="vlm-activity-msg" id="albumVlmMsg">Analyzing album with VLM…</div>
+              <div class="vlm-activity-progress-bar">
+                <div class="vlm-activity-progress-fill" id="albumVlmProgressFill" style="width: 0%"></div>
+              </div>
+              <div class="vlm-activity-logs" id="albumVlmLogs"></div>
             </div>
           </div>
 
