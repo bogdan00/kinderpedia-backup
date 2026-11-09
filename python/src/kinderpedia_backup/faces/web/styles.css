@@ -918,7 +918,7 @@ kbd {
 
 .modal-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 310px;
+  grid-template-columns: minmax(0, 1fr) 340px;
   min-height: 0;
   flex: 1;
   overflow: hidden;
@@ -1142,16 +1142,22 @@ kbd {
 
 .modal-face-btn-row {
   display: flex;
-  gap: 5px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
 }
 
 .modal-face-btn-row .btn {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 6px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .modal-face-btn-row .btn.btn-modal-unsure-compact {
   flex: 0 0 auto;
-  padding: 5px 8px;
+  padding: 4px 7px;
 }
 
 /* Reassign Child Picker Dialog */

@@ -2,7 +2,7 @@
 // refresh after re-matches. Navigation (strip, prev/next, quick rows) lives in lightboxNav.js and manual
 // box drawing in manualBox.js. All face-label changes go through actions.js.
 import { markFaceUnsure, tagFace, untagFace } from "../actions.js";
-import { api, fetchQuietJson } from "../api.js";
+import { api, fetchQuietJson, post } from "../api.js";
 import { getSelectedPerson, state, subscribe } from "../state.js";
 import { runBusy } from "../util/busy.js";
 import { delegate, el, html, on, setHtml, siblingControls } from "../util/dom.js";
@@ -173,10 +173,10 @@ function sideFaceHtml(f, selP) {
         <div class="modal-face-status-row">${faceStatusHtml(f)}</div>
         <input type="text" class="modal-face-input" data-fid="${f.face_id}" list="knownPeopleDatalist" placeholder="Name this child…" value="${f.person_name || ""}" />
         <div class="modal-face-btn-row">
-          <button type="submit" class="btn btn-tonal btn-sm">Save Tag ✓</button>
+          <button type="submit" class="btn btn-tonal btn-sm">Save ✓</button>
           <button type="button" class="btn btn-ghost btn-sm btn-modal-vlm-inspect" data-fid="${f.face_id}" title="Ask VLM to inspect this face and its outfit">✨ VLM</button>
           ${(hasTag || f.is_manual) &&
-          html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Remove Tag</button>`}
+          html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Untag</button>`}
           ${unsure &&
           html`<button type="button" class="btn btn-ghost btn-sm btn-modal-unsure ${hasTag ? "btn-modal-unsure-compact" : ""}" data-fid="${f.face_id}" data-pid="${unsure.person_id}" title="Mark as I'm not sure for ${unsure.display_name}">${hasTag ? "?" : "? Not sure"}</button>`}
         </div>
