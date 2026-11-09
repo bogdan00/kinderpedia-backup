@@ -59,6 +59,8 @@ export async function openPhotoModal(photoId, highlightFaceId = null, keepNavCon
   const detail = await api(`/api/photos/${photoId}`);
   if (state.modalNavContext && state.modalNavContext.dedupe) markPhotoSeen(detail.photo_id);
   applyPhotoModalDetail(detail, highlightFaceId);
+  const { updateUrl } = await import("../router.js");
+  updateUrl();
 }
 
 export async function openClusterFaceModal(clusterId, faceId) {
@@ -232,6 +234,8 @@ export async function closePhotoModal() {
   state.modalPhoto = null;
   state.modalNavContext = null;
   state.modalDirty = false;
+  const { updateUrl } = await import("../router.js");
+  updateUrl();
   if (!wasDirty) return;
   try {
     if (state.mode === "gallery") await loadGallery();

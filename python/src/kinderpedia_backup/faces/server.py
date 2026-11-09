@@ -1100,7 +1100,8 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
-        if path in ("/", "/index.html"):
+        _SPA_ROUTES = {"/", "/index.html", "/batch", "/childclusters", "/clusters", "/gallery", "/albums"}
+        if path in _SPA_ROUTES or path.startswith("/albums/"):
             html = (_WEB_DIR / "index.html").read_text(encoding="utf-8")
             injected = html.replace("__KP_CSRF_TOKEN__", self.ctx.csrf_token)
             self._send_bytes(injected.encode("utf-8"), content_type="text/html; charset=utf-8")

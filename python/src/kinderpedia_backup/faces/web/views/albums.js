@@ -2,6 +2,7 @@
 // filter photos within an album by child, and approve album matches in bulk.
 import { api, post, startBackgroundJob } from "../api.js";
 import { openPhotoModal } from "../components/lightbox.js";
+import { updateUrl } from "../router.js";
 import { showToast } from "../components/toasts.js";
 import { state, subscribe } from "../state.js";
 import { runBusy } from "../util/busy.js";
@@ -13,6 +14,12 @@ let albumSearchTimer = null;
 // ---------------------------------------------------------------- album listing
 export async function loadAlbums(resetOffset = false) {
   if (resetOffset) state.albumsOffset = 0;
+  if (!state.selectedAlbumKey) {
+    const listV = el("albumListView");
+    const detailV = el("albumDetailView");
+    if (listV) listV.hidden = false;
+    if (detailV) detailV.hidden = true;
+  }
   const qs = new URLSearchParams();
   if (state.albumFilterChild) qs.set("child", state.albumFilterChild);
   if (state.albumFilterYear) qs.set("year", state.albumFilterYear);
@@ -153,6 +160,7 @@ export async function openAlbumByKey(albumKey) {
   state.albumPersonFilter = null;
   el("albumListView").hidden = true;
   el("albumDetailView").hidden = false;
+  updateUrl();
   setHtml(el("albumPhotosGrid"), html`<div class="empty-state">Loading album photos…</div>`);
 
   const detail = await api(`/api/albums/detail?key=${encodeURIComponent(albumKey)}`);
@@ -348,16 +356,23 @@ export function bindAlbumsEvents() {
     state.selectedAlbumKey = null;
     state.currentAlbumDetail = null;
     state.albumPersonFilter = null;
+    const listV = el("albumListView");
+    const detailV = el("albumDetailView");
+    if (listV) listV.hidden = false;
+    if (detailV) detailV.hidden = true;
+    updateUrl();
     loadAlbums();
   });
 
   on("albumChildFilter", "change", (ev) => {
     state.albumFilterChild = ev.target.value;
+    updateUrl({ replace: true });
     loadAlbums(true);
   });
 
   on("albumYearFilter", "change", (ev) => {
     state.albumFilterYear = ev.target.value;
+    updateUrl({ replace: true });
     loadAlbums(true);
   });
 
