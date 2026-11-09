@@ -649,7 +649,9 @@ class MaterializeTests(_ArchiveCase):
                 return real_link(*a, **kw)
 
             with mock.patch(f"{MATERIALIZE_MODULE}.link_or_copy_photo", probing_link):
-                st = db.materialize_flat_folders(backup_dir=self.backup, output_dir=out, link_mode="symlink")
+                st = db.materialize_flat_folders(
+                    backup_dir=self.backup, output_dir=out, link_mode="symlink", layout="flat"
+                )
             self.assertEqual(st.links_created, 2)
             self.assertTrue(lock_free and all(lock_free))
 
@@ -660,7 +662,9 @@ class MaterializeTests(_ArchiveCase):
             keep.write_bytes(b"user file")  # a plain copy we did not create: must survive
             (out / "Leo Old" / "link.jpg").symlink_to(self.album / "002_leo.jpg")
             db.update_person(leo, display_name="Leo Renamed")
-            st2 = db.materialize_flat_folders(backup_dir=self.backup, output_dir=out, link_mode="symlink")
+            st2 = db.materialize_flat_folders(
+                backup_dir=self.backup, output_dir=out, link_mode="symlink", layout="flat"
+            )
             self.assertEqual(st2.links_created, 2)
             self.assertFalse((out / "Leo").exists())  # orphan folder emptied (symlinks) and removed
             self.assertTrue(keep.is_file())
@@ -668,6 +672,47 @@ class MaterializeTests(_ArchiveCase):
             self.assertEqual(sorted(p.name for p in (out / "Leo Renamed").iterdir()), [
                 "2025-06-01 Trip_001_leo_maya.jpg", "2025-06-01 Trip_002_leo.jpg"
             ])
+
+    def test_split_layout_creates_curated_and_full_hierarchies(self) -> None:
+        self.scan(_ScanStub())
+        out = self.backup / "ByChildSplit"
+        with FacesIndexDB(self.db_path) as db:
+            leo = db.ensure_person("Leo")
+            for fn in ("001_leo_maya.jpg", "002_leo.jpg"):
+                ph, fid = self.face_of(db, fn, 0)
+                db.tag_single_face(photo_id=ph, face_id=fid, person_id=leo)
+
+            st = db.materialize_flat_folders(
+                backup_dir=self.backup, output_dir=out, link_mode="symlink", layout="split"
+            )
+            # 2 in curated + 2 in full
+            self.assertEqual(st.links_created, 4)
+            self.assertEqual(st.photos_matched, 2)
+
+            curated_dir = out / "Leo" / "curated" / "2025" / "06"
+            full_dir = out / "Leo" / "full" / "2025" / "06" / "2025-06-01 Trip"
+
+            self.assertTrue(curated_dir.is_dir())
+            self.assertTrue(full_dir.is_dir())
+
+            # Curated month folder has album-prefixed files
+            curated_files = sorted(p.name for p in curated_dir.iterdir() if not p.name.startswith("."))
+            self.assertEqual(curated_files, [
+                "2025-06-01 Trip_001_leo_maya.jpg", "2025-06-01 Trip_002_leo.jpg"
+            ])
+
+            # Full album folder has clean filenames
+            full_files = sorted(p.name for p in full_dir.iterdir() if not p.name.startswith("."))
+            self.assertEqual(full_files, ["001_leo_maya.jpg", "002_leo.jpg"])
+
+            # Test recursive pruning on rename
+            db.update_person(leo, display_name="Leo Moved")
+            st2 = db.materialize_flat_folders(
+                backup_dir=self.backup, output_dir=out, link_mode="symlink", layout="split"
+            )
+            self.assertEqual(st2.links_created, 4)
+            self.assertFalse((out / "Leo").exists())
+            self.assertTrue((out / "Leo Moved" / "curated" / "2025" / "06").is_dir())
 
 
 class PersonClustersCapTests(unittest.TestCase):

@@ -26,9 +26,10 @@ export function jobCompletionMessage(job, wasMine) {
   }
   if (job.kind === "materialize") {
     const where = r.person ? `ByChild/${r.person}/` : "ByChild/";
+    const ly = r.layout ? ` (${r.layout})` : "";
     return {
       kind: "info",
-      text: `Synced ${where}: ${r.links_created ?? 0} new links, ${r.links_existing ?? 0} existing, ${r.links_pruned ?? 0} pruned.`,
+      text: `Synced ${where}${ly}: ${r.links_created ?? 0} new links, ${r.links_existing ?? 0} existing, ${r.links_pruned ?? 0} pruned.`,
     };
   }
   return wasMine ? { kind: "info", text: `${job.label || job.kind} finished.` } : null;

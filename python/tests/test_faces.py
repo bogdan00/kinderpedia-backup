@@ -712,7 +712,7 @@ class FacesPipelineTests(unittest.TestCase):
                     # 5. Materialize flat ByChild/Leo/ and ByChild/Alex/ hardlinks:
                     r_mat = requests.post(
                         f"{base_url}/api/materialize",
-                        json={},
+                        json={"layout": "flat"},
                         headers={"X-KP-Token": "test-csrf-secret"},
                         timeout=5,
                     )
@@ -720,6 +720,20 @@ class FacesPipelineTests(unittest.TestCase):
                     self.assertEqual(_await_job_result(base_url, r_mat)["links_created"], 6)
                     self.assertEqual(len(list((out_dir / "Leo").iterdir())), 5)
                     self.assertEqual(len(list((out_dir / "Alex").iterdir())), 1)
+
+                    # 5b. Materialize split ByChild/ curated and full hierarchies:
+                    r_mat_split = requests.post(
+                        f"{base_url}/api/materialize",
+                        json={"layout": "split"},
+                        headers={"X-KP-Token": "test-csrf-secret"},
+                        timeout=5,
+                    )
+                    r_mat_split.raise_for_status()
+                    res_split = _await_job_result(base_url, r_mat_split)
+                    self.assertEqual(res_split["photos_matched"], 6)
+                    self.assertTrue((out_dir / "Leo" / "curated").is_dir())
+                    self.assertTrue((out_dir / "Leo" / "full").is_dir())
+                    self.assertEqual(len(list((out_dir / "Leo" / "full").rglob("*.jpg"))), 5)
 
                     # 6. Portable categorization_index.json written with provenance:
                     portable = json.loads(
@@ -1434,7 +1448,7 @@ class FacesPipelineTests(unittest.TestCase):
                     # 3. Hardlink export (ByChild/Maya/) automatically includes the manually tagged photo:
                     r_mat = requests.post(
                         f"{base_url}/api/materialize",
-                        json={"person": "Maya"},
+                        json={"person": "Maya", "layout": "flat"},
                         headers=headers,
                         timeout=5,
                     )

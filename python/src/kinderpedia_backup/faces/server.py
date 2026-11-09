@@ -643,7 +643,14 @@ class _AppContext:
         )
         return {"clusters_created": n_clusters, "auto_high": ah, "candidates": cand, "overview": ov}
 
-    def run_materialize_job(self, person_filter: str | None, include_candidates: bool) -> dict[str, Any]:
+    def run_materialize_job(
+        self,
+        person_filter: str | None,
+        include_candidates: bool,
+        layout: str = "split",
+        max_curated: int = 3,
+        min_face_px: int = 70,
+    ) -> dict[str, Any]:
         """Job body for `/api/materialize`: flush pending rematch, sync ByChild/, refresh the snapshot."""
         self.wait_for_rematch(timeout=15.0)
         stats = self.db.materialize_flat_folders(
@@ -653,6 +660,9 @@ class _AppContext:
             person_filter=person_filter,
             include_candidates=include_candidates,
             prune=True,
+            layout=layout,
+            max_curated_per_album=max_curated,
+            min_curated_face_px=min_face_px,
         )
         with self._rematch_lock:
             self.db.export_portable_index(self.portable_json)
@@ -661,6 +671,7 @@ class _AppContext:
         return {
             "output_dir": str(self.output_root),
             "person": person_filter or "",
+            "layout": layout,
             "profiles": stats.reference_profiles,
             "photos_matched": stats.photos_matched,
             "links_created": stats.links_created,
@@ -1972,10 +1983,25 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/materialize":
             person_f = str(body.get("person") or "").strip() or None
             inc_cand = bool(body.get("include_candidates", False))
-            label = f"Syncing ByChild/{person_f}/ folder…" if person_f else None
+            layout_val = str(body.get("layout") or "split").strip().lower()
+            if layout_val not in ("split", "curated", "full", "flat"):
+                layout_val = "split"
+            max_c = int(body.get("max_curated") or 3)
+            min_px = int(body.get("min_face_px") or 70)
+            label = (
+                f"Syncing ByChild/{person_f}/ ({layout_val})…"
+                if person_f
+                else f"Syncing ByChild/ folders ({layout_val})…"
+            )
+
+            def _mat_task(_jid: str = "") -> dict[str, Any]:
+                return self.ctx.run_materialize_job(
+                    person_f, inc_cand, layout=layout_val, max_curated=max_c, min_face_px=min_px
+                )
+
             job = self.ctx.start_job(
                 "materialize",
-                lambda: self.ctx.run_materialize_job(person_f, inc_cand),
+                _mat_task,
                 label=label,
             )
             self._send_json(job, status=HTTPStatus.ACCEPTED)

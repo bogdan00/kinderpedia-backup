@@ -174,6 +174,27 @@ def _add_faces_arguments(parser: argparse.ArgumentParser) -> None:
         help="Output format for `faces export-urls` (default: txt — one URL per line)",
     )
     parser.add_argument(
+        "--layout",
+        dest="export_layout",
+        choices=("split", "curated", "full", "flat"),
+        default="split",
+        help="Folder layout for `materialize`: 'split' (ByChild/<Child>/[curated|full]/year/month), 'curated', 'full', or 'flat' (legacy single folder). Default: split.",
+    )
+    parser.add_argument(
+        "--max-curated",
+        dest="max_curated",
+        type=int,
+        default=3,
+        help="Maximum number of photos per album in curated export (default: 3)",
+    )
+    parser.add_argument(
+        "--min-face-px",
+        dest="min_face_px",
+        type=int,
+        default=70,
+        help="Minimum face height in pixels for secondary photos in curated export (default: 70)",
+    )
+    parser.add_argument(
         "--include-candidates",
         action="store_true",
         help="Also include unreviewed inclusive candidate matches (`0.33 <= sim < 0.45`) in materialize / export-urls",
@@ -605,9 +626,12 @@ def run_faces(args: argparse.Namespace) -> int:
                 person_filter=args.person,
                 include_candidates=args.include_candidates,
                 prune=True,
+                layout=args.export_layout,
+                max_curated_per_album=args.max_curated,
+                min_curated_face_px=args.min_face_px,
             )
         log(
-            f"[Faces] Materialized {stats.reference_profiles} person folder(s) in {out_dir}: "
+            f"[Faces] Materialized {stats.reference_profiles} person folder(s) in {out_dir} (layout: {args.export_layout}): "
             f"photos={stats.photos_matched:,}, created={stats.links_created:,}, "
             f"existing={stats.links_skipped_existing:,}, pruned={stats.links_pruned:,}"
         )
