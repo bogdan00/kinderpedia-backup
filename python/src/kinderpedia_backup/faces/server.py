@@ -1836,12 +1836,17 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Photo not found."}, status=HTTPStatus.NOT_FOUND)
                 return
             img_path = self.ctx.backup_root / rel_p
+            log(f"[Faces UI] ✨ VLM inspecting clothing for {pname or 'child'} in photo #{ph_id}...")
             sig = self.ctx.vlm.extract_clothing(
                 image_path=img_path,
                 face_box=f_box,
                 person_name=pname or "Child",
                 target_gender=target_g,
             )
+            if sig:
+                log(f"[Faces UI] ✨ VLM outfit detected: {sig.clothing_summary}")
+            else:
+                log(f"[Faces UI] ⚠ VLM returned no clothing signature for photo #{ph_id}")
 
             saved_appearance = False
             prop_job: dict[str, Any] | None = None
