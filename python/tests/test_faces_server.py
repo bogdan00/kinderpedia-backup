@@ -330,6 +330,73 @@ class FacesServerTests(unittest.TestCase):
         self.assertEqual(b2.status_code, 200)
         self.assertFalse(reviewed & {c["face_id"] for c in b2.json()["cards"]})
 
+    def test_faces_ignore_endpoint(self) -> None:
+        leo = self.seed["leo"]
+        b = requests.get(f"{self.base}/api/batch", params={"person_id": leo, "size": 2}, timeout=5).json()
+        self.assertTrue(b["cards"])
+        card = b["cards"][0]
+        # Call POST /api/faces/ignore
+        r = requests.post(
+            f"{self.base}/api/faces/ignore",
+            json={
+                "photo_id": card["photo_id"],
+                "face_id": card["face_id"],
+                "from_person_id": leo,
+            },
+            headers=HDR,
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        self.assertIn("person_id", data)
+        self.assertIn("photo", data)
+        self.assertTrue(data["rematch_scheduled"])
+
+        # Verify photo detail shows Ignored
+        det = requests.get(f"{self.base}/api/photos/{card['photo_id']}", timeout=5).json()
+        matched = [f for f in det["faces"] if f["face_id"] == card["face_id"]]
+        self.assertTrue(matched)
+        self.assertEqual(matched[0]["person_role"], "ignore")
+        self.assertEqual(matched[0]["person_name"], "Ignored")
+
+        # Untag restores it
+        r_untag = requests.post(
+            f"{self.base}/api/faces/untag",
+            json={"photo_id": card["photo_id"], "face_id": card["face_id"]},
+            headers=HDR,
+            timeout=5,
+        )
+        r_untag.raise_for_status()
+        data_untag = r_untag.json()
+        self.assertIn("removed_person_ids", data_untag)
+
+    def test_batch_submit_with_ignored(self) -> None:
+        leo = self.seed["leo"]
+        b1 = requests.get(f"{self.base}/api/batch", params={"person_id": leo, "size": 4}, timeout=5).json()
+        self.assertTrue(b1["cards"])
+        first = b1["cards"][0]
+        r = requests.post(
+            f"{self.base}/api/batch/submit",
+            json={
+                "person_id": leo,
+                "batch_size": 4,
+                "approved": [],
+                "disproved": [],
+                "ignored": [{"photo_id": first["photo_id"], "face_id": first["face_id"]}],
+            },
+            headers=HDR,
+            timeout=10,
+        )
+        r.raise_for_status()
+        res = r.json()
+        self.assertEqual(res["applied"]["ignored"], 1)
+
+        det = requests.get(f"{self.base}/api/photos/{first['photo_id']}", timeout=5).json()
+        matched = [f for f in det["faces"] if f["face_id"] == first["face_id"]]
+        self.assertTrue(matched)
+        self.assertEqual(matched[0]["person_role"], "ignore")
+        self.assertEqual(matched[0]["person_name"], "Ignored")
+
     # ------------------------------------------------------------------ C6
     def test_error_mapping(self) -> None:
         with mock.patch.object(

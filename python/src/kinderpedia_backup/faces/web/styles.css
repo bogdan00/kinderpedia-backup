@@ -597,6 +597,11 @@ kbd {
   background: var(--warn-soft);
 }
 
+.face-card.is-ignored {
+  border-color: var(--line-strong);
+  background: var(--bg-rail);
+}
+
 .face-thumb-wrap {
   position: relative;
   aspect-ratio: 1 / 1;
@@ -619,6 +624,11 @@ kbd {
 
 .face-card.state-unsure .face-thumb-wrap img {
   opacity: 0.78;
+}
+
+.face-card.is-ignored .face-thumb-wrap img {
+  opacity: 0.4;
+  filter: grayscale(0.8);
 }
 
 .decision-badge {
@@ -649,6 +659,11 @@ kbd {
 
 .state-unsure .decision-badge {
   background: var(--warn);
+  color: #fff;
+}
+
+.face-card.is-ignored .decision-badge {
+  background: var(--ink-secondary);
   color: #fff;
 }
 
@@ -691,6 +706,11 @@ kbd {
 .icon-btn.active-unsure {
   background: var(--warn);
   border-color: #fbbf24;
+}
+
+.icon-btn.active-ignore {
+  background: var(--ink-secondary);
+  border-color: var(--ink-muted);
 }
 
 .face-card-body {
@@ -1085,6 +1105,16 @@ kbd {
   background: #eff6ff;
 }
 
+.modal-face-row.is-ignored {
+  border-color: var(--line-strong);
+  background: var(--bg-rail);
+}
+
+.modal-face-row.is-ignored img {
+  opacity: 0.5;
+  filter: grayscale(0.7);
+}
+
 .modal-face-row img {
   width: 46px;
   height: 46px;
@@ -1132,6 +1162,14 @@ kbd {
   color: var(--ink-muted);
 }
 
+.modal-face-status.ignored {
+  color: var(--ink-muted);
+  background: var(--bg-rail);
+  border: 1px solid var(--line-strong);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
 .modal-face-controls input {
   width: 100%;
   padding: 5px 7px;
@@ -1158,6 +1196,16 @@ kbd {
 .modal-face-btn-row .btn.btn-modal-unsure-compact {
   flex: 0 0 auto;
   padding: 4px 7px;
+}
+
+.modal-face-btn-row .btn.btn-modal-ignore {
+  color: var(--ink-secondary);
+}
+
+.modal-face-btn-row .btn.btn-modal-ignore:hover {
+  background: var(--disprove-soft);
+  border-color: var(--disprove);
+  color: var(--disprove);
 }
 
 /* Reassign Child Picker Dialog */
@@ -1205,6 +1253,42 @@ kbd {
   max-height: 220px;
   overflow-y: auto;
   padding: 2px 0;
+}
+
+.reassign-ignore-wrap {
+  width: 100%;
+  margin-bottom: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--line-strong);
+}
+
+.btn-reassign-ignore {
+  width: 100%;
+  justify-content: center;
+  color: var(--disprove);
+  border: 1px solid var(--disprove-soft);
+  background: var(--disprove-soft);
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.btn-reassign-ignore:hover {
+  background: #fde8e8;
+  border-color: var(--disprove);
+  color: #b91c1c;
+}
+
+.reassign-chips-section-label {
+  width: 100%;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
 }
 
 .reassign-chip {

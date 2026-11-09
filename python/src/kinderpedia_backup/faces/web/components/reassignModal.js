@@ -1,6 +1,6 @@
-// Reassign picker: choose an existing child (chip) or type a name; the move itself is actions.reassignFace,
-// shared by the batch grid, the gallery and the lightbox.
-import { reassignFace } from "../actions.js";
+// Reassign picker: choose an existing child (chip), ignore this child, or type a name;
+// the move itself is actions.reassignFace or actions.ignoreFace, shared by batch, gallery and lightbox.
+import { ignoreFace, reassignFace } from "../actions.js";
 import { people, state } from "../state.js";
 import { runBusy } from "../util/busy.js";
 import { delegate, el, html, on, setHtml } from "../util/dom.js";
@@ -23,11 +23,16 @@ export function openReassignModal(ctx) {
     .sort(compareByDisplayName);
   setHtml(
     el("reassignChips"),
-    choices.length
-      ? html`${choices.map(
-          (p) => html`<button type="button" class="reassign-chip" data-pid="${p.person_id}" data-name="${p.display_name}">${p.display_name}</button>`
-        )}`
-      : html`<span class="reassign-sub">No other children enrolled yet — type a name below!</span>`
+    html`
+      <div class="reassign-ignore-wrap">
+        <button type="button" class="btn btn-ghost btn-sm btn-reassign-ignore" title="Ignore this child — don't tag, mute across archive">🚫 Ignore this child (don't tag)</button>
+      </div>
+      ${choices.length
+        ? html`<div class="reassign-chips-section-label">Or pick known child:</div>
+            ${choices.map(
+              (p) => html`<button type="button" class="reassign-chip" data-pid="${p.person_id}" data-name="${p.display_name}">${p.display_name}</button>`
+            )}`
+        : html`<span class="reassign-sub">No other children enrolled yet — type a name below!</span>`}`
   );
   const inp = el("reassignInput");
   inp.value = ctx.initialName || "";
@@ -71,6 +76,28 @@ async function applyReassignChoice(targetPid, targetName, triggerBtn) {
 }
 
 export function bindReassignModal() {
+  delegate("reassignChips", "click", ".btn-reassign-ignore", (_ev, btn) => {
+    const ctx = state.reassignContext;
+    if (!ctx || !ctx.photoId) return closeReassignModal();
+    const others = [
+      el("reassignInput"),
+      el("btnSubmitReassign"),
+      el("btnCancelReassign"),
+      ...el("reassignChips").querySelectorAll("button"),
+    ].filter((node) => node && node !== btn);
+    return runBusy(
+      btn,
+      async () => {
+        await ignoreFace({
+          photoId: ctx.photoId,
+          faceId: ctx.faceId || null,
+          fromPersonId: ctx.fromPersonId || null,
+        });
+        closeReassignModal();
+      },
+      { busyText: "Ignoring…", alsoDisable: others, context: "Ignore child face" }
+    );
+  });
   delegate("reassignChips", "click", ".reassign-chip", (_ev, chip) =>
     applyReassignChoice(Number(chip.getAttribute("data-pid")), chip.getAttribute("data-name") || "", chip)
   );

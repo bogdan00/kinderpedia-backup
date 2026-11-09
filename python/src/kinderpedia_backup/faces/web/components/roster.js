@@ -38,13 +38,15 @@ function renderDatalist() {
 
 function rosterItemHtml(p, groupKey, classNameById) {
   const classNames = (p.class_ids || []).map((cid) => classNameById.get(cid)).filter(Boolean).join(", ");
+  const isIgnored = groupKey === "ignore" || p.role === "ignore";
+  const displayName = isIgnored && p.display_name === "_Ignored_Background" ? "🚫 Ignored / Muted" : p.display_name;
   return html`
-    <div role="button" tabindex="0" class="roster-item ${p.person_id === state.selectedPersonId ? "active" : ""}" data-pid="${p.person_id}">
+    <div role="button" tabindex="0" class="roster-item ${p.person_id === state.selectedPersonId ? "active" : ""}${isIgnored ? " is-ignored" : ""}" data-pid="${p.person_id}">
       ${p.cover_face_id
         ? html`<img class="roster-avatar" src="/media/face/${Number(p.cover_face_id)}.jpg" alt="" loading="lazy" />`
-        : html`<div class="roster-avatar-placeholder">${p.display_name.slice(0, 1).toUpperCase()}</div>`}
+        : html`<div class="roster-avatar-placeholder">${isIgnored ? "🚫" : p.display_name.slice(0, 1).toUpperCase()}</div>`}
       <div class="roster-meta">
-        <div class="roster-name">${p.display_name}</div>
+        <div class="roster-name">${displayName}</div>
         <div class="roster-counts">${p.confirmed_count} confirmed · ${p.total_included_count} total${
           p.gender && p.gender !== "unknown"
             ? html` · <span class="roster-gender" title="Gender: ${p.gender}">${p.gender === "girl" ? "👧 girl" : p.gender === "boy" ? "👦 boy" : p.gender}</span>`

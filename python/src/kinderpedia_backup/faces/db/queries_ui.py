@@ -875,13 +875,16 @@ class QueriesUIMixin(ClustersMixin):
                         a.status,
                         a.similarity,
                         pe.display_name,
+                        pe.role AS person_role,
                         ROW_NUMBER() OVER (
                             PARTITION BY a.face_id
                             ORDER BY
-                                CASE a.status
-                                    WHEN 'confirmed' THEN 0
-                                    WHEN 'auto_high' THEN 1
-                                    ELSE 2
+                                CASE
+                                    WHEN pe.role != 'ignore' AND a.status = 'confirmed' THEN 0
+                                    WHEN pe.role != 'ignore' AND a.status = 'auto_high' THEN 1
+                                    WHEN pe.role != 'ignore' AND a.status = 'candidate' THEN 2
+                                    WHEN pe.role = 'ignore' AND a.status = 'confirmed' THEN 3
+                                    ELSE 4
                                 END ASC,
                                 a.updated_at DESC,
                                 a.person_id ASC
@@ -891,7 +894,6 @@ class QueriesUIMixin(ClustersMixin):
                     WHERE a.photo_id = ?
                       AND a.face_id IS NOT NULL
                       AND a.status IN ('confirmed', 'auto_high', 'candidate')
-                      AND pe.role != 'ignore'
                 )
                 SELECT
                     f.face_id, f.face_idx, f.det_score,
@@ -900,7 +902,8 @@ class QueriesUIMixin(ClustersMixin):
                     bfa.person_id AS eff_person_id,
                     bfa.status AS eff_status,
                     bfa.similarity AS eff_similarity,
-                    bfa.display_name AS person_name
+                    bfa.display_name AS person_name,
+                    bfa.person_role AS person_role
                 FROM faces f
                 LEFT JOIN best_face_assign bfa ON bfa.face_id = f.face_id AND bfa.rn = 1
                 WHERE f.photo_id = ?
@@ -942,7 +945,12 @@ class QueriesUIMixin(ClustersMixin):
                     "suppress_auto": bool(fr["suppress_auto"]),
                     "is_manual": bool(fr["is_manual"]),
                     "person_id": (int(fr["eff_person_id"]) if fr["eff_person_id"] is not None else None),
-                    "person_name": str(fr["person_name"]) if fr["person_name"] is not None else None,
+                    "person_name": (
+                        "Ignored"
+                        if (fr["person_role"] == "ignore" and str(fr["person_name"] or "").startswith("_Ignored"))
+                        else (str(fr["person_name"]) if fr["person_name"] is not None else None)
+                    ),
+                    "person_role": str(fr["person_role"]) if fr["person_role"] is not None else None,
                     "status": str(fr["eff_status"]) if fr["eff_status"] is not None else None,
                     "similarity": (
                         round(float(fr["eff_similarity"]), 4) if fr["eff_similarity"] is not None else None

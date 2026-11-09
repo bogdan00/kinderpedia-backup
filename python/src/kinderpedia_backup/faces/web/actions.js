@@ -71,6 +71,24 @@ export async function reassignFace({ photoId, faceId, fromPersonId = null, targe
   return res;
 }
 
+/** Mark a child face to ignore (don't tag across archive, acts as background veto in matcher). */
+export async function ignoreFace({ photoId, faceId, fromPersonId = null }) {
+  const res = await post("/api/faces/ignore", {
+    photo_id: photoId,
+    face_id: faceId || null,
+    from_person_id: fromPersonId || null,
+  });
+  afterLabelChange(res, {
+    photoId,
+    faceId: res.face_id || faceId || null,
+    personId: res.person_id,
+    personName: "Ignored",
+    status: "confirmed",
+  });
+  showToast("Marked child face to ignore — muted across archive.");
+  return res;
+}
+
 /** "I'm not sure" for `personId` (excluded from training, no hard negative). */
 export async function markFaceUnsure({ photoId, faceId, personId, personName = "" }) {
   const { res } = await postTag({ photoId, faceId, personId, name: personName, status: "unsure" });

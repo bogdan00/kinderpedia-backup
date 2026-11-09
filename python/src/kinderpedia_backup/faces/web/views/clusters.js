@@ -46,7 +46,7 @@ function clusterCardHtml(c) {
       <form class="cluster-assign-row" data-cid="${c.cluster_id}">
         <input type="text" list="knownPeopleDatalist" placeholder="This IS… (e.g. child name)" value="${c.person_name || ""}" required />
         <button type="submit" class="btn btn-approve btn-sm">Confirm &amp; Train</button>
-        <button type="button" class="btn btn-ghost btn-sm btn-mute-cluster" data-cid="${c.cluster_id}" title="Hide adult / wall poster cluster">Ignore</button>
+        <button type="button" class="btn btn-ghost btn-sm btn-mute-cluster" data-cid="${c.cluster_id}" title="Ignore this child / cluster — don't care to tag or don't know name. Mutes across archive.">🚫 Ignore</button>
       </form>
     </div>`;
 }
@@ -76,7 +76,7 @@ export async function assignCluster(clusterId, personName, role, jumpToBatch) {
   } else {
     setOverview(res.overview);
     await loadClusters();
-    showToast("Cluster muted.");
+    showToast("Child cluster ignored and muted across archive.");
   }
 }
 

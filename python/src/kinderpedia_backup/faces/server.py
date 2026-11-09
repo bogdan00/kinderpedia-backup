@@ -1492,6 +1492,7 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             disproved_in = body.get("disproved") or []
             unsure_in = body.get("unsure") or []
             reassigned_in = body.get("reassigned") or []
+            ignored_in = body.get("ignored") or []
 
             approved = [
                 (
@@ -1517,13 +1518,27 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 for it in unsure_in
                 if isinstance(it, dict)
             ]
+            ignored = [
+                (
+                    int(it["photo_id"]),
+                    int(it["face_id"]) if it.get("face_id") is not None else None,
+                )
+                for it in ignored_in
+                if isinstance(it, dict)
+            ]
             reassigned: list[tuple[int, int, int]] = []
             for it in reassigned_in:
                 if not isinstance(it, dict) or it.get("face_id") is None:
                     continue
                 target_name = str(it.get("new_target_name") or "").strip()
+                role_raw = str(it.get("target_role") or it.get("role") or "classmate").strip()
+                role_target: PersonRole = (
+                    cast(PersonRole, role_raw)
+                    if role_raw in ("family", "classmate", "educator", "ignore")
+                    else "classmate"
+                )
                 t_pid = (
-                    self.ctx.db.ensure_person(target_name, role="classmate")
+                    self.ctx.db.ensure_person(target_name, role=role_target)
                     if target_name
                     else int(it["target_person_id"])
                 )
@@ -1535,6 +1550,7 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 disproved=disproved,
                 unsure=unsure,
                 reassigned=reassigned,
+                ignored=ignored,
             )
             ov = self.ctx.db.get_archive_overview()
             next_batch = self.ctx.db.get_batch_proposal(
@@ -1610,6 +1626,29 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "removed_person_ids": removed_pids,
+                    "photo": photo_detail,
+                    "overview": ov,
+                    "rematch_scheduled": True,
+                }
+            )
+            return
+
+        if path == "/api/faces/ignore":
+            photo_id = int(body["photo_id"])
+            face_id = int(body["face_id"]) if body.get("face_id") is not None else None
+            from_pid = int(body["from_person_id"]) if body.get("from_person_id") is not None else None
+            res = self.ctx.db.ignore_face(
+                photo_id=photo_id,
+                face_id=face_id,
+                from_person_id=from_pid,
+            )
+            photo_detail = self.ctx.db.get_photo_detail(photo_id)
+            ov = self.ctx.db.get_archive_overview()
+            self.ctx.schedule_rematch()
+            self._send_json(
+                {
+                    "person_id": res["person_id"],
+                    "face_id": res["face_id"],
                     "photo": photo_detail,
                     "overview": ov,
                     "rematch_scheduled": True,

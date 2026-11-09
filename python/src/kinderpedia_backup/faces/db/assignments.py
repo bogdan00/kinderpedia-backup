@@ -153,6 +153,7 @@ class AssignmentsMixin(ScanRepoMixin):
         disproved: list[tuple[int, int | None]],
         unsure: list[tuple[int, int | None]] | None = None,
         reassigned: list[tuple[int, int, int]] | None = None,
+        ignored: list[tuple[int, int | None]] | None = None,
     ) -> dict[str, int]:
         """
         Persist an active-learning batch submission:
@@ -163,10 +164,13 @@ class AssignmentsMixin(ScanRepoMixin):
         - `unsure`: `[(photo_id, face_id)]` -> `unsure` (skipped without teaching positive or negative)
         - `reassigned`: `[(photo_id, face_id, target_person_id)]` -> explicit claim of the face for
           `target_person_id` + face-scoped negative (`rejected` / `reassigned`) for `person_id`
+        - `ignored`: `[(photo_id, face_id)]` -> mark face as ignored (role: 'ignore', muted across archive)
+          + face-scoped negative (`rejected` / `reassigned`) for `person_id`
         """
         now = _now_iso()
         unsure_list = unsure or []
         reassigned_list = reassigned or []
+        ignored_list = ignored or []
         skipped_conflicts = 0
         with self._lock, self._conn:
             rules_cache: dict[int, tuple[int, list[tuple[str, int, int]]]] = {}
@@ -245,11 +249,27 @@ class AssignmentsMixin(ScanRepoMixin):
                 if target_pid != person_id:
                     self._record_face_negative_locked(photo_id, person_id, face_id, now=now)
 
+            applied_ignored = 0
+            for photo_id, face_id in ignored_list:
+                if face_id is None:
+                    continue
+                ign_pid = self._get_or_create_available_ignore_person_locked(photo_id, face_id)
+                self._claim_face_locked(
+                    face_id, ign_pid, source="manual_tag", now=now, explicit=True, photo_id=photo_id
+                )
+                self._record_face_negative_locked(photo_id, person_id, face_id, now=now)
+                self._conn.execute(
+                    "UPDATE faces SET suppress_auto = 1 WHERE face_id = ?",
+                    (face_id,),
+                )
+                applied_ignored += 1
+
         return {
             "approved": applied_approved,
             "disproved": len(disproved),
             "unsure": len(unsure_list),
             "reassigned": len(reassigned_list),
+            "ignored": applied_ignored,
             "skipped_conflicts": skipped_conflicts,
         }
 
@@ -559,6 +579,112 @@ class AssignmentsMixin(ScanRepoMixin):
 
         return face_id
 
+    def _get_or_create_available_ignore_person_locked(self, photo_id: int, face_id: int) -> int:
+        """
+        Return an available person with `role = 'ignore'` that does not hold a different face on `photo_id`.
+        If all existing ignore-role people are occupied on this photo, creates a new one.
+        """
+        own = self._conn.execute(
+            """
+            SELECT p.person_id
+            FROM people p
+            JOIN assignments a ON a.person_id = p.person_id
+            WHERE p.role = 'ignore' AND a.photo_id = ? AND a.face_id = ?
+            """,
+            (photo_id, face_id),
+        ).fetchone()
+        if own is not None:
+            return int(own["person_id"])
+
+        candidates = self._conn.execute(
+            """
+            SELECT p.person_id
+            FROM people p
+            WHERE p.role = 'ignore'
+              AND p.person_id NOT IN (
+                  SELECT person_id FROM assignments
+                  WHERE photo_id = ? AND face_id IS NOT NULL AND face_id != ?
+              )
+            ORDER BY p.person_id ASC
+            """,
+            (photo_id, face_id),
+        ).fetchall()
+        if candidates:
+            return int(candidates[0]["person_id"])
+
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM people WHERE role = 'ignore'"
+        ).fetchone()
+        n = (int(count_row["n"]) + 1) if count_row else 2
+        return self.ensure_person(f"_Ignored_Background_{n}", role="ignore")
+
+    def ignore_face(
+        self,
+        *,
+        photo_id: int,
+        face_id: int | None,
+        from_person_id: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Mark a child face on `photo_id` as ignored (muted across archive, excluded from training,
+        acts as background veto in matcher). If `from_person_id` was provided, demotes that person
+        to a face-scoped negative (`rejected` / `reassigned`).
+        """
+        now = _now_iso()
+        with self._lock, self._conn:
+            resolved_fid = face_id
+            if resolved_fid is None:
+                if from_person_id is not None:
+                    row = self._conn.execute(
+                        "SELECT face_id FROM assignments WHERE photo_id = ? AND person_id = ?",
+                        (photo_id, from_person_id),
+                    ).fetchone()
+                    if row and row["face_id"] is not None:
+                        resolved_fid = int(row["face_id"])
+                if resolved_fid is None:
+                    f_rows = self._conn.execute(
+                        "SELECT face_id FROM faces WHERE photo_id = ?",
+                        (photo_id,),
+                    ).fetchall()
+                    if len(f_rows) == 1:
+                        resolved_fid = int(f_rows[0]["face_id"])
+
+            if resolved_fid is None:
+                raise ValueError(f"Could not resolve face_id on photo {photo_id} to ignore.")
+
+            ign_pid = self._get_or_create_available_ignore_person_locked(photo_id, resolved_fid)
+            self._claim_face_locked(
+                resolved_fid,
+                ign_pid,
+                source="manual_tag",
+                now=now,
+                explicit=True,
+                photo_id=photo_id,
+            )
+            if from_person_id is not None and from_person_id != ign_pid:
+                self._conn.execute(
+                    """
+                    INSERT INTO assignments (photo_id, person_id, face_id, status, source, similarity, is_anchor, updated_at)
+                    VALUES (?, ?, ?, 'rejected', 'reassigned', 0.0, 0, ?)
+                    ON CONFLICT(photo_id, person_id) DO UPDATE SET
+                        face_id = excluded.face_id,
+                        status = 'rejected',
+                        source = 'reassigned',
+                        similarity = 0.0,
+                        is_anchor = 0,
+                        updated_at = excluded.updated_at
+                    WHERE assignments.face_id IS NULL OR assignments.face_id = excluded.face_id
+                    """,
+                    (photo_id, from_person_id, resolved_fid, now),
+                )
+                self._refresh_cover_face_if_needed(from_person_id, resolved_fid)
+
+            self._conn.execute(
+                "UPDATE faces SET suppress_auto = 1 WHERE face_id = ?",
+                (resolved_fid,),
+            )
+            return {"person_id": ign_pid, "face_id": resolved_fid}
+
     def untag_face(
         self,
         *,
@@ -587,9 +713,10 @@ class AssignmentsMixin(ScanRepoMixin):
 
             holders = self._conn.execute(
                 """
-                SELECT person_id, status
-                FROM assignments
-                WHERE face_id = ?
+                SELECT a.person_id, a.status, pe.role
+                FROM assignments a
+                JOIN people pe ON pe.person_id = a.person_id
+                WHERE a.face_id = ?
                 """,
                 (face_id,),
             ).fetchall()
@@ -613,10 +740,22 @@ class AssignmentsMixin(ScanRepoMixin):
                     self._refresh_cover_face_if_needed(old_pid, face_id)
                 return removed_pids
 
+            had_ignore = any(str(hr["role"] or "") == "ignore" for hr in holders)
+            had_active_enrolled = any(
+                str(hr["role"] or "") != "ignore" and str(hr["status"]) in ("confirmed", "auto_high", "candidate")
+                for hr in holders
+            )
             for hr in holders:
                 old_pid = int(hr["person_id"])
                 st = str(hr["status"])
-                if st in ("confirmed", "auto_high", "candidate"):
+                role = str(hr["role"] or "")
+                if role == "ignore":
+                    removed_pids.append(old_pid)
+                    self._conn.execute(
+                        "DELETE FROM assignments WHERE photo_id = ? AND person_id = ? AND face_id = ?",
+                        (photo_id, old_pid, face_id),
+                    )
+                elif st in ("confirmed", "auto_high", "candidate"):
                     removed_pids.append(old_pid)
                     self._conn.execute(
                         """
@@ -649,9 +788,12 @@ class AssignmentsMixin(ScanRepoMixin):
                         (face_id,),
                     )
 
+            # When un-ignoring a previously ignored child face (and not untagging an enrolled child),
+            # clear suppress_auto so the face is restored to normal matching and clustering eligibility.
+            new_suppress = 0 if (had_ignore and not had_active_enrolled) else 1
             self._conn.execute(
-                "UPDATE faces SET suppress_auto = 1 WHERE face_id = ?",
-                (face_id,),
+                "UPDATE faces SET suppress_auto = ? WHERE face_id = ?",
+                (new_suppress, face_id),
             )
         return removed_pids
 

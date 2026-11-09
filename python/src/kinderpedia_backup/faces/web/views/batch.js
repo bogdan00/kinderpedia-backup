@@ -1,5 +1,5 @@
 // Mode 1: Active-learning batch trainer ("approve all except 1-2").
-import { decideCard, decideCardClick, toggleAllCards } from "../actions.js";
+import { decideCard, decideCardClick, ignoreFace, toggleAllCards } from "../actions.js";
 import { api, apiUrl, fetchQuietJson, post } from "../api.js";
 import { openPhotoModal } from "../components/lightbox.js";
 import { openReassignModal } from "../components/reassignModal.js";
@@ -9,6 +9,7 @@ import {
   batchSubmitLists,
   cardFromServer,
   getSelectedPerson,
+  people,
   resolvePersonName,
   setBatchCards,
   setOverview,
@@ -130,6 +131,12 @@ function badgeText(c, selP) {
   if (c.decision === "approved") return `✓ ${selP.display_name}`;
   if (c.decision === "unsure") return "? Not sure";
   if (c.decision === "reassigned") {
+    const isIgnored =
+      c.targetRole === "ignore" ||
+      c.targetName === "_Ignored_Background" ||
+      c.targetName === "Ignored" ||
+      (c.targetPersonId && (people().find((p) => p.person_id === c.targetPersonId) || {}).role === "ignore");
+    if (isIgnored) return `🚫 Ignored${c.alreadySavedInModal ? " ✓" : ""}`;
     return `↪ ${resolvePersonName(c.targetPersonId, c.targetName)}${c.alreadySavedInModal ? " ✓" : ""}`;
   }
   return `✗ Not ${selP.display_name}`;
@@ -140,8 +147,14 @@ export function batchCardHtml(c, idx, selP) {
   const peerSuffix = companions.length ? ` · with ${companions.slice(0, 2).join(", ")}` : "";
   const dateLine = `${c.album_date || c.year} · ${c.archive_child}${peerSuffix}`;
   const sim = Number(c.similarity || 0);
+  const isIgnored =
+    c.decision === "reassigned" &&
+    (c.targetRole === "ignore" ||
+      c.targetName === "_Ignored_Background" ||
+      c.targetName === "Ignored" ||
+      (c.targetPersonId && (people().find((p) => p.person_id === c.targetPersonId) || {}).role === "ignore"));
   return html`
-    <article class="face-card state-${c.decision}${c.audit ? " is-audit" : ""}" data-idx="${idx}">
+    <article class="face-card state-${c.decision}${c.audit ? " is-audit" : ""}${isIgnored ? " is-ignored" : ""}" data-idx="${idx}">
       <div class="face-thumb-wrap">
         <img src="${thumbSrc(c)}" alt="" loading="lazy" />
         <span class="decision-badge">${badgeText(c, selP)}</span>
@@ -151,6 +164,7 @@ export function batchCardHtml(c, idx, selP) {
         html`<span class="impact-pill" title="Answering this photo also settles ~${c.impact} other open photos of this child">⚡ ${c.impact}</span>`}
         <div class="card-quick-tools">
           <button type="button" class="icon-btn btn-card-unsure ${c.decision === "unsure" ? "active-unsure" : ""}" data-idx="${idx}" title="I'm not sure — skip without teaching positive or negative">?</button>
+          <button type="button" class="icon-btn btn-card-ignore ${isIgnored ? "active-ignore" : ""}" data-idx="${idx}" title="Ignore this child — don't tag, mute across archive">🚫</button>
           <button type="button" class="icon-btn btn-card-reassign" data-idx="${idx}" title="Actually another child…">↪</button>
           <button type="button" class="icon-btn btn-card-zoom" data-idx="${idx}" data-photo="${c.photo_id}" data-face="${c.face_id || ""}" title="Inspect full classroom group photo (←/→ to step through batch)">🔍</button>
         </div>
@@ -219,10 +233,11 @@ export async function submitCurrentBatch() {
       const cohNote = sweptDelta > 0 ? ` (+${sweptDelta} same-album burst photos auto-matched!)` : "";
       const unsNote = a.unsure > 0 ? `, ${a.unsure} marked unsure` : "";
       const reNote = a.reassigned > 0 ? `, ${a.reassigned} reassigned` : "";
+      const ignNote = a.ignored > 0 ? `, ${a.ignored} ignored` : "";
       const conflictNote =
         a.skipped_conflicts > 0 ? ` (${a.skipped_conflicts} skipped: already confirmed for another child)` : "";
       showToast(
-        `Saved: +${a.approved} confirmed for ${selP.display_name}${cohNote}, ${a.disproved} hard-negatives${unsNote}${reNote}${conflictNote}.`
+        `Saved: +${a.approved} confirmed for ${selP.display_name}${cohNote}, ${a.disproved} hard-negatives${unsNote}${reNote}${ignNote}${conflictNote}.`
       );
     },
     { busyText: "Updating anchors…", keepUpdatedLabel: true, context: "Submit batch", onFinally: updateBatchButtonLabel }
@@ -244,6 +259,18 @@ export function bindBatch() {
     if (iconBtn.classList.contains("btn-card-unsure")) {
       decideCard(idx, state.batchCards[idx].decision === "unsure" ? "approved" : "unsure");
       state.lastClickedBatchIdx = idx;
+    } else if (iconBtn.classList.contains("btn-card-ignore")) {
+      const card = state.batchCards[idx];
+      runBusy(
+        iconBtn,
+        () =>
+          ignoreFace({
+            photoId: card.photo_id,
+            faceId: card.face_id || null,
+            fromPersonId: selP.person_id,
+          }),
+        { busyText: "…", context: "Ignore child face" }
+      );
     } else if (iconBtn.classList.contains("btn-card-zoom")) {
       runBusy(iconBtn, () => openBatchCardInLightbox(idx), { context: "Load full photo" });
     } else if (iconBtn.classList.contains("btn-card-reassign")) {

@@ -771,5 +771,115 @@ class UpsertBatchApiTests(unittest.TestCase):
             self.assertEqual(out[0][1], out2[0][1])
 
 
+class IgnoreFaceTests(unittest.TestCase):
+    def _setup(self, tmp: str) -> tuple[FacesIndexDB, int, int, int, int, int]:
+        db = FacesIndexDB(Path(tmp) / "f.sqlite")
+        prov = PhotoProvenance(
+            rel_path="A/Albums/2025/01/x/a.jpg", archive_child="A", year="2025", month="01",
+            album_leaf="x", filename="a.jpg",
+        )
+        faces = [
+            DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=_vec(0)),
+            DetectedFace(box=BoundingBox(0, 150, 50, 100), embedding=_vec(1)),
+        ]
+        ((photo_id, (f0, f1)),) = db.upsert_scanned_batch([(prov, 200, 200, 1, 1, "d", faces)])
+        x = db.ensure_person("Alex")
+        y = db.ensure_person("Maya")
+        return db, photo_id, f0, f1, x, y
+
+    def _status(self, db: FacesIndexDB, photo_id: int, person_id: int) -> tuple[Any, ...] | None:
+        row = db._conn.execute(
+            "SELECT status, source, face_id FROM assignments WHERE photo_id = ? AND person_id = ?",
+            (photo_id, person_id),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+
+    def test_ignore_face_marks_ignored_and_records_hard_negative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, _f1, x, _y = self._setup(tmp)
+            db.apply_batch_decisions(person_id=x, approved=[(ph, f0)], disproved=[])
+            res = db.ignore_face(photo_id=ph, face_id=f0, from_person_id=x)
+            ign_pid = res["person_id"]
+            people = {p["person_id"]: p for p in db.list_people()}
+            self.assertIn(ign_pid, people)
+            self.assertEqual(people[ign_pid]["role"], "ignore")
+
+            # Face is assigned to ignore person
+            self.assertEqual(self._status(db, ph, ign_pid), ("confirmed", "manual_tag", f0))
+
+            # suppress_auto is set to 1
+            sup = db._conn.execute("SELECT suppress_auto FROM faces WHERE face_id = ?", (f0,)).fetchone()[0]
+            self.assertEqual(sup, 1)
+
+            # Reassigned hard negative recorded for person x
+            self.assertEqual(self._status(db, ph, x), ("rejected", "reassigned", f0))
+
+            # Photo detail presents it as Ignored
+            detail = db.get_photo_detail(ph)
+            face_detail = next(f for f in detail["faces"] if f["face_id"] == f0)
+            self.assertEqual(face_detail["person_role"], "ignore")
+            self.assertEqual(face_detail["person_name"], "Ignored")
+            db.close()
+
+    def test_multiple_ignored_faces_on_same_photo_do_not_collide(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, f1, _x, _y = self._setup(tmp)
+            res1 = db.ignore_face(photo_id=ph, face_id=f0)
+            res2 = db.ignore_face(photo_id=ph, face_id=f1)
+            p1 = res1["person_id"]
+            p2 = res2["person_id"]
+            self.assertNotEqual(p1, p2)
+
+            self.assertEqual(self._status(db, ph, p1), ("confirmed", "manual_tag", f0))
+            self.assertEqual(self._status(db, ph, p2), ("confirmed", "manual_tag", f1))
+
+            detail = db.get_photo_detail(ph)
+            f_map = {f["face_id"]: f for f in detail["faces"]}
+            self.assertEqual(f_map[f0]["person_role"], "ignore")
+            self.assertEqual(f_map[f0]["person_name"], "Ignored")
+            self.assertEqual(f_map[f1]["person_role"], "ignore")
+            self.assertEqual(f_map[f1]["person_name"], "Ignored")
+            db.close()
+
+    def test_untag_ignored_face_restores_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, _f1, _x, _y = self._setup(tmp)
+            res = db.ignore_face(photo_id=ph, face_id=f0)
+            p1 = res["person_id"]
+            self.assertEqual(self._status(db, ph, p1), ("confirmed", "manual_tag", f0))
+
+            # Untag
+            db.untag_face(photo_id=ph, face_id=f0)
+            self.assertIsNone(self._status(db, ph, p1))
+
+            # suppress_auto cleared
+            sup = db._conn.execute("SELECT suppress_auto FROM faces WHERE face_id = ?", (f0,)).fetchone()[0]
+            self.assertEqual(sup, 0)
+
+            detail = db.get_photo_detail(ph)
+            f_map = {f["face_id"]: f for f in detail["faces"]}
+            self.assertIsNone(f_map[f0]["person_id"])
+            self.assertIsNone(f_map[f0]["person_name"])
+            self.assertIsNone(f_map[f0]["person_role"])
+            self.assertFalse(f_map[f0]["suppress_auto"])
+            db.close()
+
+    def test_batch_decisions_with_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db, ph, f0, _f1, x, _y = self._setup(tmp)
+            res = db.apply_batch_decisions(person_id=x, approved=[], disproved=[], ignored=[(ph, f0)])
+            self.assertEqual(res["ignored"], 1)
+            self.assertEqual(self._status(db, ph, x), ("rejected", "reassigned", f0))
+
+            sup = db._conn.execute("SELECT suppress_auto FROM faces WHERE face_id = ?", (f0,)).fetchone()[0]
+            self.assertEqual(sup, 1)
+
+            detail = db.get_photo_detail(ph)
+            f_map = {f["face_id"]: f for f in detail["faces"]}
+            self.assertEqual(f_map[f0]["person_role"], "ignore")
+            self.assertEqual(f_map[f0]["person_name"], "Ignored")
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

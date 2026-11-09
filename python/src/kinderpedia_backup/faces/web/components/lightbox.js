@@ -1,7 +1,7 @@
-// Full classroom-photo lightbox: photo + face boxes, the side list of faces (tag / untag / unsure), quiet
+// Full classroom-photo lightbox: photo + face boxes, the side list of faces (tag / untag / unsure / ignore), quiet
 // refresh after re-matches. Navigation (strip, prev/next, quick rows) lives in lightboxNav.js and manual
 // box drawing in manualBox.js. All face-label changes go through actions.js.
-import { markFaceUnsure, tagFace, untagFace } from "../actions.js";
+import { ignoreFace, markFaceUnsure, tagFace, untagFace } from "../actions.js";
 import { api, fetchQuietJson, post } from "../api.js";
 import { getSelectedPerson, state, subscribe } from "../state.js";
 import { runBusy } from "../util/busy.js";
@@ -118,6 +118,8 @@ export function renderModalFaceOverlays() {
 }
 
 function faceStatusHtml(f) {
+  const isIgnored = f.person_role === "ignore" || (f.person_name && f.person_name.startsWith("_Ignored"));
+  if (isIgnored) return html`<span class="modal-face-status ignored">🚫 Ignored</span>`;
   const sim = f.similarity != null ? ` · ${f.similarity.toFixed(2)}` : "";
   if (f.person_id == null) return html`<span class="modal-face-status uncat">Uncategorized</span>`;
   if (f.status === "confirmed") return html`<span class="modal-face-status confirmed">✓ Confirmed${f.is_manual ? " · ✎ Manual" : ""}</span>`;
@@ -162,22 +164,29 @@ function vlmInspectionHtml(fid) {
 
 function sideFaceHtml(f, selP) {
   const hasTag = f.person_id != null;
+  const isIgnored = f.person_role === "ignore" || (f.person_name && f.person_name.startsWith("_Ignored"));
   const unsure = unsureTargetFor(f, selP);
   const untagTitle = f.is_manual
     ? `Remove manual box (${f.person_name || ""})`
+    : isIgnored
+    ? "Un-ignore this child face and leave uncategorized"
     : `Remove tag (${f.person_name || ""}) and leave this child uncategorized`;
   return html`
-    <form class="modal-face-row ${f.face_id === state.modalHighlightFaceId ? "highlight" : ""}" data-fid="${f.face_id}">
+    <form class="modal-face-row ${f.face_id === state.modalHighlightFaceId ? "highlight" : ""}${isIgnored ? " is-ignored" : ""}" data-fid="${f.face_id}">
       <img src="/media/face/${Number(f.face_id)}.jpg" alt="" title="Highlight this face on the photo" />
       <div class="modal-face-controls">
         <div class="modal-face-status-row">${faceStatusHtml(f)}</div>
-        <input type="text" class="modal-face-input" data-fid="${f.face_id}" list="knownPeopleDatalist" placeholder="Name this child…" value="${f.person_name || ""}" />
+        <input type="text" class="modal-face-input" data-fid="${f.face_id}" list="knownPeopleDatalist" placeholder="Name this child…" value="${isIgnored ? "" : f.person_name || ""}" />
         <div class="modal-face-btn-row">
           <button type="submit" class="btn btn-tonal btn-sm">Save ✓</button>
           <button type="button" class="btn btn-ghost btn-sm btn-modal-vlm-inspect" data-fid="${f.face_id}" title="Ask VLM to inspect this face and its outfit">✨ VLM</button>
-          ${(hasTag || f.is_manual) &&
-          html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Untag</button>`}
-          ${unsure &&
+          ${isIgnored
+            ? html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Un-ignore</button>`
+            : html`
+              <button type="button" class="btn btn-ghost btn-sm btn-modal-ignore" data-fid="${f.face_id}" title="Mark this child face to ignore (don't tag across archive)">🚫 Ignore</button>
+              ${(hasTag || f.is_manual) && html`<button type="button" class="btn btn-untag btn-sm btn-modal-untag" data-fid="${f.face_id}" title="${untagTitle}">✗ Untag</button>`}
+            `}
+          ${unsure && !isIgnored &&
           html`<button type="button" class="btn btn-ghost btn-sm btn-modal-unsure ${hasTag ? "btn-modal-unsure-compact" : ""}" data-fid="${f.face_id}" data-pid="${unsure.person_id}" title="Mark as I'm not sure for ${unsure.display_name}">${hasTag ? "?" : "? Not sure"}</button>`}
         </div>
         <div class="vlm-inspect-slot" data-vlm-slot="${f.face_id}">
@@ -384,6 +393,24 @@ export function bindLightbox() {
       alsoDisable: siblingControls(btn.closest(".modal-face-row"), btn),
       context: "Mark face unsure",
     });
+  });
+  delegate(list, "click", ".btn-modal-ignore", (_ev, btn) => {
+    const fid = Number(btn.getAttribute("data-fid"));
+    const selP = getSelectedPerson();
+    runBusy(
+      btn,
+      () =>
+        ignoreFace({
+          photoId: state.modalPhoto.photo_id,
+          faceId: fid,
+          fromPersonId: selP ? selP.person_id : null,
+        }),
+      {
+        busyText: "…",
+        alsoDisable: siblingControls(btn.closest(".modal-face-row"), btn),
+        context: "Ignore face",
+      }
+    );
   });
 
   on("btnCloseModal", "click", (_ev, btn) => runBusy(btn, () => closePhotoModal(), { context: "Close modal" }));
