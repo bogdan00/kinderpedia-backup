@@ -1815,9 +1815,22 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/vlm/inspect-face":
             ph_id = int(body.get("photo_id") or 0)
-            f_box = body.get("box") or [0, 0, 100, 100]
-            pname = str(body.get("person_name") or "")
-            target_g = str(body.get("gender") or "unknown")
+            raw_fid = body.get("face_id")
+            fid: int | None = int(raw_fid) if raw_fid is not None else None
+            f_box = body.get("box")
+            # If box has None elements or is missing, look it up from database
+            if (not f_box or any(v is None for v in f_box)) and fid is not None:
+                row = self.ctx.db._conn.execute(
+                    "SELECT bbox_left, bbox_top, bbox_right, bbox_bottom FROM faces WHERE face_id = ?",
+                    (fid,),
+                ).fetchone()
+                if row:
+                    f_box = [int(row["bbox_left"]), int(row["bbox_top"]), int(row["bbox_right"]), int(row["bbox_bottom"])]
+            if not f_box or any(v is None for v in f_box):
+                f_box = [0, 0, 100, 100]
+
+            pname = str(body.get("person_name") or "").strip()
+            target_g = str(body.get("gender") or "unknown").strip()
             rel_p = self.ctx.db.get_photo_rel_path(ph_id)
             if not rel_p:
                 self._send_json({"error": "Photo not found."}, status=HTTPStatus.NOT_FOUND)
@@ -1829,7 +1842,67 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
                 person_name=pname or "Child",
                 target_gender=target_g,
             )
-            self._send_json({"signature": sig.to_dict() if sig else None})
+
+            saved_appearance = False
+            prop_job: dict[str, Any] | None = None
+            if sig:
+                p_row = self.ctx.db._conn.execute(
+                    "SELECT archive_child, album_leaf FROM photos WHERE photo_id = ?",
+                    (ph_id,),
+                ).fetchone()
+                child_pid: int | None = None
+                if body.get("person_id") is not None:
+                    try:
+                        child_pid = int(body["person_id"])
+                    except (ValueError, TypeError):
+                        child_pid = None
+                elif fid is not None:
+                    a_row = self.ctx.db._conn.execute(
+                        "SELECT person_id FROM assignments WHERE photo_id = ? AND face_id = ? AND status IN ('confirmed', 'auto_high')",
+                        (ph_id, fid),
+                    ).fetchone()
+                    if a_row:
+                        child_pid = int(a_row["person_id"])
+                if child_pid is None and pname:
+                    pe_row = self.ctx.db._conn.execute(
+                        "SELECT person_id FROM people WHERE display_name = ? COLLATE NOCASE",
+                        (pname,),
+                    ).fetchone()
+                    if pe_row:
+                        child_pid = int(pe_row["person_id"])
+
+                if p_row and child_pid is not None:
+                    archive_child = str(p_row["archive_child"])
+                    album_leaf = str(p_row["album_leaf"])
+                    self.ctx.db.record_album_appearance(
+                        archive_child=archive_child,
+                        album_leaf=album_leaf,
+                        person_id=child_pid,
+                        sample_photo_id=ph_id,
+                        sample_face_id=fid,
+                        clothing_summary=sig.clothing_summary,
+                        top_color=sig.top_color,
+                        bottom_color=sig.bottom_color,
+                        distinctive_features=sig.distinctive_features,
+                        apparent_gender=sig.apparent_gender,
+                        verified_count=1,
+                    )
+                    saved_appearance = True
+                    propagate = bool(body.get("propagate", False))
+                    if propagate:
+                        prop_job = self.ctx.start_job(
+                            "vlm_album",
+                            lambda jid, ac=archive_child, al=album_leaf, p=child_pid: self.ctx.run_vlm_album_job(
+                                ac, al, job_id=jid, person_id=p
+                            ),
+                            label=f"VLM clothing match for {pname or 'child'} in {album_leaf}",
+                        )
+
+            self._send_json({
+                "signature": sig.to_dict() if sig else None,
+                "saved_appearance": saved_appearance,
+                "job": prop_job,
+            })
             return
 
         if path.startswith("/api/people/") and path.endswith("/gender"):

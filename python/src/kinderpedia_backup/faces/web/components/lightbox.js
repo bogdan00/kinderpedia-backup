@@ -358,7 +358,13 @@ export function bindLightbox() {
       btn,
       async () => {
         try {
-          const box = [face.bbox_left, face.bbox_top, face.bbox_right, face.bbox_bottom];
+          const b = face.box || {};
+          const box = [
+            b.left != null ? b.left : (face.bbox_left || 0),
+            b.top != null ? b.top : (face.bbox_top || 0),
+            b.right != null ? b.right : (face.bbox_right || 100),
+            b.bottom != null ? b.bottom : (face.bbox_bottom || 100),
+          ];
           const res = await post(
             "/api/vlm/inspect-face",
             {
@@ -366,6 +372,8 @@ export function bindLightbox() {
               face_id: fid,
               box,
               person_name: face.person_name || "",
+              person_id: face.person_id || null,
+              propagate: Boolean(face.person_name),
             },
             "POST",
             { timeoutMs: 90000 }
@@ -373,7 +381,8 @@ export function bindLightbox() {
           if (res && res.signature) {
             vlmInspectionCache.set(fid, res.signature);
             if (slot) setHtml(slot, vlmInspectionHtml(fid));
-            showToast(`✨ VLM: ${res.signature.apparent_gender} wearing ${res.signature.clothing_summary}`);
+            const propMsg = res.job ? " · Matching outfit across album in background…" : "";
+            showToast(`✨ VLM: ${res.signature.apparent_gender} wearing ${res.signature.clothing_summary}${propMsg}`);
           } else {
             vlmInspectionCache.set(fid, { error: "Could not extract clothing signature." });
             if (slot) setHtml(slot, vlmInspectionHtml(fid));

@@ -315,13 +315,16 @@ class VlmServerEndpointsTests(unittest.TestCase):
 
     def test_inspect_face_endpoint(self) -> None:
         import requests
+        # Test 1: inspecting with box containing None falls back to DB face_id, saves appearance and propagates
         r = requests.post(
             f"{self.base}/api/vlm/inspect-face",
             json={
                 "photo_id": self.ph_id,
-                "box": [10, 10, 50, 50],
+                "face_id": self.fid,
+                "box": [None, None, None, None],
                 "person_name": "Emma",
                 "gender": "girl",
+                "propagate": True,
             },
             headers=self.hdr,
             timeout=5,
@@ -330,6 +333,14 @@ class VlmServerEndpointsTests(unittest.TestCase):
         data = r.json()
         self.assertIsNotNone(data["signature"])
         self.assertIn("Yellow hoodie", data["signature"]["clothing_summary"])
+        self.assertTrue(data.get("saved_appearance"))
+        self.assertIsNotNone(data.get("job"))
+
+        # Verify appearance is persisted in DB
+        apps = self.db.get_album_appearances("Emma", "2026-11-01")
+        self.assertEqual(len(apps), 1)
+        self.assertEqual(apps[0]["person_name"], "Emma")
+        self.assertIn("Yellow hoodie", apps[0]["clothing_summary"])
 
     def test_analyze_album_endpoint(self) -> None:
         import requests
