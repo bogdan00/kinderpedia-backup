@@ -3,7 +3,7 @@
 import { api, post } from "../api.js";
 import { openPhotoModal } from "../components/lightbox.js";
 import { showToast } from "../components/toasts.js";
-import { resolvePersonName, state, subscribe } from "../state.js";
+import { state, subscribe } from "../state.js";
 import { runBusy } from "../util/busy.js";
 import { delegate, el, html, on, setHtml } from "../util/dom.js";
 import { plural, thumbSrc } from "../util/format.js";
@@ -35,21 +35,83 @@ function syncAlbumFilterDropdowns(children, years) {
 
   if (childSelect.options.length <= 1 && children.length) {
     const curVal = state.albumFilterChild;
-    let opts = '<option value="">All Children</option>';
-    for (const c of children) {
-      opts += `<option value="${c}" ${c === curVal ? "selected" : ""}>${c}</option>`;
-    }
-    setHtml(childSelect, opts);
+    setHtml(
+      childSelect,
+      html`
+        <option value="">All Children</option>
+        ${children.map((c) => html`<option value="${c}" ${c === curVal ? "selected" : ""}>${c}</option>`)}
+      `
+    );
   }
 
   if (yearSelect.options.length <= 1 && years.length) {
     const curVal = state.albumFilterYear;
-    let opts = '<option value="">All Years</option>';
-    for (const y of years) {
-      opts += `<option value="${y}" ${y === curVal ? "selected" : ""}>${y}</option>`;
-    }
-    setHtml(yearSelect, opts);
+    setHtml(
+      yearSelect,
+      html`
+        <option value="">All Years</option>
+        ${years.map((y) => html`<option value="${y}" ${y === curVal ? "selected" : ""}>${y}</option>`)}
+      `
+    );
   }
+}
+
+function albumCardHtml(alb) {
+  const topPills = (alb.top_people || []).map(
+    (p) => html`
+      <span class="album-tag-chip ${p.confirmed_count > 0 ? "is-confirmed" : ""}">
+        ${p.name} <strong>${p.count}</strong>
+      </span>
+    `
+  );
+
+  return html`
+    <div class="album-card" data-album-key="${alb.album_key}">
+      <div class="album-card-cover-wrap">
+        <img
+          class="album-card-cover"
+          src="/media/photo/${alb.cover_photo_id}"
+          loading="lazy"
+          alt="${alb.album_title}"
+        />
+        <div class="album-card-badges">
+          <span class="badge badge-child">${alb.archive_child}</span>
+          ${alb.year ? html`<span class="badge badge-year">${alb.year}</span>` : ""}
+        </div>
+      </div>
+      <div class="album-card-body">
+        <h3 class="album-card-title" title="${alb.album_title}">${alb.album_title}</h3>
+        <div class="album-card-meta">
+          <span>${plural(alb.photo_count, "photo")}</span>
+          <span>·</span>
+          <span>${plural(alb.face_count, "face")}</span>
+        </div>
+        <div class="album-card-status-bar">
+          ${alb.confirmed_count > 0
+            ? html`<span class="status-pill status-pill-confirmed" title="${alb.confirmed_count} confirmed">
+                ✓ ${alb.confirmed_count}
+              </span>`
+            : ""}
+          ${alb.auto_count > 0
+            ? html`<span class="status-pill status-pill-auto" title="${alb.auto_count} auto-matches">
+                ⚡ ${alb.auto_count}
+              </span>`
+            : ""}
+          ${alb.candidate_count > 0
+            ? html`<span class="status-pill status-pill-candidate" title="${alb.candidate_count} candidates">
+                ? ${alb.candidate_count}
+              </span>`
+            : ""}
+          ${alb.unassigned_count > 0
+            ? html`<span class="status-pill status-pill-none" title="${alb.unassigned_count} unassigned">
+                ∅ ${alb.unassigned_count}
+              </span>`
+            : ""}
+        </div>
+        ${topPills.length ? html`<div class="album-card-people">${topPills}</div>` : ""}
+      </div>
+    </div>
+  `;
 }
 
 function renderAlbumsList() {
@@ -76,75 +138,13 @@ function renderAlbumsList() {
   if (nextBtn) nextBtn.disabled = end >= total;
 
   if (!state.albums.length) {
-    grid.innerHTML = "";
+    setHtml(grid, html``);
     if (empty) empty.hidden = false;
     return;
   }
   if (empty) empty.hidden = true;
 
-  const cardsHtml = state.albums
-    .map((alb) => {
-      const topPills = (alb.top_people || [])
-        .map(
-          (p) => html`
-            <span class="album-tag-chip ${p.confirmed_count > 0 ? "is-confirmed" : ""}">
-              ${p.name} <strong>${p.count}</strong>
-            </span>
-          `
-        )
-        .join("");
-
-      return html`
-        <div class="album-card" data-album-key="${alb.album_key}">
-          <div class="album-card-cover-wrap">
-            <img
-              class="album-card-cover"
-              src="/media/photo/${alb.cover_photo_id}"
-              loading="lazy"
-              alt="${alb.album_title}"
-            />
-            <div class="album-card-badges">
-              <span class="badge badge-child">${alb.archive_child}</span>
-              ${alb.year ? html`<span class="badge badge-year">${alb.year}</span>` : ""}
-            </div>
-          </div>
-          <div class="album-card-body">
-            <h3 class="album-card-title" title="${alb.album_title}">${alb.album_title}</h3>
-            <div class="album-card-meta">
-              <span>${plural(alb.photo_count, "photo")}</span>
-              <span>·</span>
-              <span>${plural(alb.face_count, "face")}</span>
-            </div>
-            <div class="album-card-status-bar">
-              ${alb.confirmed_count > 0
-                ? html`<span class="status-pill status-pill-confirmed" title="${alb.confirmed_count} confirmed">
-                    ✓ ${alb.confirmed_count}
-                  </span>`
-                : ""}
-              ${alb.auto_count > 0
-                ? html`<span class="status-pill status-pill-auto" title="${alb.auto_count} auto-matches">
-                    ⚡ ${alb.auto_count}
-                  </span>`
-                : ""}
-              ${alb.candidate_count > 0
-                ? html`<span class="status-pill status-pill-candidate" title="${alb.candidate_count} candidates">
-                    ? ${alb.candidate_count}
-                  </span>`
-                : ""}
-              ${alb.unassigned_count > 0
-                ? html`<span class="status-pill status-pill-none" title="${alb.unassigned_count} unassigned">
-                    ∅ ${alb.unassigned_count}
-                  </span>`
-                : ""}
-            </div>
-            ${topPills ? html`<div class="album-card-people">${topPills}</div>` : ""}
-          </div>
-        </div>
-      `;
-    })
-    .join("");
-
-  setHtml(grid, cardsHtml);
+  setHtml(grid, html`${state.albums.map(albumCardHtml)}`);
 }
 
 // ---------------------------------------------------------------- album detail
@@ -153,7 +153,7 @@ export async function openAlbumByKey(albumKey) {
   state.albumPersonFilter = null;
   el("albumListView").hidden = true;
   el("albumDetailView").hidden = false;
-  el("albumPhotosGrid").innerHTML = '<div class="empty-state">Loading album photos…</div>';
+  setHtml(el("albumPhotosGrid"), html`<div class="empty-state">Loading album photos…</div>`);
 
   const detail = await api(`/api/albums/detail?key=${encodeURIComponent(albumKey)}`);
   state.currentAlbumDetail = detail;
@@ -163,7 +163,7 @@ export async function openAlbumByKey(albumKey) {
 export async function openAlbumByPhotoId(photoId) {
   el("albumListView").hidden = true;
   el("albumDetailView").hidden = false;
-  el("albumPhotosGrid").innerHTML = '<div class="empty-state">Loading album photos…</div>';
+  setHtml(el("albumPhotosGrid"), html`<div class="empty-state">Loading album photos…</div>`);
 
   const detail = await api(`/api/albums/detail?photo_id=${encodeURIComponent(photoId)}`);
   state.selectedAlbumKey = detail.album_key;
@@ -194,26 +194,9 @@ export function renderAlbumDetail() {
     const isAll = state.albumPersonFilter === null;
     const isUnass = state.albumPersonFilter === "unassigned";
 
-    let chipsHtml = html`
-      <button
-        type="button"
-        class="album-filter-pill ${isAll ? "active" : ""}"
-        data-album-filter-person=""
-      >
-        All Photos (${detail.photo_count})
-      </button>
-      <button
-        type="button"
-        class="album-filter-pill ${isUnass ? "active" : ""}"
-        data-album-filter-person="unassigned"
-      >
-        Unassigned Faces (${detail.unassigned_count})
-      </button>
-    `;
-
-    for (const p of detail.people || []) {
+    const personPills = (detail.people || []).map((p) => {
       const active = state.albumPersonFilter === p.person_id;
-      chipsHtml += html`
+      return html`
         <button
           type="button"
           class="album-filter-pill ${active ? "active" : ""}"
@@ -223,11 +206,90 @@ export function renderAlbumDetail() {
           ${p.confirmed_count > 0 ? html`<span class="pill-badge">✓${p.confirmed_count}</span>` : ""}
         </button>
       `;
-    }
-    setHtml(personChipsWrap, chipsHtml);
+    });
+
+    setHtml(
+      personChipsWrap,
+      html`
+        <button
+          type="button"
+          class="album-filter-pill ${isAll ? "active" : ""}"
+          data-album-filter-person=""
+        >
+          All Photos (${detail.photo_count})
+        </button>
+        <button
+          type="button"
+          class="album-filter-pill ${isUnass ? "active" : ""}"
+          data-album-filter-person="unassigned"
+        >
+          Unassigned Faces (${detail.unassigned_count})
+        </button>
+        ${personPills}
+      `
+    );
   }
 
   renderAlbumPhotos();
+}
+
+function photoCardHtml(photo, pIdx) {
+  const faceChips = (photo.faces || []).map((face) => {
+    let statusLabel = "∅";
+    let statusCls = "status-none";
+    if (face.status === "confirmed") {
+      statusLabel = "✓";
+      statusCls = "status-confirmed";
+    } else if (face.status === "auto_high") {
+      const pct = face.similarity ? Math.round(face.similarity * 100) : "";
+      statusLabel = `⚡${pct ? ` ${pct}%` : ""}`;
+      statusCls = "status-auto";
+    } else if (face.status === "candidate") {
+      const pct = face.similarity ? Math.round(face.similarity * 100) : "";
+      statusLabel = `?${pct ? ` ${pct}%` : ""}`;
+      statusCls = "status-candidate";
+    }
+
+    const displayName = face.person_name || "Unassigned";
+
+    return html`
+      <button
+        type="button"
+        class="photo-face-chip ${statusCls}"
+        data-open-face-photo="${photo.photo_id}"
+        data-open-face-id="${face.face_id}"
+        data-photo-index="${pIdx}"
+        title="${displayName} (${face.status || "unassigned"})"
+      >
+        <img class="photo-face-avatar" src="${thumbSrc(face)}" alt="" loading="lazy" />
+        <span class="photo-face-name">${displayName}</span>
+        <span class="photo-face-badge">${statusLabel}</span>
+      </button>
+    `;
+  });
+
+  return html`
+    <div class="album-photo-card" data-album-photo-id="${photo.photo_id}" data-photo-index="${pIdx}">
+      <div class="album-photo-thumb-wrap" data-open-photo-idx="${pIdx}">
+        <img
+          class="album-photo-thumb"
+          src="/media/photo/${photo.photo_id}"
+          loading="lazy"
+          alt="${photo.filename}"
+        />
+        <div class="album-photo-badges">
+          <span class="badge badge-seq">#${photo.seq_in_album || pIdx + 1}</span>
+          <span class="badge badge-faces">${plural(photo.face_count, "face")}</span>
+        </div>
+      </div>
+      <div class="album-photo-footer">
+        <div class="album-photo-meta">${photo.filename}</div>
+        <div class="album-photo-faces-strip">
+          ${faceChips.length ? faceChips : html`<span class="album-photo-nofaces">No faces detected</span>`}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderAlbumPhotos() {
@@ -245,74 +307,11 @@ function renderAlbumPhotos() {
   }
 
   if (!photos.length) {
-    grid.innerHTML = '<div class="empty-state">No photos match the selected person filter.</div>';
+    setHtml(grid, html`<div class="empty-state">No photos match the selected person filter.</div>`);
     return;
   }
 
-  const cardsHtml = photos
-    .map((photo, pIdx) => {
-      const faceChips = (photo.faces || [])
-        .map((face) => {
-          let statusLabel = "∅";
-          let statusCls = "status-none";
-          if (face.status === "confirmed") {
-            statusLabel = "✓";
-            statusCls = "status-confirmed";
-          } else if (face.status === "auto_high") {
-            const pct = face.similarity ? Math.round(face.similarity * 100) : "";
-            statusLabel = `⚡${pct ? ` ${pct}%` : ""}`;
-            statusCls = "status-auto";
-          } else if (face.status === "candidate") {
-            const pct = face.similarity ? Math.round(face.similarity * 100) : "";
-            statusLabel = `?${pct ? ` ${pct}%` : ""}`;
-            statusCls = "status-candidate";
-          }
-
-          const displayName = face.person_name || "Unassigned";
-
-          return html`
-            <button
-              type="button"
-              class="photo-face-chip ${statusCls}"
-              data-open-face-photo="${photo.photo_id}"
-              data-open-face-id="${face.face_id}"
-              data-photo-index="${pIdx}"
-              title="${displayName} (${face.status || "unassigned"})"
-            >
-              <img class="photo-face-avatar" src="${thumbSrc(face.face_id)}" alt="" loading="lazy" />
-              <span class="photo-face-name">${displayName}</span>
-              <span class="photo-face-badge">${statusLabel}</span>
-            </button>
-          `;
-        })
-        .join("");
-
-      return html`
-        <div class="album-photo-card" data-album-photo-id="${photo.photo_id}" data-photo-index="${pIdx}">
-          <div class="album-photo-thumb-wrap" data-open-photo-idx="${pIdx}">
-            <img
-              class="album-photo-thumb"
-              src="/media/photo/${photo.photo_id}"
-              loading="lazy"
-              alt="${photo.filename}"
-            />
-            <div class="album-photo-badges">
-              <span class="badge badge-seq">#${photo.seq_in_album || pIdx + 1}</span>
-              <span class="badge badge-faces">${plural(photo.face_count, "face")}</span>
-            </div>
-          </div>
-          <div class="album-photo-footer">
-            <div class="album-photo-meta">${photo.filename}</div>
-            <div class="album-photo-faces-strip">
-              ${faceChips || html`<span class="album-photo-nofaces">No faces detected</span>`}
-            </div>
-          </div>
-        </div>
-      `;
-    })
-    .join("");
-
-  setHtml(grid, cardsHtml);
+  setHtml(grid, html`${photos.map((photo, pIdx) => photoCardHtml(photo, pIdx))}`);
 }
 
 // ---------------------------------------------------------------- event wiring
@@ -416,7 +415,6 @@ export function bindAlbumsEvents() {
       async () => {
         const res = await post("/api/albums/approve-all", { album_key: detail.album_key });
         showToast(`Approved ${plural(res.approved_count, "match")} in album! Rematch scheduled.`);
-        // Reload current album detail
         const updated = await api(`/api/albums/detail?key=${encodeURIComponent(detail.album_key)}`);
         state.currentAlbumDetail = updated;
         renderAlbumDetail();

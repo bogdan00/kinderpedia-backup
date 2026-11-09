@@ -839,7 +839,19 @@ await waitFor(`document.getElementById("classesModal").hidden`, "classes dialog 
 await evaluate(`document.getElementById("btnDiscoverClusters").click(), true`);
 await waitFor(`!document.getElementById("viewClusters").hidden && !!document.querySelector("#clustersGrid .cluster-card, #clustersGrid .empty-state")`, "unnamed clusters view");
 await evaluate(`document.getElementById("tabAlbums").click(), true`);
-await waitFor(`!document.getElementById("viewAlbums").hidden && !document.getElementById("albumListView").hidden`, "album browser view");
+await waitFor(`!document.getElementById("viewAlbums").hidden && !!document.querySelector("#albumsGrid .album-card, #albumsGrid .empty-state")`, "album browser view");
+const albumToast = await evaluate(`(document.getElementById("toast") || {}).textContent || ""`);
+if (albumToast.startsWith("⚠")) fail(`unexpected error toast after switching to albums: ${albumToast}`);
+
+const hasAlbumCard = await evaluate(`!!document.querySelector("#albumsGrid .album-card")`);
+if (hasAlbumCard) {
+  await evaluate(`document.querySelector("#albumsGrid .album-card").click(), true`);
+  await waitFor(`!document.getElementById("albumDetailView").hidden && !!document.querySelector("#albumPhotosGrid .album-photo-card, #albumPhotosGrid .empty-state")`, "album detail photos");
+  const detailToast = await evaluate(`(document.getElementById("toast") || {}).textContent || ""`);
+  if (detailToast.startsWith("⚠")) fail(`unexpected error toast in album detail: ${detailToast}`);
+  await evaluate(`document.getElementById("btnBackToAlbums").click(), true`);
+  await waitFor(`!document.getElementById("albumListView").hidden`, "back to album list");
+}
 
 if (exceptions.length) fail(`uncaught page exceptions: ${JSON.stringify(exceptions.slice(0, 3))}`);
 clearTimeout(hardTimer);
