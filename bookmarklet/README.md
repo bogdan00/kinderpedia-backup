@@ -39,7 +39,7 @@ Zero-install, 1-click browser tool for parents to download all kindergarten phot
 ### Files in `bookmarklet/`
 
 - `index.html` — Install & documentation page (deployed to GitHub Pages via `.github/workflows/pages.yml`).
-- `kinderpedia-backup.js` / `kinderpedia-backup.min.js` — Main browser engine using the File System Access API (`showDirectoryPicker`), Shadow DOM UI, and AIMD adaptive rate limiting.
+- `kinderpedia-backup.js` — Main browser engine using the File System Access API (`showDirectoryPicker`), Shadow DOM UI, and AIMD adaptive rate limiting.
 - `mux.min.js` — Browser HLS-to-MP4 transmuxer so Vimeo HLS streams save as standard `.mp4` files without requiring native `ffmpeg`.
 - `worker.js` — Stateless Cloudflare Worker (configured via root `../wrangler.toml`) that relays Vimeo embed player JSON metadata with CORS headers so browser `fetch()` calls can resolve video stream URLs.
 - `serve.js` — Optional local Node.js development & fallback Vimeo streaming server (`node bookmarklet/serve.js`, listens on `http://localhost:8080`).

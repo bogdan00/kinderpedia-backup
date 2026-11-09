@@ -46,11 +46,8 @@ jobs:
       - name: Syntax check
         run: |
           node --check bookmarklet/kinderpedia-backup.js
-          node --check bookmarklet/kinderpedia-backup.min.js
           node --check bookmarklet/serve.js
           node --check bookmarklet/worker.js
-      - name: kinderpedia-backup.min.js must be an exact copy of kinderpedia-backup.js
-        run: cmp bookmarklet/kinderpedia-backup.js bookmarklet/kinderpedia-backup.min.js
       - name: Shared layout contract (python/tests/fixtures/layout_contract.json)
         run: node --test bookmarklet/tests/layout_contract.test.mjs
 

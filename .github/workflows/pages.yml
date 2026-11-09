@@ -31,7 +31,7 @@ jobs:
           cp bookmarklet/favicon.svg _site/
           cp bookmarklet/favicon.png _site/
           cp bookmarklet/kinderpedia-backup.js _site/
-          cp bookmarklet/kinderpedia-backup.min.js _site/
+          cp bookmarklet/kinderpedia-backup.js _site/kinderpedia-backup.min.js # backward-compat for legacy bookmark URLs
           cp bookmarklet/mux.min.js _site/
           touch _site/.nojekyll
 
