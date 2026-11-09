@@ -29,6 +29,7 @@ export function parseUrl() {
     album: null,
     child: null,
     year: null,
+    filterPerson: null,
     photo: null,
     face: null,
   };
@@ -59,6 +60,10 @@ export function parseUrl() {
       if (sp.has("album")) result.album = sp.get("album");
       if (sp.has("child")) result.child = sp.get("child");
       if (sp.has("year")) result.year = sp.get("year");
+      if (sp.has("filterPerson")) {
+        const val = sp.get("filterPerson");
+        result.filterPerson = val === "unassigned" ? "unassigned" : (Number(val) || null);
+      }
       if (sp.has("photo")) result.photo = Number(sp.get("photo"));
       if (sp.has("face")) result.face = Number(sp.get("face"));
     }
@@ -72,6 +77,10 @@ export function parseUrl() {
     if (!result.album && sp.has("album")) result.album = sp.get("album");
     if (!result.child && sp.has("child")) result.child = sp.get("child");
     if (!result.year && sp.has("year")) result.year = sp.get("year");
+    if (sp.has("filterPerson")) {
+      const val = sp.get("filterPerson");
+      result.filterPerson = val === "unassigned" ? "unassigned" : (Number(val) || null);
+    }
     if (!result.photo && sp.has("photo")) result.photo = Number(sp.get("photo"));
     if (!result.face && sp.has("face")) result.face = Number(sp.get("face"));
   }
@@ -87,6 +96,9 @@ export function buildUrl() {
     if (state.selectedAlbumKey) params.set("album", state.selectedAlbumKey);
     if (state.albumFilterChild) params.set("child", state.albumFilterChild);
     if (state.albumFilterYear) params.set("year", state.albumFilterYear);
+    if (state.albumPersonFilter !== null && state.albumPersonFilter !== undefined) {
+      params.set("filterPerson", String(state.albumPersonFilter));
+    }
   } else if (mode !== "clusters" && state.selectedPersonId) {
     params.set("person", String(state.selectedPersonId));
   }
@@ -120,7 +132,7 @@ export async function loadActiveView() {
   else if (state.mode === "clusters") await loadClusters();
   else if (state.mode === "albums") {
     if (state.selectedAlbumKey) {
-      await openAlbumByKey(state.selectedAlbumKey);
+      await openAlbumByKey(state.selectedAlbumKey, state.albumPersonFilter !== null);
     } else {
       await loadAlbums();
     }
@@ -164,6 +176,13 @@ export async function handleUrlChange() {
     }
     if (parsed.child !== null) state.albumFilterChild = parsed.child || "";
     if (parsed.year !== null) state.albumFilterYear = parsed.year || "";
+    let filterPersonChanged = false;
+    if (parsed.filterPerson !== null) {
+      if (state.albumPersonFilter !== parsed.filterPerson) {
+        state.albumPersonFilter = parsed.filterPerson;
+        filterPersonChanged = true;
+      }
+    }
 
     if (state.mode === "albums") {
       const targetAlbum = parsed.album || null;
@@ -176,7 +195,7 @@ export async function handleUrlChange() {
     syncModeTabs();
     emit("overview");
 
-    if (modeChanged || personChanged || albumChanged) {
+    if (modeChanged || personChanged || albumChanged || filterPersonChanged) {
       await loadActiveView();
     }
 

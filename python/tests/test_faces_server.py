@@ -913,9 +913,18 @@ if (albumToast.startsWith("⚠")) fail(`unexpected error toast after switching t
 const hasAlbumCard = await evaluate(`!!document.querySelector("#albumsGrid .album-card")`);
 if (hasAlbumCard) {
   await evaluate(`document.querySelector("#albumsGrid .album-card").click(), true`);
-  await waitFor(`!document.getElementById("albumDetailView").hidden && !!document.querySelector("#albumPhotosGrid .album-photo-card, #albumPhotosGrid .empty-state")`, "album detail photos");
+  await waitFor(`!document.getElementById("albumDetailView").hidden && !!document.querySelector("#albumPhotosGrid .album-photo-card")`, "album detail photos");
   const detailToast = await evaluate(`(document.getElementById("toast") || {}).textContent || ""`);
   if (detailToast.startsWith("⚠")) fail(`unexpected error toast in album detail: ${detailToast}`);
+
+  const targetPhotoId = await evaluate(`Number(document.querySelector("#albumPhotosGrid .album-photo-card").dataset.albumPhotoId)`);
+  await evaluate(`document.querySelector("#albumPhotosGrid .album-photo-thumb-wrap").click(), true`);
+  await waitFor(`window.__kpModalOpen()`, "album photo lightbox open");
+  const modalSrc = await evaluate(`document.getElementById("modalPhotoImg").getAttribute("src")`);
+  if (modalSrc !== `/media/photo/${targetPhotoId}`) fail(`album photo mismatch: expected /media/photo/${targetPhotoId}, got ${modalSrc}`);
+  await evaluate(`document.getElementById("btnCloseModal").click(), true`);
+  await waitFor(`document.getElementById("photoModal").hidden`, "lightbox closed from album");
+
   await evaluate(`document.getElementById("btnBackToAlbums").click(), true`);
   await waitFor(`!document.getElementById("albumListView").hidden`, "back to album list");
 }

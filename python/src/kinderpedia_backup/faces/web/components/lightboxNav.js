@@ -123,7 +123,12 @@ export async function jumpToModalNavIndex(newIndex) {
   if (!ctx || !items.length) return;
   ctx.index = wrapIndex(newIndex, items.length);
   const item = items[ctx.index];
-  await openPhotoModal(item.photo_id, item.face_id || null, true);
+  let highlightFaceId = item.face_id || null;
+  if (!highlightFaceId && ctx.filterPersonId && Array.isArray(item.faces)) {
+    const match = item.faces.find((f) => f.person_id === ctx.filterPersonId);
+    if (match) highlightFaceId = match.face_id;
+  }
+  await openPhotoModal(item.photo_id, highlightFaceId, true);
 }
 
 // ---------------------------------------------------------------- rendering
@@ -193,7 +198,8 @@ export function renderModalNavControls() {
     el("modalClusterPos").textContent = `${ctx.index + 1} / ${items.length} photos in cluster${dedupeNavNote(ctx)}`;
     el("modalClusterTitle").textContent = `${ctx.archiveChild} · ${ctx.year} (${ctx.photoCount} photos)`;
   } else if (isAlbum) {
-    const label = `Album Photo ${ctx.index + 1} of ${items.length}`;
+    const filterNote = ctx.filterPersonName ? ` · Filter: ${ctx.filterPersonName}` : "";
+    const label = `Album Photo ${ctx.index + 1} of ${items.length}${filterNote}`;
     el("modalClusterPos").textContent = label;
     el("modalClusterTitle").textContent = ctx.albumTitle || label;
   } else {

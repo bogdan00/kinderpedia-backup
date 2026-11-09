@@ -155,9 +155,9 @@ function renderAlbumsList() {
 }
 
 // ---------------------------------------------------------------- album detail
-export async function openAlbumByKey(albumKey) {
+export async function openAlbumByKey(albumKey, keepPersonFilter = false) {
   state.selectedAlbumKey = albumKey;
-  state.albumPersonFilter = null;
+  if (!keepPersonFilter) state.albumPersonFilter = null;
   el("albumListView").hidden = true;
   el("albumDetailView").hidden = false;
   updateUrl();
@@ -269,6 +269,20 @@ export function renderAlbumDetail() {
   renderAlbumPhotos();
 }
 
+export function getFilteredAlbumPhotos() {
+  const detail = state.currentAlbumDetail;
+  if (!detail || !detail.photos) return [];
+  const filterPid = state.albumPersonFilter;
+  let photos = detail.photos;
+  if (filterPid === "unassigned") {
+    return photos.filter((p) => (p.faces || []).some((f) => !f.person_id));
+  }
+  if (typeof filterPid === "number") {
+    return photos.filter((p) => (p.faces || []).some((f) => f.person_id === filterPid));
+  }
+  return photos;
+}
+
 function photoCardHtml(photo, pIdx) {
   const faceChips = (photo.faces || []).map((face) => {
     let statusLabel = "∅";
@@ -306,7 +320,7 @@ function photoCardHtml(photo, pIdx) {
 
   return html`
     <div class="album-photo-card" data-album-photo-id="${photo.photo_id}" data-photo-index="${pIdx}">
-      <div class="album-photo-thumb-wrap" data-open-photo-idx="${pIdx}">
+      <div class="album-photo-thumb-wrap" data-open-photo-id="${photo.photo_id}" data-open-photo-idx="${pIdx}">
         <img
           class="album-photo-thumb"
           src="/media/photo/${photo.photo_id}"
@@ -333,14 +347,7 @@ function renderAlbumPhotos() {
   if (!detail) return;
 
   const grid = el("albumPhotosGrid");
-  const filterPid = state.albumPersonFilter;
-
-  let photos = detail.photos || [];
-  if (filterPid === "unassigned") {
-    photos = photos.filter((p) => (p.faces || []).some((f) => !f.person_id));
-  } else if (typeof filterPid === "number") {
-    photos = photos.filter((p) => (p.faces || []).some((f) => f.person_id === filterPid));
-  }
+  const photos = getFilteredAlbumPhotos();
 
   if (!photos.length) {
     setHtml(grid, html`<div class="empty-state">No photos match the selected person filter.</div>`);
@@ -413,37 +420,74 @@ export function bindAlbumsEvents() {
       state.albumPersonFilter = Number(val);
     }
     renderAlbumDetail();
+    updateUrl({ replace: true });
   });
 
   // Clicking a photo thumbnail in album detail -> opens Lightbox with album nav context
-  delegate(document.body, "click", ".album-photo-thumb-wrap[data-open-photo-idx]", (_ev, wrap) => {
-    const pIdx = Number(wrap.getAttribute("data-open-photo-idx"));
+  delegate(document.body, "click", ".album-photo-thumb-wrap", (_ev, wrap) => {
+    const rawPhotoId =
+      wrap.getAttribute("data-open-photo-id") ||
+      wrap.closest(".album-photo-card")?.getAttribute("data-album-photo-id");
+    const photoId = Number(rawPhotoId);
     const detail = state.currentAlbumDetail;
-    if (!detail || !detail.photos || !detail.photos[pIdx]) return;
-    const photo = detail.photos[pIdx];
+    if (!detail) return;
+    const photos = getFilteredAlbumPhotos();
+    const pIdx = photos.findIndex((p) => Number(p.photo_id) === photoId);
+    if (pIdx < 0) return;
+    const photo = photos[pIdx];
+
+    const filterPid = state.albumPersonFilter;
+    let targetFaceId = null;
+    let filterName = "";
+    if (typeof filterPid === "number") {
+      if (photo.faces) {
+        const matchFace = photo.faces.find((f) => f.person_id === filterPid);
+        if (matchFace) targetFaceId = matchFace.face_id;
+      }
+      const matchedPerson = (detail.people || []).find((p) => p.person_id === filterPid);
+      filterName = matchedPerson ? matchedPerson.display_name : "";
+    } else if (filterPid === "unassigned") {
+      filterName = "Unassigned";
+    }
 
     state.modalNavContext = {
       type: "album",
       albumKey: detail.album_key,
-      photos: detail.photos,
+      albumTitle: detail.album_title,
+      photos,
       index: pIdx,
+      filterPersonId: typeof filterPid === "number" ? filterPid : null,
+      filterPersonName: filterName,
     };
-    openPhotoModal(photo.photo_id, null, true);
+    openPhotoModal(photo.photo_id, targetFaceId, true);
   });
 
   // Clicking a face chip -> opens Lightbox focused on that face with album nav context
   delegate(document.body, "click", ".photo-face-chip[data-open-face-photo]", (_ev, chip) => {
     const photoId = Number(chip.getAttribute("data-open-face-photo"));
     const faceId = Number(chip.getAttribute("data-open-face-id"));
-    const pIdx = Number(chip.getAttribute("data-photo-index"));
     const detail = state.currentAlbumDetail;
     if (!detail) return;
+    const photos = getFilteredAlbumPhotos();
+    const pIdx = photos.findIndex((p) => Number(p.photo_id) === photoId);
+
+    const filterPid = state.albumPersonFilter;
+    let filterName = "";
+    if (typeof filterPid === "number") {
+      const matchedPerson = (detail.people || []).find((p) => p.person_id === filterPid);
+      filterName = matchedPerson ? matchedPerson.display_name : "";
+    } else if (filterPid === "unassigned") {
+      filterName = "Unassigned";
+    }
 
     state.modalNavContext = {
       type: "album",
       albumKey: detail.album_key,
-      photos: detail.photos,
-      index: Number.isFinite(pIdx) ? pIdx : 0,
+      albumTitle: detail.album_title,
+      photos,
+      index: pIdx >= 0 ? pIdx : 0,
+      filterPersonId: typeof filterPid === "number" ? filterPid : null,
+      filterPersonName: filterName,
     };
     openPhotoModal(photoId, faceId, true);
   });

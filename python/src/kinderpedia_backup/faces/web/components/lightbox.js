@@ -250,6 +250,10 @@ export async function closePhotoModal() {
     if (state.mode === "gallery") await loadGallery();
     else if (state.mode === "clusters") await loadClusters();
     else if (state.mode === "childclusters") await reloadChildClustersPreservingUi();
+    else if (state.mode === "albums" && state.selectedAlbumKey) {
+      const { openAlbumByKey } = await import("../views/albums.js");
+      await openAlbumByKey(state.selectedAlbumKey, true);
+    }
   } catch (err) {
     reportError(err, "Refresh view");
   }
