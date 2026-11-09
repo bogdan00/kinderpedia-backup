@@ -82,8 +82,11 @@ function updateBatchHeaderCopy() {
   const meta = state.batchMeta;
   const hiSim = cards[0].similarity.toFixed(2);
   const loSim = cards[cards.length - 1].similarity.toFixed(2);
-  const remCount = Math.max(cards.length, meta ? meta.remaining_unreviewed : cards.length);
-  el("batchHeading").textContent = `Are these ${selP.display_name}? (${cards.length} shown of ${remCount} queued · sim ${hiSim} → ${loSim})`;
+  const nAudits = (meta && meta.audit_count) || cards.filter((c) => c.audit).length;
+  const remCands = meta && typeof meta.remaining_unreviewed === "number" ? meta.remaining_unreviewed : cards.length;
+  const auditSuffix = nAudits > 0 ? ` incl. ${nAudits} audit` : "";
+  const totalInQueue = Math.max(cards.length, remCands + nAudits);
+  el("batchHeading").textContent = `Are these ${selP.display_name}? (${cards.length} shown${auditSuffix} of ${totalInQueue} queued · sim ${hiSim} → ${loSim})`;
   const topPeers = ((meta && meta.top_peers) || []).slice(0, 4);
   const peersNote = topPeers.length
     ? html`<br />Learned peers: ${topPeers.map(

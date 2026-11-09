@@ -499,38 +499,19 @@ class QueriesUIMixin(ClustersMixin):
                 (person_id,),
             ).fetchone()
             remaining = int(total_row["n"]) if total_row else 0
-
-            n_audit_want = (
-                max(0, int(audit_per_batch))
-                if audit_per_batch is not None
-                else max(0, round(batch_size / 12))
-            )
-            n_audit_want = min(n_audit_want, max(0, batch_size - 1))
-            audit_rows: list[sqlite3.Row] = []
-            if n_audit_want > 0 and int(person_row["cohesion_count"] or 0) > 0:
-                audit_rows = self._conn.execute(
-                    """
-                    WITH pick AS (
-                        SELECT photo_id, face_id, status, source, similarity
-                        FROM assignments
-                        WHERE person_id = ?
-                          AND status = 'auto_high'
-                          AND source IN ('album_cohesion', 'model_trusted')
-                        ORDER BY RANDOM()
-                        LIMIT ?
-                    )
-                    SELECT
-                        tc.photo_id, tc.face_id, tc.status, tc.source, tc.similarity,
-                        p.rel_path, p.archive_child, p.year, p.album_leaf, p.album_title,
-                        p.album_date, p.filename, p.best_live_url, p.face_count,
-                        f.det_score, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left
-                    FROM pick tc
-                    JOIN photos p ON p.photo_id = tc.photo_id
-                    LEFT JOIN faces f ON f.face_id = tc.face_id
-                    """,
-                    (person_id, n_audit_want),
-                ).fetchall()
-            main_size = max(1, batch_size - len(audit_rows))
+            if remaining == 0:
+                top_peers = self.get_person_peers(person_id)
+                return {
+                    "person_id": int(person_row["person_id"]),
+                    "display_name": str(person_row["display_name"]),
+                    "remaining_unreviewed": 0,
+                    "album_cohesion_count": int(person_row["cohesion_count"] or 0),
+                    "batch_count": 0,
+                    "audit_count": 0,
+                    "mode": mode,
+                    "top_peers": top_peers,
+                    "cards": [],
+                }
 
             pool_rows = self._conn.execute(
                 """
@@ -568,6 +549,62 @@ class QueriesUIMixin(ClustersMixin):
                 (person_id, fetch_pool),
             ).fetchall()
 
+            if not pool_rows:
+                top_peers = self.get_person_peers(person_id)
+                return {
+                    "person_id": int(person_row["person_id"]),
+                    "display_name": str(person_row["display_name"]),
+                    "remaining_unreviewed": 0,
+                    "album_cohesion_count": int(person_row["cohesion_count"] or 0),
+                    "batch_count": 0,
+                    "audit_count": 0,
+                    "mode": mode,
+                    "top_peers": top_peers,
+                    "cards": [],
+                }
+
+            if audit_per_batch is not None:
+                n_audit_want = max(0, int(audit_per_batch))
+                # Never let audit cards take over the entire batch: at least 1 candidate must remain
+                n_audit_want = min(n_audit_want, max(0, batch_size - 1), max(0, len(pool_rows) - 1))
+            else:
+                # Audit cards are spot checks mixed into actual candidate batches.
+                # Target ~1 audit card per 12 candidate cards (up to round(batch_size / 12)).
+                # When pool is small (< 6 candidates), don't inject audit cards so the user can finish the queue.
+                target_audit = max(0, round(batch_size / 12))
+                if len(pool_rows) >= 16:
+                    n_audit_want = min(target_audit, max(0, batch_size - 1))
+                elif len(pool_rows) >= 6:
+                    n_audit_want = min(1, target_audit, max(0, batch_size - 1))
+                else:
+                    n_audit_want = 0
+
+            audit_rows: list[sqlite3.Row] = []
+            if n_audit_want > 0 and int(person_row["cohesion_count"] or 0) > 0:
+                audit_rows = self._conn.execute(
+                    """
+                    WITH pick AS (
+                        SELECT photo_id, face_id, status, source, similarity
+                        FROM assignments
+                        WHERE person_id = ?
+                          AND status = 'auto_high'
+                          AND source IN ('album_cohesion', 'model_trusted')
+                        ORDER BY RANDOM()
+                        LIMIT ?
+                    )
+                    SELECT
+                        tc.photo_id, tc.face_id, tc.status, tc.source, tc.similarity,
+                        p.rel_path, p.archive_child, p.year, p.album_leaf, p.album_title,
+                        p.album_date, p.filename, p.best_live_url, p.face_count,
+                        f.det_score, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left
+                    FROM pick tc
+                    JOIN photos p ON p.photo_id = tc.photo_id
+                    LEFT JOIN faces f ON f.face_id = tc.face_id
+                    """,
+                    (person_id, n_audit_want),
+                ).fetchall()
+            main_size = max(1, batch_size - len(audit_rows))
+
         # Lock order rule: `_faces_matrix_lock` is always taken BEFORE (never inside) `_lock`, so the
         # impact selection (which reads the RAM matrix + runs an SGEMM) must run with `_lock` released.
         impact_by_photo: dict[int, int] = {}
@@ -590,13 +627,18 @@ class QueriesUIMixin(ClustersMixin):
                     overflow_rows.append(r_cand)
             if len(rows) < main_size and overflow_rows:
                 rows.extend(overflow_rows[: main_size - len(rows)])
-            audit_photo_ids: set[int] = set()
-            if audit_rows:
+            audit_keys: set[tuple[int, int | None]] = set()
+            if audit_rows and rows:
                 rng = random.Random()
                 merged: list[sqlite3.Row] = list(rows)
                 for a_row in audit_rows:
                     merged.insert(rng.randint(0, len(merged)), a_row)
-                    audit_photo_ids.add(int(a_row["photo_id"]))
+                    audit_keys.add(
+                        (
+                            int(a_row["photo_id"]),
+                            int(a_row["face_id"]) if a_row["face_id"] is not None else None,
+                        )
+                    )
                 rows = merged
 
             companions_by_photo: dict[int, list[str]] = {}
@@ -628,10 +670,11 @@ class QueriesUIMixin(ClustersMixin):
         for r in rows:
             sim = float(r["similarity"])
             pid_val = int(r["photo_id"])
+            fid_val = int(r["face_id"]) if r["face_id"] is not None else None
             cards.append(
                 {
                     "photo_id": pid_val,
-                    "face_id": int(r["face_id"]) if r["face_id"] is not None else None,
+                    "face_id": fid_val,
                     "status": str(r["status"]),
                     "source": str(r["source"] or ""),
                     "similarity": round(sim, 4),
@@ -643,7 +686,7 @@ class QueriesUIMixin(ClustersMixin):
                         if sim >= ambiguous_min_sim
                         else "disproved"
                     ),
-                    "audit": pid_val in audit_photo_ids,
+                    "audit": (pid_val, fid_val) in audit_keys,
                     "archive_child": str(r["archive_child"]),
                     "year": str(r["year"]),
                     "album_leaf": str(r["album_leaf"]),

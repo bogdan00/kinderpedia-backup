@@ -582,6 +582,8 @@ class FacesPipelineTests(unittest.TestCase):
                 next_batch = db.get_batch_proposal(alex_id)
                 self.assertEqual(next_batch["remaining_unreviewed"], 0)
                 self.assertEqual(next_batch["album_cohesion_count"], 5)
+                self.assertEqual(len(next_batch["cards"]), 0)
+                self.assertEqual(next_batch["audit_count"], 0)
 
                 # All 6 bunnysuit photos (1 confirmed + 5 album_cohesion) are included in Alex's gallery,
                 # while the 7th unrelated classmate photo is NOT included:

@@ -732,6 +732,34 @@ class BatchProposalAuditTests(unittest.TestCase):
                     want = "approved" if sim >= 0.50 else ("unsure" if sim >= 0.38 else "disproved")
                     self.assertEqual(c["default_decision"], want)
 
+            # Regression: when candidates are few (e.g. 2 left), no audit cards are injected to avoid infinite looping
+            small_rows: list[tuple[int, int, int, Any, float, Any]] = [
+                (saved[0][0], pid, saved[0][1][0], "candidate", 0.45, "model_match"),
+                (saved[1][0], pid, saved[1][1][0], "candidate", 0.42, "model_match"),
+            ]
+            for photo_id, (fid,) in saved[2:]:
+                small_rows.append((photo_id, pid, fid, "auto_high", 0.70, "album_cohesion"))
+            db.replace_model_assignments(small_rows, set())
+            small_prop = db.get_batch_proposal(pid, batch_size=24)
+            self.assertEqual(small_prop["remaining_unreviewed"], 2)
+            self.assertEqual(small_prop["batch_count"], 2)
+            self.assertEqual(small_prop["audit_count"], 0)
+            self.assertEqual(len(small_prop["cards"]), 2)
+            self.assertTrue(all(not c["audit"] for c in small_prop["cards"]))
+
+            # Regression: when all candidates are resolved (0 remaining), queue ends immediately
+            # with 0 cards returned (never endless audit cards when candidates are done).
+            no_cand_rows: list[tuple[int, int, int, Any, float, Any]] = [
+                (photo_id, pid, fid, "auto_high", 0.70, "album_cohesion")
+                for photo_id, (fid,) in saved
+            ]
+            db.replace_model_assignments(no_cand_rows, set())
+            done_prop = db.get_batch_proposal(pid, batch_size=24)
+            self.assertEqual(done_prop["remaining_unreviewed"], 0)
+            self.assertEqual(done_prop["batch_count"], 0)
+            self.assertEqual(done_prop["audit_count"], 0)
+            self.assertEqual(len(done_prop["cards"]), 0)
+
 
 class UpsertBatchApiTests(unittest.TestCase):
     def test_upsert_without_hashes_still_works_and_returns_face_ids(self) -> None:
