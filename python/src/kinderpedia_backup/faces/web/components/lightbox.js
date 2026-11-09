@@ -346,12 +346,17 @@ export function bindLightbox() {
       async () => {
         try {
           const box = [face.bbox_left, face.bbox_top, face.bbox_right, face.bbox_bottom];
-          const res = await post("/api/vlm/inspect-face", {
-            photo_id: photo.photo_id,
-            face_id: fid,
-            box,
-            person_name: face.person_name || "",
-          });
+          const res = await post(
+            "/api/vlm/inspect-face",
+            {
+              photo_id: photo.photo_id,
+              face_id: fid,
+              box,
+              person_name: face.person_name || "",
+            },
+            "POST",
+            { timeoutMs: 90000 }
+          );
           if (res && res.signature) {
             vlmInspectionCache.set(fid, res.signature);
             if (slot) setHtml(slot, vlmInspectionHtml(fid));

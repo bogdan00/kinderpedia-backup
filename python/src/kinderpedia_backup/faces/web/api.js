@@ -5,8 +5,7 @@ import { el } from "./util/dom.js";
 
 const DEFAULT_TIMEOUT_MS = 45000;
 const OFFLINE_MSG = "Cannot reach backend on 127.0.0.1:8765 (server may be restarting)";
-const SLOW_MSG =
-  "The backend is taking longer than usual to answer — it is still working; watch the status chip and retry in a moment";
+const SLOW_MSG = "Request timed out — backend is still working in background";
 
 let inFlightRequests = 0;
 let jobStartsInFlight = 0;
@@ -129,8 +128,8 @@ export async function api(path, opts = {}) {
 }
 
 /** POST JSON helper. */
-export function post(path, body = {}, method = "POST") {
-  return api(path, { method, body: JSON.stringify(body) });
+export function post(path, body = {}, method = "POST", opts = {}) {
+  return api(path, { ...opts, method, body: JSON.stringify(body) });
 }
 
 /** GET that never throws or flags offline (background refreshes): JSON or null. */
