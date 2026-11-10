@@ -120,10 +120,10 @@ export function bindOverview() {
   );
   delegate(document.body, "click", "[data-export]", (_ev, btn) => exportUrls(btn));
   on("btnRecluster", "click", (_ev, btn) => runJob(btn, "/api/recluster", {}, "Refresh scan"));
-  on("btnMaterializeAll", "click", (_ev, btn) => runJob(btn, "/api/materialize", {}, "Sync all folders"));
+  on("btnMaterializeAll", "click", (_ev, btn) => runJob(btn, "/api/materialize", {}, "Export photos by child"));
   on("btnSyncPersonFolder", "click", (_ev, btn) => {
     const selP = getSelectedPerson();
-    if (selP) runJob(btn, "/api/materialize", { person: selP.display_name }, "Sync folder");
+    if (selP) runJob(btn, "/api/materialize", { person: selP.display_name }, "Export photo folder");
   });
   on("btnDiscoverClusters", "click", (_ev, btn) => runBusy(btn, () => switchMode("clusters"), { context: "Load clusters" }));
   on("btnAddPerson", "click", (_ev, btn) => addPerson(btn));

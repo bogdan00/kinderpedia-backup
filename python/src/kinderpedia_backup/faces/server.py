@@ -66,7 +66,7 @@ _FINISHED_JOBS_KEEP = 20
 
 _JOB_LABELS = {
     "recluster": "Rebuilding clusters & re-matching…",
-    "materialize": "Syncing ByChild/ folders…",
+    "materialize": "Exporting photos by child…",
     "vlm_album": "VLM clothing continuity check…",
     "vlm_batch": "Batch VLM assistant across albums…",
 }
@@ -1989,9 +1989,9 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             max_c = int(body.get("max_curated") or 3)
             min_px = int(body.get("min_face_px") or 70)
             label = (
-                f"Syncing ByChild/{person_f}/ ({layout_val})…"
+                f"Exporting {person_f}'s photos ({layout_val})…"
                 if person_f
-                else f"Syncing ByChild/ folders ({layout_val})…"
+                else f"Exporting photos by child ({layout_val})…"
             )
 
             def _mat_task(_jid: str = "") -> dict[str, Any]:

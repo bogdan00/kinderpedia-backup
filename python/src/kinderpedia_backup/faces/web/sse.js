@@ -29,7 +29,7 @@ export function jobCompletionMessage(job, wasMine) {
     const ly = r.layout ? ` (${r.layout})` : "";
     return {
       kind: "info",
-      text: `Synced ${where}${ly}: ${r.links_created ?? 0} new links, ${r.links_existing ?? 0} existing, ${r.links_pruned ?? 0} pruned.`,
+      text: `Exported ${where}${ly}: ${r.links_created ?? 0} new, ${r.links_existing ?? 0} existing, ${r.links_pruned ?? 0} pruned.`,
     };
   }
   return wasMine ? { kind: "info", text: `${job.label || job.kind} finished.` } : null;
