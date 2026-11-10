@@ -588,12 +588,8 @@ class PeopleMixin(DBCore):
             family_rows = self._conn.execute(
                 "SELECT person_id, display_name, archive_hint FROM people WHERE role = 'family' ORDER BY person_id"
             ).fetchall()
-            family_people = [
-                {
-                    "person_id": int(r["person_id"]),
-                    "display_name": str(r["display_name"]),
-                    "archive_hint": str(r["archive_hint"] or ""),
-                }
+            family_people: list[tuple[int, str, str]] = [
+                (int(r["person_id"]), str(r["display_name"]), str(r["archive_hint"] or ""))
                 for r in family_rows
             ]
             if role == "ignore":
@@ -611,11 +607,11 @@ class PeopleMixin(DBCore):
                     "is_self_benchmark": False,
                     "class_archive_total": 0,
                     "classes": [],
-                    "family_names": [fp["display_name"] for fp in family_people],
+                    "family_names": [fp_name for _fp_id, fp_name, _fp_hint in family_people],
                 }
             photo_info = self._get_photo_date_map_locked()
             class_totals = self._get_class_totals_locked(classes, photo_info)
-            relevant_pids = sorted({person_id} | {fp["person_id"] for fp in family_people})
+            relevant_pids: list[int] = sorted({person_id} | {fp_id for fp_id, _fp_name, _fp_hint in family_people})
             placeholders = ",".join("?" for _ in relevant_pids)
             tag_rows = self._conn.execute(
                 f"SELECT person_id, photo_id FROM assignments WHERE person_id IN ({placeholders}) AND status IN ('confirmed', 'auto_high')",  # noqa: S608 - parameterized IN list
@@ -651,28 +647,26 @@ class PeopleMixin(DBCore):
             class_photos_by_pid[pid] = pid_map
 
         # Pick benchmark family child for each class
-        bench_by_cid: dict[int, dict[str, Any] | None] = {}
+        bench_by_cid: dict[int, tuple[int, str, str] | None] = {}
         for c in classes:
             cid = int(c["class_id"])
             ac_low = str(c["archive_child"] or "").strip().lower()
-            candidates: list[dict[str, Any]] = []
+            candidates: list[tuple[int, str, str]] = []
             if ac_low:
                 candidates = [
-                    fp
-                    for fp in family_people
-                    if fp["display_name"].lower() == ac_low or fp["archive_hint"].lower() == ac_low
+                    fp for fp in family_people if fp[1].lower() == ac_low or fp[2].lower() == ac_low
                 ]
             if not candidates:
                 member_set = set(c.get("member_ids") or [])
-                candidates = [fp for fp in family_people if fp["person_id"] in member_set]
+                candidates = [fp for fp in family_people if fp[0] in member_set]
             if not candidates:
                 candidates = [
-                    fp for fp in family_people if len(class_photos_by_pid[fp["person_id"]].get(cid, set())) > 0
+                    fp for fp in family_people if len(class_photos_by_pid[fp[0]].get(cid, set())) > 0
                 ]
             if candidates:
                 bench_by_cid[cid] = max(
                     candidates,
-                    key=lambda fp: (len(class_photos_by_pid[fp["person_id"]].get(cid, set())), -fp["person_id"]),
+                    key=lambda fp: (len(class_photos_by_pid[fp[0]].get(cid, set())), -fp[0]),
                 )
             else:
                 bench_by_cid[cid] = None
@@ -709,8 +703,7 @@ class PeopleMixin(DBCore):
             archive_union_total += c_total
             bp = bench_by_cid.get(cid)
             if bp is not None:
-                bp_id = int(bp["person_id"])
-                bp_name = str(bp["display_name"])
+                bp_id, bp_name, _bp_hint = bp
                 c_bench_pids = class_photos_by_pid[bp_id].get(cid, set())
                 for ph in c_bench_pids:
                     bench_pair_union.add((bp_id, ph))
@@ -764,7 +757,7 @@ class PeopleMixin(DBCore):
             "is_self_benchmark": is_self_benchmark,
             "class_archive_total": archive_union_total,
             "classes": per_class,
-            "family_names": [fp["display_name"] for fp in family_people],
+            "family_names": [fp_name for _fp_id, fp_name, _fp_hint in family_people],
         }
 
     def merge_people(self, source_person_id: int, target_person_id: int) -> None:
