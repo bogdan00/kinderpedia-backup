@@ -1339,6 +1339,14 @@ class _FacesRequestHandler(BaseHTTPRequestHandler):
             return
         # --- end suspicious labels ----------------------------------------------------------------
 
+        if path.startswith("/api/people/") and path.endswith("/benchmark"):
+            pid_str = path[len("/api/people/") : -len("/benchmark")]
+            if not pid_str.isdigit():
+                self._send_json({"error": "Invalid person id."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(self.ctx.db.get_person_export_benchmark(int(pid_str)))
+            return
+
         if path == "/api/jobs":
             self._send_json({"jobs": self.ctx.list_jobs()})
             return

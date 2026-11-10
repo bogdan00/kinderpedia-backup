@@ -109,6 +109,9 @@ class ScanRepoMixin(MatrixCacheMixin):
                 ),
             )
             self._photo_summary_cache = None
+            self._photo_date_cache = None
+            self._class_photo_totals_cache = None
+            self._class_photo_totals_key = None
         with self._faces_matrix_lock:
             self._faces_matrix_cache = None
 
@@ -174,6 +177,9 @@ class ScanRepoMixin(MatrixCacheMixin):
                 "face_ids": face_ids,
             }
             self._photo_summary_cache = None
+            self._photo_date_cache = None
+            self._class_photo_totals_cache = None
+            self._class_photo_totals_key = None
         with self._faces_matrix_lock:
             self._faces_matrix_cache = None
         return out
@@ -441,6 +447,9 @@ class ScanRepoMixin(MatrixCacheMixin):
                     )
                 out_ids.append((photo_id, face_ids))
             self._photo_summary_cache = None
+            self._photo_date_cache = None
+            self._class_photo_totals_cache = None
+            self._class_photo_totals_key = None
         with self._faces_matrix_lock:
             self._faces_matrix_cache = None
         return out_ids

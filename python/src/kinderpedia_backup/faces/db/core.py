@@ -41,6 +41,9 @@ class DBCore:
         self._faces_matrix_lock = threading.Lock()
         self._faces_matrix_cache: dict[str, Any] | None = None
         self._photo_summary_cache: dict[str, Any] | None = None
+        self._photo_date_cache: dict[int, tuple[str, int]] | None = None
+        self._class_photo_totals_cache: dict[int, int] | None = None
+        self._class_photo_totals_key: tuple[tuple[int, str, int, int], ...] | None = None
         self._knn_neighbor_cache: dict[str, Any] | None = None
         self._label_outliers: set[tuple[int, int]] = set()  # (face_id, person_id) from the last rematch
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
@@ -57,6 +60,9 @@ class DBCore:
             self._faces_matrix_cache = None
         with self._lock:
             self._photo_summary_cache = None
+            self._photo_date_cache = None
+            self._class_photo_totals_cache = None
+            self._class_photo_totals_key = None
             self._conn.close()
 
     def invalidate_caches(self) -> None:
@@ -65,6 +71,9 @@ class DBCore:
             self._faces_matrix_cache = None
         with self._lock:
             self._photo_summary_cache = None
+            self._photo_date_cache = None
+            self._class_photo_totals_cache = None
+            self._class_photo_totals_key = None
 
     def __enter__(self: _SelfDB) -> _SelfDB:
         return self

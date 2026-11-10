@@ -926,5 +926,113 @@ class IgnoreFaceTests(unittest.TestCase):
             db.close()
 
 
+class ExportBenchmarkTests(unittest.TestCase):
+    def test_benchmark_compares_enrolled_classes_to_matching_family_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = FacesIndexDB(Path(tmp) / "f.sqlite")
+            fam_a = db.ensure_person("ChildA", role="family", archive_hint="ChildA")
+            fam_b = db.ensure_person("ChildB", role="family", archive_hint="ChildB")
+            mate = db.ensure_person("Leo", role="classmate")
+            unlisted = db.ensure_person("Maya", role="classmate")
+            ign = db.ensure_person("_Ignored_Background", role="ignore")
+
+            batch = []
+            # Feed ChildA: 4 photos in 2024-10, 2 photos in 2023-10
+            for i in range(4):
+                prov = PhotoProvenance(
+                    rel_path=f"ChildA/Albums/2024/10/alb/{i}.jpg",
+                    archive_child="ChildA",
+                    year="2024",
+                    month="10",
+                    album_leaf="2024-10-10 alb",
+                    album_date="2024-10-10",
+                    filename=f"{i}.jpg",
+                )
+                faces = [
+                    DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=_vec(i)),
+                    DetectedFace(box=BoundingBox(0, 150, 50, 100), embedding=_vec(20 + i)),
+                ]
+                batch.append((prov, 200, 200, 1, i + 1, "d", faces))
+            for i in range(2):
+                prov = PhotoProvenance(
+                    rel_path=f"ChildA/Albums/2023/10/old/{i}.jpg",
+                    archive_child="ChildA",
+                    year="2023",
+                    month="10",
+                    album_leaf="2023-10-10 old",
+                    album_date="2023-10-10",
+                    filename=f"{i}.jpg",
+                )
+                faces = [
+                    DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=_vec(40 + i)),
+                    DetectedFace(box=BoundingBox(0, 150, 50, 100), embedding=_vec(50 + i)),
+                ]
+                batch.append((prov, 200, 200, 1, i + 1, "d", faces))
+            # Feed ChildB: 2 photos in 2025-10
+            for i in range(2):
+                prov = PhotoProvenance(
+                    rel_path=f"ChildB/Albums/2025/10/rad/{i}.jpg",
+                    archive_child="ChildB",
+                    year="2025",
+                    month="10",
+                    album_leaf="2025-10-10 rad",
+                    album_date="2025-10-10",
+                    filename=f"{i}.jpg",
+                )
+                faces = [
+                    DetectedFace(box=BoundingBox(0, 50, 50, 0), embedding=_vec(60 + i)),
+                    DetectedFace(box=BoundingBox(0, 150, 50, 100), embedding=_vec(80 + i)),
+                ]
+                batch.append((prov, 200, 200, 1, i + 1, "d", faces))
+
+            up = db.upsert_scanned_batch(batch)
+            # Tag fam_a in all 4 photos of 2024-10 + all 2 photos of 2023-10; Leo in 2 of 2024-10 + 1 in 2023-10 + 1 in ChildB 2025-10
+            for ph_id, fids in up[:4]:
+                db.apply_batch_decisions(person_id=fam_a, approved=[(ph_id, fids[0])], disproved=[])
+            for ph_id, fids in up[:2]:
+                db.apply_batch_decisions(person_id=mate, approved=[(ph_id, fids[1])], disproved=[])
+            for ph_id, fids in up[4:6]:
+                db.apply_batch_decisions(person_id=fam_a, approved=[(ph_id, fids[0])], disproved=[])
+            # 1 extra photo for Maya in 2023-10 (not enrolled in classes)
+            db.apply_batch_decisions(person_id=unlisted, approved=[(up[4][0], up[4][1][1])], disproved=[])
+            for ph_id, fids in up[6:8]:
+                db.apply_batch_decisions(person_id=fam_b, approved=[(ph_id, fids[0])], disproved=[])
+            db.apply_batch_decisions(person_id=mate, approved=[(up[6][0], up[6][1][1])], disproved=[])
+
+            c_a24 = db.create_class(name="ChildA 2024-25", archive_child="ChildA", start_date="2024-09-01", end_date="2025-08-31")
+            c_a23 = db.create_class(name="ChildA 2023-24", archive_child="ChildA", start_date="2023-09-01", end_date="2024-08-31")
+            c_b25 = db.create_class(name="ChildB 2025-26", archive_child="ChildB", start_date="2025-09-01", end_date="2026-08-31")
+            db.set_class_members(c_a24["class_id"], [fam_a, mate])
+            db.set_class_members(c_b25["class_id"], [fam_b, mate])
+
+            b_mate = db.get_person_export_benchmark(mate)
+            self.assertEqual(b_mate["scope"], "enrolled")
+            self.assertFalse(b_mate["is_self_benchmark"])
+            self.assertEqual(b_mate["benchmark_names"], ["ChildA", "ChildB"])
+            self.assertEqual(b_mate["in_classes_count"], 3)
+            self.assertEqual(b_mate["benchmark_count"], 6)
+            self.assertEqual(b_mate["pct_of_benchmark"], 50.0)
+            self.assertEqual(b_mate["outside_classes_count"], 0)
+
+            b_fam_a = db.get_person_export_benchmark(fam_a)
+            self.assertTrue(b_fam_a["is_self_benchmark"])
+            self.assertEqual(b_fam_a["in_classes_count"], 4)
+            self.assertEqual(b_fam_a["outside_classes_count"], 2)  # 2 photos in 2023-24 not enrolled
+
+            # Maya isn't enrolled in any class, so "detected" picks ChildA 2023-24 automatically
+            b_maya = db.get_person_export_benchmark(unlisted)
+            self.assertEqual(b_maya["scope"], "detected")
+            self.assertEqual(len(b_maya["classes"]), 1)
+            self.assertEqual(b_maya["classes"][0]["class_id"], c_a23["class_id"])
+            self.assertEqual(b_maya["classes"][0]["benchmark_name"], "ChildA")
+            self.assertEqual(b_maya["classes"][0]["benchmark_count"], 2)
+            self.assertEqual(b_maya["pct_of_benchmark"], 50.0)
+
+            b_ign = db.get_person_export_benchmark(ign)
+            self.assertEqual(b_ign["role"], "ignore")
+            self.assertEqual(b_ign["classes"], [])
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

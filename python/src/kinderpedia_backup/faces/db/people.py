@@ -481,6 +481,50 @@ class PeopleMixin(DBCore):
                 continue
         return created
 
+    def _get_photo_date_map_locked(self) -> dict[int, tuple[str, int]]:
+        if self._photo_date_cache is None:
+            photo_rows = self._conn.execute(
+                "SELECT photo_id, archive_child, album_date, image_dateadd, year, month FROM photos"
+            ).fetchall()
+            self._photo_date_cache = {
+                int(r["photo_id"]): (
+                    str(r["archive_child"] or ""),
+                    photo_date_ord(
+                        str(r["album_date"] or ""),
+                        str(r["image_dateadd"] or ""),
+                        str(r["year"] or ""),
+                        str(r["month"] or ""),
+                    ),
+                )
+                for r in photo_rows
+            }
+        return self._photo_date_cache
+
+    def _get_class_totals_locked(
+        self,
+        classes: list[dict[str, Any]],
+        photo_info: dict[int, tuple[str, int]],
+    ) -> dict[int, int]:
+        windows = tuple(
+            (
+                int(c["class_id"]),
+                str(c["archive_child"] or ""),
+                date_to_ord(str(c["start_date"] or "")),
+                date_to_ord(str(c["end_date"] or "")) or UNKNOWN_DATE_ORD,
+            )
+            for c in classes
+        )
+        if self._class_photo_totals_cache is not None and self._class_photo_totals_key == windows:
+            return self._class_photo_totals_cache
+        totals: dict[int, int] = {w[0]: 0 for w in windows}
+        for _ph_id, (feed, o) in photo_info.items():
+            for cid, w_feed, w_s, w_e in windows:
+                if (not w_feed or w_feed == feed) and w_s <= o <= w_e:
+                    totals[cid] += 1
+        self._class_photo_totals_cache = totals
+        self._class_photo_totals_key = windows
+        return totals
+
     def get_class_matrix(self) -> dict[str, Any]:
         classes = self.list_classes()
         with self._lock:
@@ -494,24 +538,10 @@ class PeopleMixin(DBCore):
                     "SELECT person_id, display_name, role FROM people ORDER BY display_name COLLATE NOCASE"
                 ).fetchall()
             ]
-            photo_rows = self._conn.execute(
-                "SELECT photo_id, archive_child, album_date, image_dateadd, year, month FROM photos"
-            ).fetchall()
+            photo_info = self._get_photo_date_map_locked()
             tag_rows = self._conn.execute(
                 "SELECT photo_id, person_id FROM assignments WHERE status IN ('confirmed', 'auto_high')"
             ).fetchall()
-        photo_info = {
-            int(r["photo_id"]): (
-                str(r["archive_child"] or ""),
-                photo_date_ord(
-                    str(r["album_date"] or ""),
-                    str(r["image_dateadd"] or ""),
-                    str(r["year"] or ""),
-                    str(r["month"] or ""),
-                ),
-            )
-            for r in photo_rows
-        }
         windows = [
             (
                 c["class_id"],
@@ -541,6 +571,200 @@ class PeopleMixin(DBCore):
             "classes": [{**c, "photo_count": photo_counts[c["class_id"]]} for c in classes],
             "people": people,
             "counts": counts,
+        }
+
+    def get_person_export_benchmark(self, person_id: int) -> dict[str, Any]:
+        """Compare a person's exportable photo counts per class against the class's family benchmark."""
+        classes = self.list_classes()
+        with self._lock:
+            p_row = self._conn.execute(
+                "SELECT person_id, display_name, role, archive_hint FROM people WHERE person_id = ?",
+                (person_id,),
+            ).fetchone()
+            if p_row is None:
+                raise KeyError(f"Person {person_id} not found.")
+            role = str(p_row["role"])
+            display_name = str(p_row["display_name"])
+            family_rows = self._conn.execute(
+                "SELECT person_id, display_name, archive_hint FROM people WHERE role = 'family' ORDER BY person_id"
+            ).fetchall()
+            family_people = [
+                {
+                    "person_id": int(r["person_id"]),
+                    "display_name": str(r["display_name"]),
+                    "archive_hint": str(r["archive_hint"] or ""),
+                }
+                for r in family_rows
+            ]
+            if role == "ignore":
+                return {
+                    "person_id": person_id,
+                    "display_name": display_name,
+                    "role": role,
+                    "scope": "none",
+                    "total_exportable": 0,
+                    "in_classes_count": 0,
+                    "outside_classes_count": 0,
+                    "benchmark_count": 0,
+                    "pct_of_benchmark": None,
+                    "benchmark_names": [],
+                    "is_self_benchmark": False,
+                    "class_archive_total": 0,
+                    "classes": [],
+                    "family_names": [fp["display_name"] for fp in family_people],
+                }
+            photo_info = self._get_photo_date_map_locked()
+            class_totals = self._get_class_totals_locked(classes, photo_info)
+            relevant_pids = sorted({person_id} | {fp["person_id"] for fp in family_people})
+            placeholders = ",".join("?" for _ in relevant_pids)
+            tag_rows = self._conn.execute(
+                f"SELECT person_id, photo_id FROM assignments WHERE person_id IN ({placeholders}) AND status IN ('confirmed', 'auto_high')",  # noqa: S608 - parameterized IN list
+                relevant_pids,
+            ).fetchall()
+
+        photos_by_pid: dict[int, set[int]] = {pid: set() for pid in relevant_pids}
+        for r in tag_rows:
+            photos_by_pid[int(r["person_id"])].add(int(r["photo_id"]))
+
+        windows = [
+            (
+                c,
+                str(c["archive_child"] or ""),
+                date_to_ord(str(c["start_date"] or "")),
+                date_to_ord(str(c["end_date"] or "")) or UNKNOWN_DATE_ORD,
+            )
+            for c in classes
+        ]
+
+        # Precompute per-class photo sets for `person_id` and each `family` person (typically 2-3 IDs total)
+        class_photos_by_pid: dict[int, dict[int, set[int]]] = {pid: {} for pid in relevant_pids}
+        for pid in relevant_pids:
+            pid_map: dict[int, set[int]] = {int(c["class_id"]): set() for c in classes}
+            for ph_id in photos_by_pid[pid]:
+                info = photo_info.get(ph_id)
+                if info is None:
+                    continue
+                feed, o = info
+                for c, w_feed, w_s, w_e in windows:
+                    if (not w_feed or w_feed == feed) and w_s <= o <= w_e:
+                        pid_map[int(c["class_id"])].add(ph_id)
+            class_photos_by_pid[pid] = pid_map
+
+        # Pick benchmark family child for each class
+        bench_by_cid: dict[int, dict[str, Any] | None] = {}
+        for c in classes:
+            cid = int(c["class_id"])
+            ac_low = str(c["archive_child"] or "").strip().lower()
+            candidates: list[dict[str, Any]] = []
+            if ac_low:
+                candidates = [
+                    fp
+                    for fp in family_people
+                    if fp["display_name"].lower() == ac_low or fp["archive_hint"].lower() == ac_low
+                ]
+            if not candidates:
+                member_set = set(c.get("member_ids") or [])
+                candidates = [fp for fp in family_people if fp["person_id"] in member_set]
+            if not candidates:
+                candidates = [
+                    fp for fp in family_people if len(class_photos_by_pid[fp["person_id"]].get(cid, set())) > 0
+                ]
+            if candidates:
+                bench_by_cid[cid] = max(
+                    candidates,
+                    key=lambda fp: (len(class_photos_by_pid[fp["person_id"]].get(cid, set())), -fp["person_id"]),
+                )
+            else:
+                bench_by_cid[cid] = None
+
+        enrolled = [c for c in classes if person_id in (c.get("member_ids") or [])]
+        if enrolled:
+            scope = "enrolled"
+            target_classes = enrolled
+        else:
+            detected = [
+                c
+                for c in classes
+                if len(class_photos_by_pid[person_id].get(int(c["class_id"]), set())) > 0
+            ]
+            if detected:
+                scope = "detected"
+                target_classes = detected
+            else:
+                scope = "none"
+                target_classes = []
+
+        child_union: set[int] = set()
+        bench_pair_union: set[tuple[int, int]] = set()
+        archive_union_total = 0
+        bench_names: list[str] = []
+        seen_bench_names: set[str] = set()
+        per_class: list[dict[str, Any]] = []
+
+        for c in target_classes:
+            cid = int(c["class_id"])
+            c_child_pids = class_photos_by_pid[person_id].get(cid, set())
+            child_union |= c_child_pids
+            c_total = int(class_totals.get(cid, 0))
+            archive_union_total += c_total
+            bp = bench_by_cid.get(cid)
+            if bp is not None:
+                bp_id = int(bp["person_id"])
+                bp_name = str(bp["display_name"])
+                c_bench_pids = class_photos_by_pid[bp_id].get(cid, set())
+                for ph in c_bench_pids:
+                    bench_pair_union.add((bp_id, ph))
+                if bp_name not in seen_bench_names:
+                    seen_bench_names.add(bp_name)
+                    bench_names.append(bp_name)
+                b_cnt = len(c_bench_pids)
+            else:
+                bp_id = None
+                bp_name = ""
+                b_cnt = 0
+            c_cnt = len(c_child_pids)
+            per_class.append(
+                {
+                    "class_id": cid,
+                    "class_name": str(c["name"]),
+                    "archive_child": str(c["archive_child"] or ""),
+                    "start_date": str(c["start_date"] or ""),
+                    "end_date": str(c["end_date"] or ""),
+                    "child_count": c_cnt,
+                    "benchmark_person_id": bp_id,
+                    "benchmark_name": bp_name,
+                    "benchmark_count": b_cnt,
+                    "pct_of_benchmark": round(100.0 * c_cnt / b_cnt, 1) if b_cnt > 0 else None,
+                    "class_total_photos": c_total,
+                    "pct_of_class": round(100.0 * c_cnt / c_total, 1) if c_total > 0 else None,
+                }
+            )
+
+        total_exportable = len(photos_by_pid[person_id])
+        in_classes_count = len(child_union)
+        outside_classes_count = max(0, total_exportable - in_classes_count) if target_classes else total_exportable
+        bench_total = len(bench_pair_union)
+        pct_total = round(100.0 * in_classes_count / bench_total, 1) if bench_total > 0 else None
+        benchmarked_rows = [row for row in per_class if row["benchmark_person_id"] is not None]
+        is_self_benchmark = bool(benchmarked_rows) and all(
+            row["benchmark_person_id"] == person_id for row in benchmarked_rows
+        )
+
+        return {
+            "person_id": person_id,
+            "display_name": display_name,
+            "role": role,
+            "scope": scope,
+            "total_exportable": total_exportable,
+            "in_classes_count": in_classes_count,
+            "outside_classes_count": outside_classes_count,
+            "benchmark_count": bench_total,
+            "pct_of_benchmark": pct_total,
+            "benchmark_names": bench_names,
+            "is_self_benchmark": is_self_benchmark,
+            "class_archive_total": archive_union_total,
+            "classes": per_class,
+            "family_names": [fp["display_name"] for fp in family_people],
         }
 
     def merge_people(self, source_person_id: int, target_person_id: int) -> None:

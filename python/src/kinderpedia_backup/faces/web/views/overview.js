@@ -7,6 +7,11 @@ import { loadActiveView, selectPerson, switchMode } from "../router.js";
 import { findPersonByName, getSelectedPerson, setOverview, state, subscribe } from "../state.js";
 import { runBusy } from "../util/busy.js";
 import { delegate, el, html, on, setHtml } from "../util/dom.js";
+import { plural } from "../util/format.js";
+
+const benchmarkCache = new Map();
+let benchmarkOverviewRef = null;
+let benchmarkReqSeq = 0;
 
 function syncOptions(selectEl, items, allLabel) {
   const prev = selectEl.value;
@@ -14,9 +19,137 @@ function syncOptions(selectEl, items, allLabel) {
   if (items.includes(prev)) selectEl.value = prev;
 }
 
+function tierForPct(pct, role) {
+  if (role === "educator") return { cls: "tier-good", note: "educator" };
+  if (pct == null) return { cls: "tier-low", note: "no class baseline" };
+  if (pct >= 70) return { cls: "tier-good", note: "close to benchmark" };
+  if (pct >= 40) return { cls: "tier-mid", note: "gap — may need tagging" };
+  return { cls: "tier-low", note: "big gap — likely untagged" };
+}
+
+function renderBenchmarkData(data) {
+  const box = el("exportBenchmarkBox");
+  if (!box) return;
+  const selP = getSelectedPerson();
+  if (!selP || (data && data.person_id !== selP.person_id)) return;
+  if (!data) {
+    box.hidden = false;
+    setHtml(box, html`<div class="benchmark-sub">Checking class benchmark…</div>`);
+    return;
+  }
+  box.hidden = false;
+  if (data.role === "ignore") {
+    setHtml(box, html`<div class="benchmark-sub">Ignored group — excluded from benchmarks &amp; exports.</div>`);
+    return;
+  }
+
+  const fmt = (n) => Number(n || 0).toLocaleString();
+  const classes = Array.isArray(data.classes) ? data.classes : [];
+  if (!classes.length) {
+    const fam = (data.family_names || []).join(" / ") || "your family child";
+    setHtml(
+      box,
+      html`<div class="benchmark-sub">
+        ${fmt(data.total_exportable)} photos ready · assign to a class in <strong>🏫 Classes</strong> to compare vs ${fam}.
+      </div>`
+    );
+    return;
+  }
+
+  if (data.is_self_benchmark) {
+    setHtml(
+      box,
+      html`<div class="benchmark-header">
+          <span>★ Family Benchmark</span>
+          <strong class="benchmark-pct tier-good">${fmt(data.total_exportable)} photos</strong>
+        </div>
+        <div class="benchmark-track"><div class="benchmark-fill is-benchmark" style="width: 100%"></div></div>
+        <div class="benchmark-sub">
+          Baseline across ${plural(classes.length, "class", "classes")} (${fmt(data.class_archive_total)} archive photos)
+        </div>
+        <div class="benchmark-rows">
+          ${classes.map(
+            (c) => html`<div class="benchmark-row" title="${fmt(c.child_count)} of ${fmt(c.class_total_photos)} photos in ${c.class_name}">
+              <span class="benchmark-row-name">${c.class_name}</span>
+              <span class="benchmark-row-vals">${fmt(c.child_count)} (${c.pct_of_class != null ? `${Math.round(c.pct_of_class)}%` : "—"})</span>
+            </div>`
+          )}
+        </div>`
+    );
+    return;
+  }
+
+  const benchNames = Array.isArray(data.benchmark_names) && data.benchmark_names.length ? data.benchmark_names : ["benchmark"];
+  const benchTitle = benchNames.join(" & ");
+  const multiBench = benchNames.length > 1;
+  const pct = data.pct_of_benchmark != null ? Math.round(data.pct_of_benchmark) : null;
+  const tier = tierForPct(pct, data.role);
+  const scopeLabel = data.scope === "detected" ? "active years" : plural(classes.length, "class", "classes");
+  const fillW = pct != null ? Math.min(100, Math.max(0, pct)) : 0;
+
+  setHtml(
+    box,
+    html`<div class="benchmark-header" title="Compares exportable photos in each shared class against ${benchTitle} (teacher distributes photos roughly equally)">
+        <span>vs ${benchTitle} (${scopeLabel})</span>
+        <strong class="benchmark-pct ${tier.cls}">${pct != null ? `${pct}%` : "—"}</strong>
+      </div>
+      <div class="benchmark-track"><div class="benchmark-fill ${tier.cls}" style="width: ${fillW}%"></div></div>
+      <div class="benchmark-sub">${fmt(data.in_classes_count)} / ${fmt(data.benchmark_count)} photos · ${tier.note}</div>
+      <div class="benchmark-rows">
+        ${classes.map((c) => {
+          const rp = c.pct_of_benchmark != null ? Math.round(c.pct_of_benchmark) : null;
+          const rt = tierForPct(rp, data.role);
+          const who = multiBench && c.benchmark_name ? ` ${c.benchmark_name}` : "";
+          return html`<div class="benchmark-row" title="${c.class_name}: ${fmt(c.child_count)} vs ${c.benchmark_name || "benchmark"} (${fmt(c.benchmark_count)})">
+            <span class="benchmark-row-name">${c.class_name}</span>
+            <span class="benchmark-row-vals">${fmt(c.child_count)} / ${fmt(c.benchmark_count)}${who} <span class="benchmark-row-pct ${rt.cls}">(${rp != null ? `${rp}%` : "—"})</span></span>
+          </div>`;
+        })}
+      </div>
+      ${data.scope === "detected" ? html`<div class="benchmark-footnote">Not ticked in <strong>🏫 Classes</strong> yet — matched by year.</div>` : ""}
+      ${data.outside_classes_count > 0 ? html`<div class="benchmark-footnote">+${fmt(data.outside_classes_count)} outside enrolled classes (${fmt(data.total_exportable)} exported total)</div>` : ""}`
+  );
+}
+
+async function refreshSelectedBenchmark(selP) {
+  const box = el("exportBenchmarkBox");
+  if (!box || !selP) {
+    if (box) box.hidden = true;
+    return;
+  }
+  if (selP.role === "ignore") {
+    renderBenchmarkData({ person_id: selP.person_id, role: "ignore" });
+    return;
+  }
+  const pid = selP.person_id;
+  if (benchmarkCache.has(pid)) {
+    renderBenchmarkData(benchmarkCache.get(pid));
+    return;
+  }
+  renderBenchmarkData(null);
+  const seq = ++benchmarkReqSeq;
+  try {
+    const data = await api(`/api/people/${pid}/benchmark`);
+    if (benchmarkOverviewRef !== state.overview) return;
+    benchmarkCache.set(pid, data);
+    if (seq === benchmarkReqSeq || (getSelectedPerson() && getSelectedPerson().person_id === pid)) {
+      renderBenchmarkData(data);
+    }
+  } catch {
+    if (seq === benchmarkReqSeq && box && getSelectedPerson()?.person_id === pid) {
+      box.hidden = false;
+      setHtml(box, html`<div class="benchmark-sub">Could not load class benchmark.</div>`);
+    }
+  }
+}
+
 export function renderOverview() {
   const ov = state.overview;
   if (!ov) return;
+  if (benchmarkOverviewRef !== ov) {
+    benchmarkOverviewRef = ov;
+    benchmarkCache.clear();
+  }
   el("coverageText").textContent = `${ov.coverage_pct}%`;
   el("coverageFill").style.width = `${Math.min(100, ov.coverage_pct)}%`;
   const known = ov.faces_known != null ? ov.faces_known : ov.faces_categorized;
@@ -36,6 +169,33 @@ export function renderOverview() {
   const selP = getSelectedPerson();
   el("personToolbar").hidden = !selP;
   if (selP) el("activePersonChip").textContent = `${selP.display_name} (${selP.total_included_count} photos)`;
+  const topExportBtn = el("btnSyncPersonFolder");
+  if (topExportBtn) topExportBtn.hidden = !selP || selP.role === "ignore";
+
+  const exportChildBtn = el("btnExportChild");
+  const exportAllBtn = el("btnMaterializeAll");
+  const exportablePeopleCount = (ov.people || []).filter((p) => p.role === "family" || p.role === "classmate").length;
+  if (exportChildBtn && exportAllBtn) {
+    if (selP) {
+      const canExportSingle = selP.role !== "ignore";
+      exportChildBtn.hidden = !canExportSingle;
+      if (canExportSingle && exportChildBtn.dataset.busy !== "1") {
+        exportChildBtn.textContent = `Export ${selP.display_name}'s Photos`;
+      }
+      exportAllBtn.className = "btn btn-ghost btn-xs rail-export-all-btn";
+      if (exportAllBtn.dataset.busy !== "1") {
+        exportAllBtn.textContent =
+          exportablePeopleCount > 0 ? `or export all ${exportablePeopleCount} children…` : "or export all children…";
+      }
+    } else {
+      exportChildBtn.hidden = true;
+      exportAllBtn.className = "btn btn-primary btn-full";
+      if (exportAllBtn.dataset.busy !== "1") {
+        exportAllBtn.textContent = "Export All Children";
+      }
+    }
+  }
+  refreshSelectedBenchmark(selP);
 }
 
 /** Toast for a background-job start ({ job, started } from startBackgroundJob). */
@@ -120,10 +280,18 @@ export function bindOverview() {
   );
   delegate(document.body, "click", "[data-export]", (_ev, btn) => exportUrls(btn));
   on("btnRecluster", "click", (_ev, btn) => runJob(btn, "/api/recluster", {}, "Refresh scan"));
-  on("btnMaterializeAll", "click", (_ev, btn) => runJob(btn, "/api/materialize", {}, "Export photos by child"));
+  on("btnExportChild", "click", (_ev, btn) => {
+    const selP = getSelectedPerson();
+    if (selP && selP.role !== "ignore") {
+      runJob(btn, "/api/materialize", { person: selP.display_name }, `Export ${selP.display_name}'s photos`);
+    }
+  });
+  on("btnMaterializeAll", "click", (_ev, btn) => runJob(btn, "/api/materialize", {}, "Export all children"));
   on("btnSyncPersonFolder", "click", (_ev, btn) => {
     const selP = getSelectedPerson();
-    if (selP) runJob(btn, "/api/materialize", { person: selP.display_name }, "Export photo folder");
+    if (selP && selP.role !== "ignore") {
+      runJob(btn, "/api/materialize", { person: selP.display_name }, "Export photo folder");
+    }
   });
   on("btnDiscoverClusters", "click", (_ev, btn) => runBusy(btn, () => switchMode("clusters"), { context: "Load clusters" }));
   on("btnAddPerson", "click", (_ev, btn) => addPerson(btn));

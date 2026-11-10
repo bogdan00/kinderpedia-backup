@@ -240,6 +240,17 @@ class FacesServerTests(unittest.TestCase):
         self.assertEqual(done["result"]["person"], "Leo")
         self.assertFalse(requests.get(f"{self.base}/api/status", timeout=5).json()["jobs"])
 
+    def test_person_benchmark_endpoint(self) -> None:
+        leo = self.seed["leo"]
+        r = requests.get(f"{self.base}/api/people/{leo}/benchmark", timeout=5)
+        self.assertEqual(r.status_code, 200, r.text)
+        b = r.json()
+        self.assertEqual(b["person_id"], leo)
+        self.assertEqual(b["display_name"], "Leo")
+        self.assertIn("total_exportable", b)
+        self.assertEqual(requests.get(f"{self.base}/api/people/abc/benchmark", timeout=5).status_code, 400)
+        self.assertEqual(requests.get(f"{self.base}/api/people/999999/benchmark", timeout=5).status_code, 404)
+
     def test_recluster_waits_for_running_rematch(self) -> None:
         # Recluster must hold `_rematch_lock`: while it is taken the job cannot progress.
         self.ctx._rematch_lock.acquire()
@@ -928,6 +939,12 @@ if (hasAlbumCard) {
   await evaluate(`document.getElementById("btnBackToAlbums").click(), true`);
   await waitFor(`!document.getElementById("albumListView").hidden`, "back to album list");
 }
+
+// 8) Left-rail single-child Export button & class benchmark under it.
+await waitFor(`!document.getElementById("btnExportChild").hidden && /^Export .+\\'s Photos$/.test(document.getElementById("btnExportChild").textContent.trim())`, "single-child export button");
+await waitFor(`!document.getElementById("exportBenchmarkBox").hidden && !/Checking/.test(document.getElementById("exportBenchmarkBox").textContent)`, "export benchmark loaded");
+await evaluate(`document.getElementById("btnExportChild").click(), true`);
+await waitFor(`/Exported ByChild\\/[^/]+\\//.test((document.getElementById("toast") || {}).textContent || "") && window.__kpIdle()`, "single-child export completed");
 
 if (exceptions.length) fail(`uncaught page exceptions: ${JSON.stringify(exceptions.slice(0, 3))}`);
 clearTimeout(hardTimer);

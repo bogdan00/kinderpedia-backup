@@ -48,10 +48,20 @@
         <button
           type="button"
           class="btn btn-primary btn-full"
-          id="btnMaterializeAll"
-          title="Export curated highlights and full album folders for every tagged child into ByChild/ (zero extra disk space)"
+          id="btnExportChild"
+          hidden
+          title="Export curated highlights and full album folders for this child into ByChild/ (zero extra disk space)"
         >
-          Export Photos by Child
+          Export Child's Photos
+        </button>
+        <div class="export-benchmark" id="exportBenchmarkBox" hidden></div>
+        <button
+          type="button"
+          class="btn btn-primary btn-full"
+          id="btnMaterializeAll"
+          title="Export curated highlights and full album folders for every enrolled child into ByChild/ (zero extra disk space)"
+        >
+          Export All Children
         </button>
       </div>
     </aside>

@@ -7,7 +7,7 @@ import { showToast } from "./toasts.js";
 
 const JOB_BUTTON_IDS = {
   recluster: ["btnRecluster"],
-  materialize: ["btnMaterializeAll", "btnSyncPersonFolder"],
+  materialize: ["btnExportChild", "btnMaterializeAll", "btnSyncPersonFolder"],
 };
 
 /** Buttons stay disabled while a job of their kind runs (bg_status + jobs started from this tab). */
